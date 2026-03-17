@@ -1,11 +1,9 @@
 """
 shared/kalshi_client.py
-Authenticated Kalshi REST client. Uses RSA-PSS signing (same pattern as your
-existing kalshi-bot repo) — just wired to this monorepo's settings.
+Authenticated Kalshi REST client with Railway-compatible private key loading.
 """
 
 import base64
-import hashlib
 import json
 import time
 import logging
@@ -24,15 +22,29 @@ logger = logging.getLogger(__name__)
 
 
 def _load_private_key():
-    """Load RSA private key from PEM string or file path."""
+    """
+    Load RSA private key.
+    Handles three formats:
+      1. Proper PEM with real newlines (local .env)
+      2. PEM with literal \\n (Railway environment variables)
+      3. File path to a PEM file
+    """
     pem = KALSHI_PRIVATE_KEY.strip()
+
+    # Railway stores multiline env vars with literal \n — fix it
+    if "\\n" in pem:
+        pem = pem.replace("\\n", "\n")
+
     if pem.startswith("-----BEGIN"):
         pem_bytes = pem.encode()
     else:
+        # Treat as file path
         with open(pem, "rb") as f:
             pem_bytes = f.read()
-    return serialization.load_pem_private_key(pem_bytes, password=None,
-                                               backend=default_backend())
+
+    return serialization.load_pem_private_key(
+        pem_bytes, password=None, backend=default_backend()
+    )
 
 
 def _sign_request(method: str, path: str, body: str = "") -> dict:
@@ -41,16 +53,20 @@ def _sign_request(method: str, path: str, body: str = "") -> dict:
     msg_str   = ts_ms + method.upper() + path + body
     msg_bytes = msg_str.encode("utf-8")
     key       = _load_private_key()
-    signature = key.sign(msg_bytes, padding.PSS(
-        mgf=padding.MGF1(hashes.SHA256()),
-        salt_length=padding.PSS.DIGEST_LENGTH
-    ), hashes.SHA256())
+    signature = key.sign(
+        msg_bytes,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH
+        ),
+        hashes.SHA256()
+    )
     sig_b64 = base64.b64encode(signature).decode("utf-8")
     return {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-        "KALSHI-ACCESS-SIGNATURE": sig_b64,
+        "Content-Type":             "application/json",
+        "KALSHI-ACCESS-KEY":        KALSHI_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP":  ts_ms,
+        "KALSHI-ACCESS-SIGNATURE":  sig_b64,
     }
 
 
@@ -58,27 +74,27 @@ class KalshiClient:
     """Thin wrapper around the Kalshi V2 trading API."""
 
     def __init__(self):
-        self.base = KALSHI_API_BASE
+        self.base    = KALSHI_API_BASE
         self.session = requests.Session()
-
-    # ── Generic helpers ────────────────────────────────────────────────────────
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         headers = _sign_request("GET", path)
-        url = self.base + path
-        r = self.session.get(url, headers=headers, params=params, timeout=10)
+        r = self.session.get(
+            self.base + path, headers=headers,
+            params=params, timeout=10
+        )
         r.raise_for_status()
         return r.json()
 
     def _post(self, path: str, body: dict) -> dict:
         body_str = json.dumps(body)
         headers  = _sign_request("POST", path, body_str)
-        url = self.base + path
-        r = self.session.post(url, headers=headers, data=body_str, timeout=10)
+        r = self.session.post(
+            self.base + path, headers=headers,
+            data=body_str, timeout=10
+        )
         r.raise_for_status()
         return r.json()
-
-    # ── Market data ────────────────────────────────────────────────────────────
 
     def get_markets(self, status: str = "open", limit: int = 200,
                     cursor: Optional[str] = None) -> dict:
@@ -90,14 +106,7 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         return self._get(f"/markets/{ticker}")
 
-    def get_orderbook(self, ticker: str) -> dict:
-        return self._get(f"/markets/{ticker}/orderbook")
-
-    def get_trades(self, ticker: str, limit: int = 100) -> dict:
-        return self._get(f"/markets/{ticker}/trades", params={"limit": limit})
-
     def get_all_open_markets(self) -> list:
-        """Paginate through all open markets."""
         markets, cursor = [], None
         while True:
             resp   = self.get_markets(status="open", limit=200, cursor=cursor)
@@ -108,29 +117,19 @@ class KalshiClient:
                 break
         return markets
 
-    # ── Account ────────────────────────────────────────────────────────────────
-
     def get_balance(self) -> float:
         resp = self._get("/portfolio/balance")
-        return resp.get("balance", 0) / 100  # Kalshi returns cents
+        return resp.get("balance", 0) / 100
 
     def get_positions(self) -> list:
         return self._get("/portfolio/positions").get("market_positions", [])
 
-    # ── Order execution ────────────────────────────────────────────────────────
-
     def place_order(self, ticker: str, side: str, count: int,
                     yes_price: int, client_order_id: str) -> dict:
-        """
-        Place a limit order.
-        side      : 'yes' or 'no'
-        count     : number of contracts
-        yes_price : price in cents (1–99)
-        """
         if DEMO_MODE:
             logger.info(
-                "[DEMO] Would place %s %s × %d @ %dc on %s",
-                side.upper(), ticker, count, yes_price, ticker
+                "[DEMO] Would place %s %s x%d @ %dc",
+                side.upper(), ticker, count, yes_price
             )
             return {"status": "demo", "ticker": ticker, "side": side,
                     "count": count, "yes_price": yes_price}
