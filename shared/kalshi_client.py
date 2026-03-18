@@ -129,7 +129,7 @@ class KalshiClient:
 
     def get_all_open_markets(self) -> list:
         markets, cursor, page = [], None, 0
-        max_pages = 50  # hard stop at 5000 markets
+        max_pages = 100 
         while page < max_pages:
             resp   = self.get_markets(status="open", limit=100, cursor=cursor)
             batch  = resp.get("markets", [])
