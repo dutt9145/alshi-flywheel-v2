@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Kalshi
-KALSHI_API_BASE      = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_API_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_KEY_ID        = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY   = os.getenv("KALSHI_PRIVATE_KEY", "")
 

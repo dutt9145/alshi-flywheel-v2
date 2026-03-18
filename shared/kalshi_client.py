@@ -1,12 +1,17 @@
 """
 shared/kalshi_client.py
-Authenticated Kalshi REST client with Railway-compatible private key loading.
+Handles ALL private key formats:
+  - Base64 encoded (Railway-safe, recommended)
+  - PEM with real newlines (local .env)
+  - PEM with literal \n (Railway default)
+  - File path to .pem or .txt file
 """
 
 import base64
 import json
 import time
 import logging
+import textwrap
 from typing import Optional
 
 import requests
@@ -23,34 +28,58 @@ logger = logging.getLogger(__name__)
 
 def _load_private_key():
     """
-    Load RSA private key.
-    Handles three formats:
-      1. Proper PEM with real newlines (local .env)
-      2. PEM with literal \\n (Railway environment variables)
-      3. File path to a PEM file
+    Load RSA private key — handles every possible format Railway might use.
     """
     pem = KALSHI_PRIVATE_KEY.strip()
 
-    # Railway stores multiline env vars with literal \n — fix it
+    # Format 1: Base64 encoded entire PEM (most Railway-safe)
+    if not pem.startswith("-----"):
+        try:
+            decoded = base64.b64decode(pem).decode()
+            if "BEGIN" in decoded:
+                pem = decoded
+            else:
+                # Raw key body only — wrap it
+                wrapped = textwrap.fill(pem, 64)
+                pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+        except Exception:
+            # Not base64 — treat as raw key body
+            wrapped = textwrap.fill(pem, 64)
+            pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+
+    # Format 2: Has literal \n instead of real newlines
     if "\\n" in pem:
         pem = pem.replace("\\n", "\n")
 
-    if pem.startswith("-----BEGIN"):
-        pem_bytes = pem.encode()
-    else:
-        # Treat as file path
-        with open(pem, "rb") as f:
-            pem_bytes = f.read()
+    # Format 3: PEM header present but no line breaks in body
+    if "-----BEGIN RSA PRIVATE KEY-----" in pem and "\n" not in pem.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", ""):
+        body = pem.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
+        wrapped = textwrap.fill(body, 64)
+        pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+
+    # Format 4: File path
+    if not pem.startswith("-----") and len(pem) < 200:
+        try:
+            with open(pem, "rb") as f:
+                raw = f.read().decode()
+            if "\\n" in raw:
+                raw = raw.replace("\\n", "\n")
+            if "\n" not in raw.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", ""):
+                body = raw.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
+                wrapped = textwrap.fill(body, 64)
+                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+            pem = raw
+        except Exception:
+            pass
 
     return serialization.load_pem_private_key(
-        pem_bytes, password=None, backend=default_backend()
+        pem.encode(), password=None, backend=default_backend()
     )
 
 
 def _sign_request(method: str, path: str, body: str = "") -> dict:
-    """Generate Kalshi RSA-PSS signed headers."""
     ts_ms     = str(int(time.time() * 1000))
-    msg_str   = ts_ms + method.upper() + path + body
+    msg_str   = ts_ms + method.upper() + path
     msg_bytes = msg_str.encode("utf-8")
     key       = _load_private_key()
     signature = key.sign(
@@ -63,15 +92,14 @@ def _sign_request(method: str, path: str, body: str = "") -> dict:
     )
     sig_b64 = base64.b64encode(signature).decode("utf-8")
     return {
-        "Content-Type":             "application/json",
-        "KALSHI-ACCESS-KEY":        KALSHI_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP":  ts_ms,
-        "KALSHI-ACCESS-SIGNATURE":  sig_b64,
+        "Content-Type":            "application/json",
+        "KALSHI-ACCESS-KEY":       KALSHI_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
     }
 
 
 class KalshiClient:
-    """Thin wrapper around the Kalshi V2 trading API."""
 
     def __init__(self):
         self.base    = KALSHI_API_BASE
@@ -79,20 +107,16 @@ class KalshiClient:
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         headers = _sign_request("GET", path)
-        r = self.session.get(
-            self.base + path, headers=headers,
-            params=params, timeout=10
-        )
+        r = self.session.get(self.base + path, headers=headers,
+                             params=params, timeout=10)
         r.raise_for_status()
         return r.json()
 
     def _post(self, path: str, body: dict) -> dict:
         body_str = json.dumps(body)
         headers  = _sign_request("POST", path, body_str)
-        r = self.session.post(
-            self.base + path, headers=headers,
-            data=body_str, timeout=10
-        )
+        r = self.session.post(self.base + path, headers=headers,
+                              data=body_str, timeout=10)
         r.raise_for_status()
         return r.json()
 
@@ -102,9 +126,6 @@ class KalshiClient:
         if cursor:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
-
-    def get_market(self, ticker: str) -> dict:
-        return self._get(f"/markets/{ticker}")
 
     def get_all_open_markets(self) -> list:
         markets, cursor = [], None
@@ -127,20 +148,13 @@ class KalshiClient:
     def place_order(self, ticker: str, side: str, count: int,
                     yes_price: int, client_order_id: str) -> dict:
         if DEMO_MODE:
-            logger.info(
-                "[DEMO] Would place %s %s x%d @ %dc",
-                side.upper(), ticker, count, yes_price
-            )
+            logger.info("[DEMO] Would place %s %s x%d @ %dc",
+                        side.upper(), ticker, count, yes_price)
             return {"status": "demo", "ticker": ticker, "side": side,
                     "count": count, "yes_price": yes_price}
-
         body = {
-            "action":          "buy",
-            "ticker":          ticker,
-            "type":            "limit",
-            "side":            side,
-            "count":           count,
-            "yes_price":       yes_price,
+            "action": "buy", "ticker": ticker, "type": "limit",
+            "side": side, "count": count, "yes_price": yes_price,
             "client_order_id": client_order_id,
         }
         return self._post("/portfolio/orders", body)
