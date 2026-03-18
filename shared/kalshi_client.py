@@ -77,7 +77,7 @@ def _load_private_key():
     )
 
 
-def _sign_request(method: str, path: str, body: str = "") -> dict:
+def _sign_request(method: str, path: str) -> dict:
     ts_ms     = str(int(time.time() * 1000))
     msg_str   = ts_ms + method.upper() + path
     msg_bytes = msg_str.encode("utf-8")
@@ -114,13 +114,13 @@ class KalshiClient:
 
     def _post(self, path: str, body: dict) -> dict:
         body_str = json.dumps(body)
-        headers  = _sign_request("POST", path, body_str)
+        headers  = _sign_request("POST", path)
         r = self.session.post(self.base + path, headers=headers,
                               data=body_str, timeout=10)
         r.raise_for_status()
         return r.json()
 
-    def get_markets(self, status: str = "open", limit: int = 200,
+    def get_markets(self, status: str = "open", limit: int = 100,
                     cursor: Optional[str] = None) -> dict:
         params = {"status": status, "limit": limit}
         if cursor:
@@ -130,12 +130,13 @@ class KalshiClient:
     def get_all_open_markets(self) -> list:
         markets, cursor = [], None
         while True:
-            resp   = self.get_markets(status="open", limit=200, cursor=cursor)
+            resp   = self.get_markets(status="open", limit=100, cursor=cursor)
             batch  = resp.get("markets", [])
             markets.extend(batch)
             cursor = resp.get("cursor")
-            if not cursor or len(batch) < 200:
+            if not cursor or len(batch) < 100:
                 break
+            time.sleep(0.5)  # Rate limit: avoid 429s between paginated requests
         return markets
 
     def get_balance(self) -> float:
