@@ -163,9 +163,10 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     context = {"coin": coin_id}
 
     # ── CoinGecko base (always — free, reliable) ──────────────────────────────
+    time.sleep(0.1)  # before the CoinGecko call to avoid hitting their rate limit
     cg = _get(f"https://api.coingecko.com/api/v3/coins/{coin_id}", {
         "localization": "false", "tickers": "false", "market_data": "true",
-    }, ttl=120)
+    }, ttl=600)
 
     price = change_24h = rank = volume = ath_change = 0.0
     if cg:
