@@ -22,7 +22,7 @@ KALSHI_PRIVATE_KEY   = os.getenv("KALSHI_PRIVATE_KEY", "")
 # Bankroll & risk
 BANKROLL             = float(os.getenv("BANKROLL", "10000"))
 KELLY_FRACTION       = 0.25
-MIN_EDGE_PCT         = 0.05
+MIN_EDGE_PCT         = float(os.getenv("MIN_EDGE_PCT", "0.05"))
 CONSENSUS_EDGE_PCT   = 0.05
 CONSENSUS_CONFIDENCE = 0.65
 MAX_SINGLE_TRADE_PCT = 0.04
