@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v3 — signals table now populated)
+orchestrator.py  (v3 — signals table now populated + full market debug)
 
 Fixes vs v2:
   1. log_signal() is now called for EVERY market that passes consensus (gates 1-3)
@@ -9,6 +9,7 @@ Fixes vs v2:
      — you can now see everything the bot considered, not just what it traded
   3. Fixed 3x format string bug: %.2%% → %.2f%% (was causing silent log crashes)
   4. log_signal imported alongside log_trade
+  5. DEBUG: logs full first market object so we can identify correct title field
 
 Every SCAN_INTERVAL_SEC:
   1. Pull all open Kalshi markets
@@ -86,8 +87,6 @@ class FlywheelOrchestrator:
         consensus = self.engine.evaluate(ticker, yes_price, signals)
 
         # ── Write signal to Supabase regardless of gate 4 outcome ─────────────
-        # This is what populates the signals table. We log every market that
-        # passes consensus so you can review what the bot saw, not just traded.
         lead_sector = signals[0].sector
         try:
             log_signal(
@@ -122,7 +121,6 @@ class FlywheelOrchestrator:
             )
             return
 
-        # Log arb enhancement to consensus avg_prob if we have sharp data
         if arb.sharp_line_prob is not None:
             logger.info(
                 "SHARP CONFIRM %s | kalshi=%.2f%% sharp=%.2f%% spread=%+.2f%%",
@@ -213,8 +211,10 @@ class FlywheelOrchestrator:
             return
         logger.info("Fetched %d open markets", len(markets))
 
-        logger.info("SAMPLE TITLES: %s", [m.get("title","") for m in markets[:10]])
-        
+        # ── DEBUG: log every field on the first market so we can identify
+        # the correct question/title field. Remove this after one deploy. ──────
+        logger.info("FULL MARKET SAMPLE: %s", markets[0] if markets else "empty")
+
         for market in markets:
             self._evaluate_market(market)
         logger.info("Scan complete")
