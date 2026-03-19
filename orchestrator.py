@@ -212,6 +212,9 @@ class FlywheelOrchestrator:
             logger.error("Failed to fetch markets: %s", e)
             return
         logger.info("Fetched %d open markets", len(markets))
+
+        logger.info("SAMPLE TITLES: %s", [m.get("title","") for m in markets[:10]])
+        
         for market in markets:
             self._evaluate_market(market)
         logger.info("Scan complete")
