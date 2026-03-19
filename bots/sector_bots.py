@@ -1,17 +1,26 @@
 """
-bots/sector_bots.py
+bots/sector_bots.py  (v2 — event_ticker matching + correct price field)
 
-All six concrete sector bots in one file.
-Each inherits BaseBot and implements the three required methods.
+Fixes vs v1:
+  1. is_relevant() now checks event_ticker AND ticker for Kalshi category codes
+     (e.g. KXNBA, KXBTC, KXCPI) in addition to title keyword matching.
+     Previously only checked title which contains outcome labels like
+     "yes Detroit wins by over 16.5 Points" — not the question text.
+     This is why all bots returned None for every market.
+  2. _detect_coin() uses event_ticker prefix for coin detection (KXBTC→bitcoin)
+  3. _extract_teams() uses event_ticker prefix for league detection (KXNBA→NBA)
+  4. _detect_company() uses event_ticker for company/ticker detection
+  5. Number extraction for targets still uses title — that part was correct
+     since title does contain the numeric outcome values
 
-Sectors
--------
-1. EconomicsBot  — CPI, NFP, Fed policy markets
-2. CryptoBot     — BTC/ETH price and dominance markets
-3. PoliticsBot   — Election, approval, legislative markets
-4. WeatherBot    — Temperature, precipitation, storm markets
-5. TechBot       — Earnings surprises, product launch markets
-6. SportsBot     — Game outcome, over/under, MVP markets
+Kalshi event_ticker format examples:
+  KXNBASPREAD-26MAR19DETWAS  → NBA spread market
+  KXBTC-26MAR19              → Bitcoin price market
+  KXCPI-26MAR                → CPI economics market
+  KXFED-26MAR                → Fed rate market
+  KXPRES-2026                → Presidential market
+  KXWTHR-NYC-26MAR           → Weather market
+  KXAAPL-26MAR               → Apple earnings market
 """
 
 import logging
@@ -29,6 +38,20 @@ from shared.data_fetchers import (
 logger = logging.getLogger(__name__)
 
 
+def _search_fields(market: dict, keywords: list[str]) -> bool:
+    """
+    Search across all useful Kalshi market fields for any keyword match.
+    Checks: event_ticker, ticker, title — covers category codes + outcome text.
+    """
+    haystack = " ".join([
+        market.get("event_ticker", ""),
+        market.get("ticker", ""),
+        market.get("title", ""),
+        market.get("subtitle", ""),
+    ]).lower()
+    return any(kw.lower() in haystack for kw in keywords)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  1. ECONOMICS BOT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -39,33 +62,33 @@ class EconomicsBot(BaseBot):
     - "Will CPI be above X% this month?"
     - "Will the Fed raise rates at the next meeting?"
     - "Will unemployment exceed X%?"
-
-    Features: CPI, PCE, unemployment, fed funds, NFP, 10y yield, GDP growth
     """
 
-    KEYWORDS = ["cpi", "inflation", "fed", "unemployment", "nonfarm",
-                "payroll", "gdp", "recession", "rate hike", "rate cut",
-                "pce", "fomc", "interest rate", "treasury", "yield"]
+    # event_ticker codes + human-readable keywords
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxcpi", "kxfed", "kxfomc", "kxgdp", "kxjobs", "kxunrate",
+        "kxpce", "kxnfp", "kxyield", "kxrate", "kxinfl",
+        # Human-readable fallback (title / subtitle)
+        "cpi", "inflation", "fed", "unemployment", "nonfarm",
+        "payroll", "gdp", "recession", "rate hike", "rate cut",
+        "pce", "fomc", "interest rate", "treasury", "yield",
+        "federal reserve", "basis points",
+    ]
 
     @property
     def sector_name(self) -> str:
         return "economics"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
         features, context = fetch_economics_features()
-
-        # Inject contract-specific numeric target if parseable
-        # e.g. "Will CPI be above 3.2%?" → target = 3.2
         title   = market.get("title", "")
         numbers = re.findall(r"\d+\.?\d*", title)
         target  = float(numbers[0]) if numbers else 0.0
         features = np.append(features, target)
-
         context["contract_target"] = target
         return features, context
 
@@ -76,31 +99,54 @@ class EconomicsBot(BaseBot):
 
 class CryptoBot(BaseBot):
     """
-    Markets resolved by crypto price thresholds, dominance, ETF flows, etc.
+    Markets resolved by crypto price thresholds, dominance, ETF flows.
     - "Will BTC close above $X on date Y?"
     - "Will ETH dominance exceed X%?"
     """
 
-    KEYWORDS = ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
-                "sol", "xrp", "ripple", "altcoin", "defi", "nft", "etf",
-                "blockchain", "coinbase", "binance", "stablecoin"]
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
+        "kxbnb", "kxavax", "kxlink", "kxcoin",
+        # Human-readable fallback
+        "bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
+        "sol", "xrp", "ripple", "altcoin", "defi", "nft", "etf",
+        "blockchain", "coinbase", "binance", "stablecoin",
+    ]
 
-    COIN_MAP = {"btc": "bitcoin", "bitcoin": "bitcoin",
-                "eth": "ethereum", "ethereum": "ethereum",
-                "sol": "solana", "xrp": "ripple"}
+    # event_ticker prefix → CoinGecko coin_id
+    TICKER_COIN_MAP = {
+        "kxbtc":  "bitcoin",
+        "kxeth":  "ethereum",
+        "kxsol":  "solana",
+        "kxxrp":  "ripple",
+        "kxdoge": "dogecoin",
+    }
+
+    # Title keyword → CoinGecko coin_id
+    TITLE_COIN_MAP = {
+        "btc":      "bitcoin",  "bitcoin":  "bitcoin",
+        "eth":      "ethereum", "ethereum": "ethereum",
+        "sol":      "solana",   "solana":   "solana",
+        "xrp":      "ripple",   "ripple":   "ripple",
+    }
 
     @property
     def sector_name(self) -> str:
         return "crypto"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
     def _detect_coin(self, market: dict) -> str:
+        # Check event_ticker first (most reliable)
+        et = market.get("event_ticker", "").lower()
+        for prefix, coin_id in self.TICKER_COIN_MAP.items():
+            if et.startswith(prefix):
+                return coin_id
+        # Fall back to title keyword scan
         title = market.get("title", "").lower()
-        for kw, coin_id in self.COIN_MAP.items():
+        for kw, coin_id in self.TITLE_COIN_MAP.items():
             if kw in title:
                 return coin_id
         return "bitcoin"
@@ -108,19 +154,14 @@ class CryptoBot(BaseBot):
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
         coin_id  = self._detect_coin(market)
         features, context = fetch_crypto_features(coin_id=coin_id)
-
-        # Extract price target from title
         title   = market.get("title", "")
         numbers = re.findall(r"[\d,]+\.?\d*", title.replace(",", ""))
         target  = float(numbers[0]) if numbers else 0.0
-
-        # Add ratio of current price vs target as a feature
         current_price = context.get("price", 1.0) or 1.0
         ratio = current_price / target if target > 0 else 1.0
         features = np.append(features, [target, ratio])
-
         context["contract_target"] = target
-        context["price_vs_target"] = ratio
+        context["price_vs_target"]  = ratio
         return features, context
 
 
@@ -131,40 +172,38 @@ class CryptoBot(BaseBot):
 class PoliticsBot(BaseBot):
     """
     Markets on elections, legislation, approval ratings, appointments.
-    - "Will X win the primary?"
-    - "Will Congress pass Y bill?"
-    - "Will approval rating exceed X%?"
     """
 
-    KEYWORDS = ["election", "vote", "congress", "senate", "president",
-                "governor", "democrat", "republican", "bill", "law",
-                "approval", "impeach", "nominee", "ballot", "primary",
-                "caucus", "supreme court", "executive order", "policy"]
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxpres", "kxsenate", "kxhouse", "kxgov", "kxelect",
+        "kxpol", "kxcong", "kxsupct", "kxadmin",
+        # Human-readable fallback
+        "election", "vote", "congress", "senate", "president",
+        "governor", "democrat", "republican", "bill", "law",
+        "approval", "impeach", "nominee", "ballot", "primary",
+        "caucus", "supreme court", "executive order", "policy",
+        "trump", "harris", "biden", "white house",
+    ]
 
     @property
     def sector_name(self) -> str:
         return "politics"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
-        # Try to extract Polymarket slug from market metadata
         poly_slug  = market.get("polymarket_slug")
         features, context = fetch_politics_features(poly_slug)
-
         title   = market.get("title", "")
         numbers = re.findall(r"\d+\.?\d*", title)
         target  = float(numbers[0]) if numbers else 50.0
         features = np.append(features, target)
-
-        # Days to market close
         close_ts = market.get("close_time", "")
         try:
             from datetime import datetime, timezone
-            close_dt = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
+            close_dt      = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
             days_to_close = (close_dt - datetime.now(timezone.utc)).days
         except Exception:
             days_to_close = 30
@@ -180,15 +219,18 @@ class PoliticsBot(BaseBot):
 class WeatherBot(BaseBot):
     """
     Markets on temperature records, precipitation, storm landfalls.
-    - "Will NYC temperature exceed 90°F on date X?"
-    - "Will hurricane landfall in Florida this week?"
     """
 
-    KEYWORDS = ["temperature", "temp", "fahrenheit", "celsius", "snow",
-                "rain", "hurricane", "storm", "tornado", "flood", "drought",
-                "heat", "cold", "blizzard", "wind", "precipitation", "weather"]
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxwthr", "kxhurr", "kxsnow", "kxtmp", "kxrain",
+        "kxstorm", "kxtornado", "kxblizz",
+        # Human-readable fallback
+        "temperature", "temp", "fahrenheit", "celsius", "snow",
+        "rain", "hurricane", "storm", "tornado", "flood", "drought",
+        "heat", "cold", "blizzard", "wind", "precipitation", "weather",
+    ]
 
-    # Known city coordinates — extend as needed
     CITY_COORDS = {
         "new york": (40.71, -74.01), "nyc": (40.71, -74.01),
         "los angeles": (34.05, -118.24), "la": (34.05, -118.24),
@@ -203,31 +245,26 @@ class WeatherBot(BaseBot):
         return "weather"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
     def _detect_city(self, market: dict) -> tuple[float, float, str]:
         title = market.get("title", "").lower()
         for city, coords in self.CITY_COORDS.items():
             if city in title:
                 return coords[0], coords[1], city
-        return 40.71, -74.01, "New York"  # default
+        return 40.71, -74.01, "New York"
 
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
         lat, lon, city = self._detect_city(market)
         features, context = fetch_weather_features(lat, lon, city)
-
-        title   = market.get("title", "")
-        numbers = re.findall(r"\d+\.?\d*", title)
+        title    = market.get("title", "")
+        numbers  = re.findall(r"\d+\.?\d*", title)
         target_f = float(numbers[0]) if numbers else 75.0
         target_c = (target_f - 32) * 5 / 9
-
-        # Feature: how close current max temp is to the threshold
-        delta = context.get("temp_max_c", 0.0) - target_c
+        delta    = context.get("temp_max_c", 0.0) - target_c
         features = np.append(features, [target_c, delta])
-        context["target_c"] = target_c
-        context["delta_from_target"] = delta
+        context["target_c"]           = target_c
+        context["delta_from_target"]  = delta
         return features, context
 
 
@@ -238,41 +275,56 @@ class WeatherBot(BaseBot):
 class TechBot(BaseBot):
     """
     Markets on earnings, product launches, M&A, AI milestones.
-    - "Will Apple beat Q3 EPS estimates?"
-    - "Will GPT-5 launch before date X?"
-    - "Will AAPL close above $X?"
     """
 
-    KEYWORDS = ["earnings", "revenue", "eps", "profit", "ipo", "merger",
-                "acquisition", "apple", "google", "microsoft", "amazon",
-                "meta", "nvidia", "tesla", "openai", "anthropic", "ai",
-                "artificial intelligence", "model", "launch", "release",
-                "stock", "share", "market cap", "nasdaq", "tech"]
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxaapl", "kxgoog", "kxmsft", "kxamzn", "kxmeta", "kxnvda",
+        "kxtsla", "kxearnings", "kxtech", "kxai", "kxipo",
+        "kxopenai", "kxanthropic", "kxnasdaq",
+        # Human-readable fallback
+        "earnings", "revenue", "eps", "profit", "ipo", "merger",
+        "acquisition", "apple", "google", "microsoft", "amazon",
+        "meta", "nvidia", "tesla", "openai", "anthropic", "ai",
+        "artificial intelligence", "model", "launch", "release",
+        "stock", "share", "market cap", "nasdaq", "tech",
+    ]
 
-    TICKER_MAP = {"apple": "AAPL", "google": "GOOGL", "microsoft": "MSFT",
-                  "amazon": "AMZN", "meta": "META", "nvidia": "NVDA",
-                  "tesla": "TSLA"}
+    # event_ticker prefix → stock symbol
+    TICKER_PREFIX_MAP = {
+        "kxaapl": "AAPL", "kxgoog": "GOOGL", "kxmsft": "MSFT",
+        "kxamzn": "AMZN", "kxmeta": "META",  "kxnvda": "NVDA",
+        "kxtsla": "TSLA",
+    }
+
+    # Title keyword → stock symbol
+    TITLE_TICKER_MAP = {
+        "apple": "AAPL", "google": "GOOGL", "microsoft": "MSFT",
+        "amazon": "AMZN", "meta": "META",   "nvidia": "NVDA",
+        "tesla": "TSLA",
+    }
 
     @property
     def sector_name(self) -> str:
         return "tech"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
     def _detect_company(self, market: dict) -> str:
+        et = market.get("event_ticker", "").lower()
+        for prefix, symbol in self.TICKER_PREFIX_MAP.items():
+            if et.startswith(prefix):
+                return symbol
         title = market.get("title", "").lower()
-        for name, ticker in self.TICKER_MAP.items():
+        for name, symbol in self.TITLE_TICKER_MAP.items():
             if name in title:
-                return ticker
+                return symbol
         return "AAPL"
 
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
         company  = self._detect_company(market)
         features, context = fetch_tech_features(company)
-
         title   = market.get("title", "")
         numbers = re.findall(r"[\d,]+\.?\d*", title.replace(",", ""))
         target  = float(numbers[0]) if numbers else 0.0
@@ -288,54 +340,72 @@ class TechBot(BaseBot):
 class SportsBot(BaseBot):
     """
     Markets on game outcomes, over/unders, season props.
-    - "Will the Lakers beat the Celtics on X date?"
-    - "Will the NFL game go over 48.5 points?"
-    - "Will X player score 25+ points?"
     """
 
-    KEYWORDS = ["nba", "nfl", "mlb", "nhl", "soccer", "mls", "ufc", "mma",
-                "basketball", "football", "baseball", "hockey", "tennis",
-                "golf", "f1", "formula 1", "champion", "playoff", "super bowl",
-                "world series", "finals", "game", "match", "season", "win",
-                "score", "points", "over", "under", "spread", "mvp"]
+    KEYWORDS = [
+        # Kalshi event_ticker prefixes
+        "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
+        "kxncaa", "kxcbb", "kxcfb", "kxsoccer", "kxtennis",
+        "kxgolf", "kxf1", "kxnascar", "kxolympic",
+        # Human-readable fallback (title has team names + "Points", "wins")
+        "nba", "nfl", "mlb", "nhl", "soccer", "mls", "ufc", "mma",
+        "basketball", "football", "baseball", "hockey", "tennis",
+        "golf", "f1", "formula 1", "champion", "playoff", "super bowl",
+        "world series", "finals", "wins by", "points scored",
+        "over", "under", "spread", "mvp",
+    ]
+
+    # event_ticker prefix → league name
+    LEAGUE_MAP = {
+        "kxnba":  "NBA", "kxnfl":  "NFL", "kxmlb": "MLB",
+        "kxnhl":  "NHL", "kxmls":  "MLS", "kxufc": "UFC",
+        "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
+    }
 
     @property
     def sector_name(self) -> str:
         return "sports"
 
     def is_relevant(self, market: dict) -> bool:
-        title = (market.get("title", "") + " " +
-                 market.get("ticker", "")).lower()
-        return any(kw in title for kw in self.KEYWORDS)
+        return _search_fields(market, self.KEYWORDS)
 
-    def _extract_teams(self, market: dict) -> tuple[str, str, str]:
-        title  = market.get("title", "")
+    def _extract_teams_and_league(self, market: dict) -> tuple[str, str, str]:
+        # Detect league from event_ticker first (reliable)
+        et     = market.get("event_ticker", "").lower()
         league = "NBA"
-        for lg in ["NBA", "NFL", "MLB", "NHL", "MLS", "UFC"]:
-            if lg.lower() in title.lower():
+        for prefix, lg in self.LEAGUE_MAP.items():
+            if et.startswith(prefix):
                 league = lg
                 break
-        # Naive team extraction: first two words after "Will"
-        parts = title.replace("Will the ", "").replace("Will ", "").split()
-        team_a = parts[0] if len(parts) > 0 else "Team A"
-        # Look for " vs " or " beat "
+
+        # Fall back to title scan for league if not in event_ticker
+        title = market.get("title", "")
+        if league == "NBA":
+            for lg in ["NFL", "MLB", "NHL", "MLS", "UFC"]:
+                if lg.lower() in title.lower():
+                    league = lg
+                    break
+
+        # Extract teams from title (still the right place — has team names)
+        team_a, team_b = "Team A", "Team B"
         if " vs " in title:
-            teams = title.split(" vs ")
-            team_a = teams[0].strip().split()[-1]
-            team_b = teams[1].strip().split()[0]
+            parts  = title.split(" vs ")
+            team_a = parts[0].strip().split()[-1]
+            team_b = parts[1].strip().split()[0]
         elif " beat " in title.lower():
-            idx = title.lower().index(" beat ")
+            idx    = title.lower().index(" beat ")
             team_a = title[:idx].split()[-1]
             team_b = title[idx + 6:].split()[0]
-        else:
-            team_b = "Team B"
+        elif "wins" in title.lower():
+            # Format: "yes Detroit wins by over 16.5 Points"
+            words  = title.replace("yes ", "").replace("no ", "").split()
+            team_a = words[0] if words else "Team A"
+
         return team_a, team_b, league
 
     def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
-        team_a, team_b, league = self._extract_teams(market)
+        team_a, team_b, league = self._extract_teams_and_league(market)
         features, context = fetch_sports_features(team_a, team_b, league)
-
-        # Over/under target from title
         title   = market.get("title", "")
         numbers = re.findall(r"\d+\.?\d*", title)
         ou_line = float(numbers[0]) if numbers else 0.0

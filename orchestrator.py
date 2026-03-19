@@ -1,21 +1,19 @@
 """
-orchestrator.py  (v3 — signals table now populated + full market debug)
+orchestrator.py  (v4 — correct Kalshi price fields)
 
-Fixes vs v2:
-  1. log_signal() is now called for EVERY market that passes consensus (gates 1-3)
-     — this is what populates the signals table in Supabase
-     — previously log_signal was never called, so signals table stayed at 0 rows
-  2. log_signal() is also called when the arb gate vetoes a trade
-     — you can now see everything the bot considered, not just what it traded
-  3. Fixed 3x format string bug: %.2%% → %.2f%% (was causing silent log crashes)
-  4. log_signal imported alongside log_trade
-  5. DEBUG: logs full first market object so we can identify correct title field
+Fixes vs v3:
+  1. Price now reads yes_bid_dollars / yes_ask_dollars (string, 0-1 range)
+     and converts to cents (* 100). Previously used yes_bid/yes_ask which
+     don't exist in the Kalshi API response — so yes_price was always 50.
+  2. Falls back to last_price_dollars if bid/ask are both zero (illiquid market)
+  3. Skips markets with zero liquidity (both bid and ask at 0 AND no last price)
+  4. Debug log line removed now that field names are confirmed
 
 Every SCAN_INTERVAL_SEC:
   1. Pull all open Kalshi markets
   2. Each sector bot evaluates relevance + generates BotSignal
   3. ConsensusEngine: direction + edge + confidence gates (gates 1-3)
-  4. log_signal() ← WRITTEN HERE regardless of gate 4 outcome
+  4. log_signal() — written here regardless of gate 4 outcome
   5. ArbLayer: cross-venue check vs Polymarket / OddsPapi (gate 4)
   6. Kelly size + place order + log_trade()
 
@@ -49,6 +47,38 @@ logging.basicConfig(
 logger = logging.getLogger("orchestrator")
 
 
+def _parse_yes_price_cents(market: dict) -> int:
+    """
+    Extract yes price in cents (0-100) from the Kalshi market object.
+
+    Kalshi returns prices as dollar strings in 0.0-1.0 range:
+      yes_bid_dollars: "0.4200"
+      yes_ask_dollars: "0.4400"
+      last_price_dollars: "0.4300"
+
+    Priority:
+      1. Midpoint of bid + ask (most accurate for liquid markets)
+      2. last_price_dollars (fallback for illiquid markets with no current quote)
+      3. 0 if none available (caller will skip this market)
+    """
+    try:
+        bid = float(market.get("yes_bid_dollars") or 0)
+        ask = float(market.get("yes_ask_dollars") or 0)
+        if bid > 0 and ask > 0:
+            return int(round((bid + ask) / 2 * 100))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        last = float(market.get("last_price_dollars") or 0)
+        if last > 0:
+            return int(round(last * 100))
+    except (TypeError, ValueError):
+        pass
+
+    return 0
+
+
 class FlywheelOrchestrator:
 
     def __init__(self):
@@ -63,12 +93,15 @@ class FlywheelOrchestrator:
 
     def _evaluate_market(self, market: dict) -> None:
         ticker    = market.get("ticker", "UNKNOWN")
-        yes_bid   = market.get("yes_bid", 0)
-        yes_ask   = market.get("yes_ask", 100)
-        yes_price = int((yes_bid + yes_ask) / 2)
         title     = market.get("title", "")
+        yes_price = _parse_yes_price_cents(market)
 
-        if yes_price <= 1 or yes_price >= 99:
+        # Skip markets with no price data (no liquidity yet)
+        if yes_price == 0:
+            return
+
+        # Skip markets at the extreme ends (near-certain outcomes, no edge)
+        if yes_price <= 2 or yes_price >= 98:
             return
 
         # ── Gates 1-3: Bot consensus ───────────────────────────────────────────
@@ -125,9 +158,9 @@ class FlywheelOrchestrator:
             logger.info(
                 "SHARP CONFIRM %s | kalshi=%.2f%% sharp=%.2f%% spread=%+.2f%%",
                 ticker,
-                yes_price / 100 * 100,
+                yes_price,
                 arb.sharp_line_prob * 100,
-                (yes_price / 100 - arb.sharp_line_prob) * 100,
+                yes_price - arb.sharp_line_prob * 100,
             )
 
         # ── Kelly sizing ───────────────────────────────────────────────────────
@@ -135,20 +168,20 @@ class FlywheelOrchestrator:
 
         if consensus.direction == "YES":
             sizing = kelly_stake(
-                prob             = consensus.avg_prob,
-                yes_price_cents  = yes_price,
-                bankroll         = self.bankroll,
-                sector           = lead_sector,
-                sector_exposure  = sector_exp,
+                prob            = consensus.avg_prob,
+                yes_price_cents = yes_price,
+                bankroll        = self.bankroll,
+                sector          = lead_sector,
+                sector_exposure = sector_exp,
             )
             side = "yes"
         else:
             sizing = no_kelly_stake(
-                prob             = consensus.avg_prob,
-                yes_price_cents  = yes_price,
-                bankroll         = self.bankroll,
-                sector           = lead_sector,
-                sector_exposure  = sector_exp,
+                prob            = consensus.avg_prob,
+                yes_price_cents = yes_price,
+                bankroll        = self.bankroll,
+                sector          = lead_sector,
+                sector_exposure = sector_exp,
             )
             side = "no"
 
@@ -189,15 +222,9 @@ class FlywheelOrchestrator:
         arb_note = f" arb_spread={arb.cross_spread:.2f}%" if arb.arb_exists else ""
         logger.info(
             "TRADE #%d | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%%s",
-            trade_id,
-            ticker,
-            consensus.direction.upper(),
-            sizing["contracts"],
-            yes_price,
-            sizing["dollars"],
-            consensus.avg_edge * 100,
-            consensus.avg_confidence * 100,
-            arb_note,
+            trade_id, ticker, consensus.direction.upper(),
+            sizing["contracts"], yes_price, sizing["dollars"],
+            consensus.avg_edge * 100, consensus.avg_confidence * 100, arb_note,
         )
 
     # ── Market scan ────────────────────────────────────────────────────────────
@@ -210,11 +237,6 @@ class FlywheelOrchestrator:
             logger.error("Failed to fetch markets: %s", e)
             return
         logger.info("Fetched %d open markets", len(markets))
-
-        # ── DEBUG: log every field on the first market so we can identify
-        # the correct question/title field. Remove this after one deploy. ──────
-        logger.info("FULL MARKET SAMPLE: %s", markets[0] if markets else "empty")
-
         for market in markets:
             self._evaluate_market(market)
         logger.info("Scan complete")
@@ -239,7 +261,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v3 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v4 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
