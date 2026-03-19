@@ -1,19 +1,16 @@
 """
-shared/calibration_logger.py  (v4 — Postgres interval fix + better error logging)
+shared/calibration_logger.py  (v5 — np.float64 cast fix)
 
-Fixes vs v3:
-  1. Postgres INTERVAL syntax fixed — was using string interpolation
-     which breaks with psycopg2; now uses parameterized query correctly
-  2. log_signal and log_trade both log a confirmation line on success
-     so you can verify writes are reaching Supabase in Railway logs
-  3. init_db() logs which mode it's running in at INFO level (was silent)
-  4. _db() context manager logs connection errors explicitly
+Fixes vs v4:
+  1. All numeric values explicitly cast to Python float()/int()/str() before
+     being passed to psycopg2. numpy's np.float64 type was being serialized
+     as the literal string "np.float64(0.283...)" which Postgres parsed as
+     schema "np" → column "float64" → crash: schema "np" does not exist.
+  2. Fix applied to log_signal, log_trade, log_outcome, compute_calibration
 
 Automatically detects which database to use:
   - DATABASE_URL set → Supabase PostgreSQL (Railway production)
   - DATABASE_URL not set → local SQLite (laptop dev mode)
-
-Zero code changes needed when switching environments.
 """
 
 import logging
@@ -35,7 +32,6 @@ USE_POSTGRES = bool(DATABASE_URL)
 def _db():
     if USE_POSTGRES:
         import psycopg2
-        import psycopg2.extras
         try:
             conn = psycopg2.connect(DATABASE_URL)
         except Exception as e:
@@ -62,7 +58,6 @@ def _db():
 
 
 def _rows_to_dicts(rows, cursor=None):
-    """Normalise both sqlite3.Row and psycopg2 tuples into dicts."""
     if not rows:
         return []
     if USE_POSTGRES and cursor:
@@ -80,7 +75,6 @@ def _ph(n: int) -> str:
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    """Create tables if they don't exist. Works for both SQLite and Postgres."""
     mode = "Supabase PostgreSQL" if USE_POSTGRES else f"SQLite at {DB_PATH}"
     logger.info("Initialising database — %s", mode)
 
@@ -189,8 +183,8 @@ def log_signal(
 ) -> None:
     """
     Write one row to the signals table.
-    Called for every market that passes consensus (gates 1-3),
-    regardless of whether the arb gate or Kelly sizer approves the trade.
+    All numeric values cast to Python native types to prevent
+    np.float64 being serialized as a string by psycopg2.
     """
     sql = f"""
         INSERT INTO signals
@@ -200,10 +194,14 @@ def log_signal(
     """
     vals = (
         datetime.now(timezone.utc).isoformat(),
-        ticker, sector,
-        our_prob, market_prob,
-        edge, confidence,
-        direction, brier_score,
+        str(ticker),
+        str(sector),
+        float(our_prob),
+        float(market_prob),
+        float(edge),
+        float(confidence),
+        str(direction),
+        float(brier_score) if brier_score is not None else None,
     )
     with _db() as conn:
         if USE_POSTGRES:
@@ -213,7 +211,9 @@ def log_signal(
     logger.info(
         "SIGNAL logged | %s | %s | prob=%.2f%% edge=%+.2f%% conf=%.0f%%",
         ticker, direction,
-        our_prob * 100, edge * 100, confidence * 100,
+        float(our_prob) * 100,
+        float(edge) * 100,
+        float(confidence) * 100,
     )
 
 
@@ -231,14 +231,20 @@ def log_trade(
 ) -> int:
     """
     Write one row to the trades table. Returns the new trade ID.
-    demo_mode=True means the trade was simulated (no real money moved).
+    All numeric values cast to Python native types.
     """
     vals = (
         datetime.now(timezone.utc).isoformat(),
-        ticker, direction,
-        contracts, yes_price_cents, dollars_risked,
-        avg_prob, avg_edge, avg_confidence,
-        order_id, int(demo_mode),
+        str(ticker),
+        str(direction),
+        int(contracts),
+        int(yes_price_cents),
+        float(dollars_risked),
+        float(avg_prob),
+        float(avg_edge),
+        float(avg_confidence),
+        str(order_id) if order_id is not None else None,
+        int(demo_mode),
     )
 
     with _db() as conn:
@@ -251,7 +257,7 @@ def log_trade(
                  order_id, demo_mode)
                 VALUES ({_ph(11)}) RETURNING id
             """, vals)
-            trade_id = cur.fetchone()[0]
+            trade_id = int(cur.fetchone()[0])
         else:
             cur = conn.execute(f"""
                 INSERT INTO trades
@@ -260,12 +266,13 @@ def log_trade(
                  order_id, demo_mode)
                 VALUES ({_ph(11)})
             """, vals)
-            trade_id = cur.lastrowid
+            trade_id = int(cur.lastrowid)
 
     logger.info(
         "TRADE logged #%d | %s | %s %dx@%dc | $%.2f | demo=%s",
         trade_id, ticker, direction,
-        contracts, yes_price_cents, dollars_risked, demo_mode,
+        int(contracts), int(yes_price_cents),
+        float(dollars_risked), bool(demo_mode),
     )
     return trade_id
 
@@ -278,8 +285,10 @@ def log_outcome(
 ) -> None:
     vals = (
         datetime.now(timezone.utc).isoformat(),
-        ticker, resolved.upper(),
-        pnl_usd, trade_id,
+        str(ticker),
+        str(resolved).upper(),
+        float(pnl_usd) if pnl_usd is not None else None,
+        int(trade_id) if trade_id is not None else None,
     )
     sql = f"""
         INSERT INTO outcomes (logged_at, ticker, resolved, pnl_usd, trade_id)
@@ -293,21 +302,16 @@ def log_outcome(
     logger.info(
         "OUTCOME logged | %s resolved=%s P&L=%s",
         ticker, resolved,
-        f"${pnl_usd:.2f}" if pnl_usd is not None else "pending",
+        f"${float(pnl_usd):.2f}" if pnl_usd is not None else "pending",
     )
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 
 def compute_calibration(sector: str, window_days: int = 30) -> dict:
-    """
-    Compute Brier score and accuracy for a sector over the last window_days.
-    Uses parameterized interval to avoid psycopg2 string interpolation issues.
-    """
     if USE_POSTGRES:
-        # Correct parameterized interval for psycopg2 — do NOT use f-string here
         date_sql = "s.created_at >= NOW() - INTERVAL '%s days'"
-        params   = (sector, window_days)
+        params   = (str(sector), int(window_days))
         sql = f"""
             SELECT s.our_prob, o.resolved, s.edge, s.confidence
             FROM signals s
@@ -318,7 +322,7 @@ def compute_calibration(sector: str, window_days: int = 30) -> dict:
         """
     else:
         date_sql = "s.created_at >= datetime('now', ? || ' days')"
-        params   = (sector, f"-{window_days}")
+        params   = (str(sector), f"-{int(window_days)}")
         sql = f"""
             SELECT s.our_prob, o.resolved, s.edge, s.confidence
             FROM signals s
@@ -340,10 +344,10 @@ def compute_calibration(sector: str, window_days: int = 30) -> dict:
         logger.info("[%s] No resolved signals in last %d days", sector, window_days)
         return {"sector": sector, "n": 0, "brier": None, "accuracy": None}
 
-    probs   = [r["our_prob"] for r in rows]
+    probs   = [float(r["our_prob"]) for r in rows]
     actuals = [1 if r["resolved"] == "YES" else 0 for r in rows]
-    edges   = [r["edge"] for r in rows]
-    confs   = [r["confidence"] for r in rows]
+    edges   = [float(r["edge"]) for r in rows]
+    confs   = [float(r["confidence"]) for r in rows]
 
     brier    = sum((p - a) ** 2 for p, a in zip(probs, actuals)) / len(rows)
     accuracy = sum(
@@ -351,19 +355,24 @@ def compute_calibration(sector: str, window_days: int = 30) -> dict:
     ) / len(rows)
 
     stats = {
-        "sector":          sector,
-        "n":               len(rows),
-        "brier":           round(brier, 4),
-        "accuracy":        round(accuracy, 4),
-        "avg_edge":        round(sum(edges) / len(edges), 4),
-        "avg_confidence":  round(sum(confs) / len(confs), 4),
+        "sector":         str(sector),
+        "n":              int(len(rows)),
+        "brier":          round(float(brier), 4),
+        "accuracy":       round(float(accuracy), 4),
+        "avg_edge":       round(float(sum(edges) / len(edges)), 4),
+        "avg_confidence": round(float(sum(confs) / len(confs)), 4),
     }
 
     ins_vals = (
         datetime.now(timezone.utc).isoformat(),
-        sector, window_days, len(rows),
-        brier, accuracy,
-        stats["avg_edge"], stats["avg_confidence"], 0,
+        str(sector),
+        int(window_days),
+        int(len(rows)),
+        float(brier),
+        float(accuracy),
+        float(stats["avg_edge"]),
+        float(stats["avg_confidence"]),
+        float(0),
     )
     ins_sql = f"""
         INSERT INTO calibration_stats
@@ -379,6 +388,6 @@ def compute_calibration(sector: str, window_days: int = 30) -> dict:
 
     logger.info(
         "[%s] Calibration: Brier=%.4f Acc=%.1f%% n=%d",
-        sector, brier, accuracy * 100, len(rows),
+        sector, float(brier), float(accuracy) * 100, int(len(rows)),
     )
     return stats
