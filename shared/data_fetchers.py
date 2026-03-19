@@ -1,11 +1,12 @@
 """
-shared/data_fetchers.py  (v3 — CoinGecko 429 fixes)
+shared/data_fetchers.py  (v4 — FRED fallbacks + CoinGecko 429 fixes)
 
 Fixes applied:
-  1. Batched CoinGecko call — all coins fetched in one /coins/markets request
-  2. Exponential backoff retry in _get for 429 responses (1s, 2s, 4s)
-  3. Global threading lock + min interval to serialize CoinGecko calls
-  4. Redis-ready note: for multi-process Railway deploys, swap _cache for Redis
+  1. FRED hardcoded fallbacks — bot stays functional during FRED 500s/outages
+  2. Exponential backoff retry in _get for 429/500/502/503 responses (1s, 2s, 4s)
+  3. Batched CoinGecko call — all coins fetched in one /coins/markets request
+  4. Global threading lock + min interval to serialize CoinGecko calls
+  5. Redis-ready note: for multi-process Railway deploys, swap _cache for Redis
 
 Fetcher priority logic per sector:
   - If a premium key is present, use the premium source
@@ -53,11 +54,11 @@ def _get(url: str, params: dict = None, headers: dict = None,
         try:
             r = requests.get(url, params=params or {}, headers=headers or {},
                              auth=auth, timeout=12)
-            if r.status_code == 429:
+            if r.status_code in (429, 500, 502, 503):
                 wait = 2 ** attempt  # 1s, 2s, 4s
                 logger.warning(
-                    "Rate limited (429) by %s — retrying in %ss (attempt %d/%d)",
-                    url, wait, attempt + 1, retries
+                    "HTTP %s from %s — retrying in %ss (attempt %d/%d)",
+                    r.status_code, url, wait, attempt + 1, retries
                 )
                 time.sleep(wait)
                 continue
@@ -123,9 +124,21 @@ def _fetch_all_cg_markets() -> dict[str, dict]:
 #  1. ECONOMICS
 # =============================================================================
 
+# Last-known values used as fallback when FRED returns 500s or is unreachable.
+# Update these periodically to keep the fallback reasonable.
+FRED_FALLBACKS = {
+    "CPIAUCSL":        314.0,    # CPI, Feb 2026 approx
+    "PCEPI":           125.0,    # PCE price index
+    "UNRATE":          4.1,      # Unemployment rate %
+    "FEDFUNDS":        4.33,     # Fed funds rate %
+    "PAYEMS":          159000.0, # Nonfarm payrolls (thousands)
+    "DGS10":           4.3,      # 10-year Treasury yield %
+    "A191RL1Q225SBEA": 2.8,      # Real GDP growth % annualized
+}
+
 def fetch_economics_features() -> tuple[np.ndarray, dict]:
     """
-    Free path   : FRED API
+    Free path   : FRED API (with hardcoded fallbacks on 500/outage)
     Premium path: Alpha Vantage economic indicators (richer, real-time)
     Extra signal: Polygon.io futures prices (leading indicators before FRED)
     """
@@ -167,17 +180,23 @@ def fetch_economics_features() -> tuple[np.ndarray, dict]:
 
     else:
         # ── FRED fallback (Tier 1) ────────────────────────────────────────────
-        FRED = "https://api.stlouisfed.org/fred/series/observations"
+        FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 
-        def _fred(series_id):
-            d = _get(FRED, {
+        def _fred(series_id: str) -> float:
+            d = _get(FRED_URL, {
                 "series_id": series_id, "api_key": FRED_API_KEY,
                 "file_type": "json", "sort_order": "desc", "limit": 1,
             }, ttl=3600)
             try:
-                return float(d["observations"][0]["value"])
+                val = d["observations"][0]["value"]
+                return float(val)
             except Exception:
-                return 0.0
+                fallback = FRED_FALLBACKS.get(series_id, 0.0)
+                logger.warning(
+                    "FRED parse failed for %s — using hardcoded fallback %.2f",
+                    series_id, fallback
+                )
+                return fallback
 
         cpi          = _fred("CPIAUCSL")
         pce          = _fred("PCEPI")
