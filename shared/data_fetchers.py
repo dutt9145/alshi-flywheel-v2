@@ -1,5 +1,11 @@
 """
-shared/data_fetchers.py  (v2 — upgraded APIs)
+shared/data_fetchers.py  (v3 — CoinGecko 429 fixes)
+
+Fixes applied:
+  1. Batched CoinGecko call — all coins fetched in one /coins/markets request
+  2. Exponential backoff retry in _get for 429 responses (1s, 2s, 4s)
+  3. Global threading lock + min interval to serialize CoinGecko calls
+  4. Redis-ready note: for multi-process Railway deploys, swap _cache for Redis
 
 Fetcher priority logic per sector:
   - If a premium key is present, use the premium source
@@ -13,6 +19,7 @@ Tier 3 ($29-150): Glassnode, Tomorrow.io, Alpha Vantage sentiment, Coinglass, Lu
 """
 
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -29,25 +36,87 @@ from config.settings import (
 logger = logging.getLogger(__name__)
 
 # ── In-memory TTL cache ───────────────────────────────────────────────────────
+# NOTE: This cache is per-process. If you have multiple Railway services hitting
+# the same APIs, swap this for a Redis-backed cache (e.g. redis-py + REDIS_URL)
+# so the TTL is respected across all processes.
 
 _cache: dict = {}
 
 def _get(url: str, params: dict = None, headers: dict = None,
-         ttl: int = 300, auth=None) -> Optional[dict]:
+         ttl: int = 300, auth=None, retries: int = 3) -> Optional[dict]:
     key = url + str(sorted((params or {}).items()))
     entry = _cache.get(key)
     if entry and (time.time() - entry["ts"] < ttl):
         return entry["data"]
-    try:
-        r = requests.get(url, params=params or {}, headers=headers or {},
-                         auth=auth, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        _cache[key] = {"ts": time.time(), "data": data}
-        return data
-    except Exception as e:
-        logger.warning("Fetch failed %s: %s", url, e)
-        return entry["data"] if entry else None
+
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params or {}, headers=headers or {},
+                             auth=auth, timeout=12)
+            if r.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(
+                    "Rate limited (429) by %s — retrying in %ss (attempt %d/%d)",
+                    url, wait, attempt + 1, retries
+                )
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            _cache[key] = {"ts": time.time(), "data": data}
+            return data
+        except Exception as e:
+            logger.warning("Fetch failed %s: %s", url, e)
+            if attempt == retries - 1:
+                return entry["data"] if entry else None
+
+    return entry["data"] if entry else None
+
+
+# ── CoinGecko rate-limit guard ────────────────────────────────────────────────
+# CoinGecko free tier: ~10-30 req/min. Multiple bots calling simultaneously
+# blows past this instantly. Serialise all CG calls behind a lock with a
+# minimum interval, and batch all coins into one /coins/markets request.
+
+_cg_lock = threading.Lock()
+_cg_last_call: float = 0.0
+_CG_MIN_INTERVAL: float = 2.0  # seconds between any CoinGecko call
+
+def _cg_rate_limited_get(url: str, params: dict, ttl: int) -> Optional[dict]:
+    """Wrapper around _get that enforces a minimum interval for CoinGecko."""
+    global _cg_last_call
+    with _cg_lock:
+        elapsed = time.time() - _cg_last_call
+        if elapsed < _CG_MIN_INTERVAL:
+            time.sleep(_CG_MIN_INTERVAL - elapsed)
+        _cg_last_call = time.time()
+    return _get(url, params, ttl=ttl)
+
+
+# ── Batched CoinGecko fetch ───────────────────────────────────────────────────
+
+_KNOWN_COINS = ["bitcoin", "ethereum", "solana", "ripple"]
+
+def _fetch_all_cg_markets() -> dict[str, dict]:
+    """
+    Fetch all tracked coins in ONE CoinGecko /coins/markets call.
+    Returns a dict keyed by coin_id, e.g. {"bitcoin": {...}, "ethereum": {...}}.
+    TTL 600s so all bots share this result within the same process.
+    """
+    ids_str = ",".join(_KNOWN_COINS)
+    data = _cg_rate_limited_get(
+        "https://api.coingecko.com/api/v3/coins/markets",
+        {
+            "vs_currency": "usd",
+            "ids": ids_str,
+            "price_change_percentage": "24h",
+            "sparkline": "false",
+        },
+        ttl=600,
+    )
+    if not data:
+        return {}
+    return {coin["id"]: coin for coin in data}
 
 
 # =============================================================================
@@ -123,9 +192,8 @@ def fetch_economics_features() -> tuple[np.ndarray, dict]:
     # ── Polygon futures (Tier 2) — leading indicators ────────────────────────
     futures_yield = yield_10y
     if POLYGON_API_KEY:
-        # Fed funds futures imply near-term rate expectations
         ff_data = _get(
-            "https://api.polygon.io/v2/last/trade/ZQ",  # CME Fed Funds future
+            "https://api.polygon.io/v2/last/trade/ZQ",
             {"apiKey": POLYGON_API_KEY}, ttl=120
         )
         if ff_data:
@@ -154,7 +222,7 @@ def fetch_economics_features() -> tuple[np.ndarray, dict]:
 
 def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     """
-    Free path  : CoinGecko + Fear & Greed
+    Free path  : CoinGecko batched /coins/markets + Fear & Greed
     Tier 2     : Polygon.io crypto WebSocket snapshot
     Tier 3     : Glassnode on-chain (exchange netflow, whale count)
                  Coinglass (funding rates, liquidations)
@@ -162,20 +230,19 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     """
     context = {"coin": coin_id}
 
-    # ── CoinGecko base (always — free, reliable) ──────────────────────────────
-    time.sleep(0.1)  # before the CoinGecko call to avoid hitting their rate limit
-    cg = _get(f"https://api.coingecko.com/api/v3/coins/{coin_id}", {
-        "localization": "false", "tickers": "false", "market_data": "true",
-    }, ttl=600)
+    # ── CoinGecko batched (always — free, rate-limit safe) ───────────────────
+    # All coins fetched in a single API call, shared across bots via _cache.
+    cg_all = _fetch_all_cg_markets()
+    cg = cg_all.get(coin_id, {})
 
     price = change_24h = rank = volume = ath_change = 0.0
     if cg:
-        md = cg.get("market_data", {})
-        price      = md.get("current_price", {}).get("usd", 0.0)
-        change_24h = md.get("price_change_percentage_24h", 0.0)
+        price      = float(cg.get("current_price", 0) or 0)
+        change_24h = float(cg.get("price_change_percentage_24h", 0) or 0)
         rank       = float(cg.get("market_cap_rank", 0) or 0)
-        volume     = md.get("total_volume", {}).get("usd", 0.0)
-        ath_change = md.get("ath_change_percentage", {}).get("usd", 0.0)
+        volume     = float(cg.get("total_volume", 0) or 0)
+        ath_pct    = cg.get("ath_change_percentage")
+        ath_change = float(ath_pct) if ath_pct is not None else 0.0
 
     # Fear & Greed
     fg = _get("https://api.alternative.me/fng/", {}, ttl=3600)
@@ -203,18 +270,22 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     whale_count      = 0.0
     if GLASSNODE_API_KEY:
         asset = {"bitcoin": "BTC", "ethereum": "ETH"}.get(coin_id, "BTC")
-        netflow_data = _get("https://api.glassnode.com/v1/metrics/transactions/transfers_volume_exchanges_net", {
-            "a": asset, "api_key": GLASSNODE_API_KEY, "i": "24h",
-        }, ttl=1800)
+        netflow_data = _get(
+            "https://api.glassnode.com/v1/metrics/transactions/transfers_volume_exchanges_net",
+            {"a": asset, "api_key": GLASSNODE_API_KEY, "i": "24h"},
+            ttl=1800,
+        )
         if netflow_data:
             try:
                 exchange_netflow = float(netflow_data[-1]["v"])
             except Exception:
                 pass
 
-        whale_data = _get("https://api.glassnode.com/v1/metrics/addresses/count", {
-            "a": asset, "api_key": GLASSNODE_API_KEY, "i": "24h",
-        }, ttl=3600)
+        whale_data = _get(
+            "https://api.glassnode.com/v1/metrics/addresses/count",
+            {"a": asset, "api_key": GLASSNODE_API_KEY, "i": "24h"},
+            ttl=3600,
+        )
         if whale_data:
             try:
                 whale_count = float(whale_data[-1]["v"]) / 1e6
@@ -222,13 +293,15 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
                 pass
 
     # ── Coinglass (Tier 3) — funding rate & liquidations ─────────────────────
-    funding_rate  = 0.0
-    liquidations  = 0.0
+    funding_rate = 0.0
     if COINGLASS_KEY:
         sym_cg = {"bitcoin": "BTC", "ethereum": "ETH"}.get(coin_id, "BTC")
-        fund_data = _get("https://open-api.coinglass.com/public/v2/funding", {
-            "symbol": sym_cg,
-        }, headers={"coinglassSecret": COINGLASS_KEY}, ttl=300)
+        fund_data = _get(
+            "https://open-api.coinglass.com/public/v2/funding",
+            {"symbol": sym_cg},
+            headers={"coinglassSecret": COINGLASS_KEY},
+            ttl=300,
+        )
         if fund_data:
             try:
                 funding_rate = float(fund_data["data"][0]["fundingRate"])
@@ -241,9 +314,12 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     if LUNARCRUSH_KEY:
         sym_lc = {"bitcoin": "BTC", "ethereum": "ETH",
                   "solana": "SOL"}.get(coin_id, "BTC")
-        lc_data = _get(f"https://lunarcrush.com/api4/public/coins/{sym_lc}/v1",
-                       {}, headers={"Authorization": f"Bearer {LUNARCRUSH_KEY}"},
-                       ttl=600)
+        lc_data = _get(
+            f"https://lunarcrush.com/api4/public/coins/{sym_lc}/v1",
+            {},
+            headers={"Authorization": f"Bearer {LUNARCRUSH_KEY}"},
+            ttl=600,
+        )
         if lc_data:
             try:
                 d = lc_data["data"]
@@ -305,14 +381,13 @@ def fetch_politics_features(polymarket_slug: Optional[str] = None) -> tuple[np.n
             pass
 
     # ── Finnhub news sentiment (Tier 1 — free 60 req/min) ────────────────────
-    news_sentiment  = 0.0
-    news_volume     = 0.0
+    news_sentiment = 0.0
+    news_volume    = 0.0
     if FINNHUB_API_KEY:
         fin_news = _get("https://finnhub.io/api/v1/news",
                         {"category": "politics", "token": FINNHUB_API_KEY}, ttl=1800)
         if fin_news:
-            news_volume = float(len(fin_news)) / 100.0
-            # Finnhub news doesn't have sentiment natively — proxy via headline count
+            news_volume    = float(len(fin_news)) / 100.0
             news_sentiment = min(news_volume, 1.0)
     elif NEWSAPI_KEY:
         nd = _get("https://newsapi.org/v2/everything", {
@@ -322,7 +397,6 @@ def fetch_politics_features(polymarket_slug: Optional[str] = None) -> tuple[np.n
         if nd:
             news_volume = float(nd.get("totalResults", 0)) / 1000.0
 
-    # Approval rating placeholder (replace with 538/RCP scraper)
     approval_rating = 45.0
     days_to_event   = 30.0
 
@@ -430,16 +504,16 @@ def fetch_tech_features(company: str = "AAPL") -> tuple[np.ndarray, dict]:
     days_to_earnings = 45.0
     analyst_buy_pct  = 0.60
     eps_surprise     = 0.0
-    insider_buy_sell = 0.0  # positive = net buying
+    insider_buy_sell = 0.0
     options_iv       = 0.0
     news_sentiment   = 0.0
 
     # ── Finnhub (Tier 1 — free) — earnings + analyst grades ──────────────────
     if FINNHUB_API_KEY:
-        # Earnings calendar
         import datetime
-        today   = datetime.date.today()
-        in_90   = today + datetime.timedelta(days=90)
+        today = datetime.date.today()
+        in_90 = today + datetime.timedelta(days=90)
+
         ec = _get("https://finnhub.io/api/v1/calendar/earnings", {
             "from": str(today), "to": str(in_90), "token": FINNHUB_API_KEY,
         }, ttl=3600)
@@ -454,19 +528,17 @@ def fetch_tech_features(company: str = "AAPL") -> tuple[np.ndarray, dict]:
                         pass
                     break
 
-        # Analyst recommendation grades
         grade = _get("https://finnhub.io/api/v1/stock/recommendation", {
             "symbol": company, "token": FINNHUB_API_KEY,
         }, ttl=3600)
         if grade:
             try:
-                g = grade[0]
+                g     = grade[0]
                 total = g["buy"] + g["hold"] + g["sell"] + 1
                 analyst_buy_pct = g["buy"] / total
             except Exception:
                 pass
 
-        # Company news sentiment (use headline count as proxy)
         news = _get("https://finnhub.io/api/v1/company-news", {
             "symbol": company, "from": str(today), "to": str(today),
             "token": FINNHUB_API_KEY,
@@ -476,16 +548,15 @@ def fetch_tech_features(company: str = "AAPL") -> tuple[np.ndarray, dict]:
 
     # ── FMP (Tier 2) — insider trades + earnings history ─────────────────────
     if FMP_API_KEY:
-        insider = _get(f"https://financialmodelingprep.com/api/v4/insider-trading", {
+        insider = _get("https://financialmodelingprep.com/api/v4/insider-trading", {
             "symbol": company, "page": 0, "apikey": FMP_API_KEY,
         }, ttl=3600)
         if insider:
             buys  = sum(1 for t in insider if t.get("transactionType") == "P-Purchase")
             sells = sum(1 for t in insider if t.get("transactionType") == "S-Sale")
             total = buys + sells + 1
-            insider_buy_sell = (buys - sells) / total  # -1 to +1
+            insider_buy_sell = (buys - sells) / total
 
-        # EPS surprise history (most recent)
         hist = _get(f"https://financialmodelingprep.com/api/v3/earnings-surprises/{company}", {
             "apikey": FMP_API_KEY,
         }, ttl=7200)
@@ -550,10 +621,10 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
 
     elo_a = elo_b = 1500.0
     home_advantage = 1.0
-    vegas_spread = 0.0
-    pinnacle_prob = 0.5   # sharpest probability in the world
-    home_win_pct = 0.5
-    away_win_pct = 0.5
+    vegas_spread   = 0.0
+    pinnacle_prob  = 0.5
+    home_win_pct   = 0.5
+    away_win_pct   = 0.5
 
     # ── TheOddsAPI (Tier 2) — Pinnacle + 80 books ────────────────────────────
     sport_key = {
@@ -563,11 +634,11 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
 
     if ODDS_API_KEY:
         odds = _get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", {
-            "apiKey":  ODDS_API_KEY,
-            "regions": "us",
-            "markets": "h2h",
-            "oddsFormat": "decimal",
-            "bookmakers": "pinnacle",
+            "apiKey":      ODDS_API_KEY,
+            "regions":     "us",
+            "markets":     "h2h",
+            "oddsFormat":  "decimal",
+            "bookmakers":  "pinnacle",
         }, ttl=300)
         if odds:
             for game in odds:
@@ -594,7 +665,7 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
         )
         if msf:
             for ts in msf.get("teamStatsTotals", []):
-                name = ts.get("team", {}).get("abbreviation", "")
+                name   = ts.get("team", {}).get("abbreviation", "")
                 wins   = float(ts.get("stats", {}).get("standings", {}).get("wins", 0))
                 losses = float(ts.get("stats", {}).get("standings", {}).get("losses", 1))
                 wp = wins / (wins + losses)
@@ -607,10 +678,14 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
 
     # ── ESPN unofficial (always — free fallback) ──────────────────────────────
     if elo_a == 1500.0:
-        sport_espn = {"NBA": "basketball/nba", "NFL": "football/nfl",
-                      "MLB": "baseball/mlb",   "NHL": "hockey/nhl"}.get(league, "basketball/nba")
-        espn = _get(f"https://site.api.espn.com/apis/site/v2/sports/{sport_espn}/scoreboard",
-                    {}, ttl=300)
+        sport_espn = {
+            "NBA": "basketball/nba", "NFL": "football/nfl",
+            "MLB": "baseball/mlb",   "NHL": "hockey/nhl",
+        }.get(league, "basketball/nba")
+        espn = _get(
+            f"https://site.api.espn.com/apis/site/v2/sports/{sport_espn}/scoreboard",
+            {}, ttl=300,
+        )
         if espn:
             for event in espn.get("events", []):
                 competitors = event.get("competitions", [{}])[0].get("competitors", [])
