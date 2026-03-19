@@ -1,8 +1,13 @@
 """
-bots/base_bot.py
+bots/base_bot.py  (v2 — correct Kalshi price fields)
 
-Abstract base class every sector bot must extend.
-Enforces a consistent interface:  evaluate(ticker, market) → BotSignal
+Fixes vs v1:
+  1. Price now reads yes_bid_dollars / yes_ask_dollars (0.0-1.0 string range)
+     and converts to 0.0-1.0 float. Previously used yes_bid/yes_ask which
+     don't exist in the Kalshi API — so market_prob was always 0.50 for
+     every market regardless of actual price.
+  2. Falls back to last_price_dollars if bid/ask are both zero
+  3. format string bug fixed: %.2%% → %.2f%%
 """
 
 import logging
@@ -19,6 +24,29 @@ from shared.calibration_logger import log_signal, compute_calibration
 logger = logging.getLogger(__name__)
 
 
+def _market_prob(market: dict) -> float:
+    """
+    Extract yes probability (0.0-1.0) from a Kalshi market object.
+    Kalshi returns prices as dollar strings in 0.0-1.0 range.
+    """
+    try:
+        bid = float(market.get("yes_bid_dollars") or 0)
+        ask = float(market.get("yes_ask_dollars") or 0)
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        last = float(market.get("last_price_dollars") or 0)
+        if last > 0:
+            return last
+    except (TypeError, ValueError):
+        pass
+
+    return 0.50  # neutral fallback if no price data
+
+
 class BaseBot(ABC):
     """
     Sector bot base class.
@@ -30,8 +58,8 @@ class BaseBot(ABC):
     """
 
     def __init__(self):
-        self.model:       BayesianPolyModel = BayesianPolyModel.load(self.sector_name)
-        self._calibration: Optional[dict]  = None
+        self.model:        BayesianPolyModel = BayesianPolyModel.load(self.sector_name)
+        self._calibration: Optional[dict]   = None
 
     # ── Must override ──────────────────────────────────────────────────────────
 
@@ -54,7 +82,6 @@ class BaseBot(ABC):
     def is_relevant(self, market: dict) -> bool:
         """
         Return True if this sector bot should evaluate the given market.
-        Use market title keywords, series ticker prefix, etc.
         """
         ...
 
@@ -71,11 +98,8 @@ class BaseBot(ABC):
         if not self.is_relevant(market):
             return None
 
-        # Market's implied probability
-        yes_bid = market.get("yes_bid", 50)
-        yes_ask = market.get("yes_ask", 50)
-        yes_price = (yes_bid + yes_ask) / 2
-        market_prob = yes_price / 100.0
+        # Market's implied probability (correct Kalshi field names)
+        market_prob = _market_prob(market)
 
         try:
             features, context = self.fetch_features(market)
@@ -89,29 +113,38 @@ class BaseBot(ABC):
         confidence = prediction["confidence"]
         edge       = abs(our_prob - market_prob)
 
-        # Pre-filter: don't even log sub-threshold opportunities
+        # Pre-filter: skip sub-threshold opportunities
         if edge < MIN_EDGE_PCT:
-            logger.debug("[%s] %s edge %.2%% too small, skip",
-                         self.sector_name, ticker, edge)
+            logger.debug("[%s] %s edge %.2f%% too small, skip",
+                         self.sector_name, ticker, edge * 100)
             return None
 
-        # Log signal
         direction = "YES" if our_prob > market_prob else "NO"
         brier     = self.model.brier_score()
+
         log_signal(
-            ticker=ticker, sector=self.sector_name,
-            our_prob=our_prob, market_prob=market_prob,
-            edge=our_prob - market_prob, confidence=confidence,
-            direction=direction, brier_score=brier,
+            ticker      = ticker,
+            sector      = self.sector_name,
+            our_prob    = our_prob,
+            market_prob = market_prob,
+            edge        = our_prob - market_prob,
+            confidence  = confidence,
+            direction   = direction,
+            brier_score = brier,
         )
 
         signal = BotSignal(
-            sector=self.sector_name, prob=our_prob, confidence=confidence,
-            market_prob=market_prob, brier_score=brier,
+            sector      = self.sector_name,
+            prob        = our_prob,
+            confidence  = confidence,
+            market_prob = market_prob,
+            brier_score = brier,
         )
-        logger.info("[%s] %s → our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
-                    self.sector_name, ticker, our_prob, market_prob,
-                    our_prob - market_prob, direction, confidence)
+        logger.info(
+            "[%s] %s → our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
+            self.sector_name, ticker, our_prob, market_prob,
+            our_prob - market_prob, direction, confidence,
+        )
         return signal
 
     def record_outcome(self, features: np.ndarray, resolved_yes: bool) -> None:
