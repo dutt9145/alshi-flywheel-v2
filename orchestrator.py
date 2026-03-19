@@ -1,13 +1,14 @@
 """
-orchestrator.py  (v4 — correct Kalshi price fields)
+orchestrator.py  (v4 — correct Kalshi price fields + liquidity debug)
 
 Fixes vs v3:
   1. Price now reads yes_bid_dollars / yes_ask_dollars (string, 0-1 range)
      and converts to cents (* 100). Previously used yes_bid/yes_ask which
      don't exist in the Kalshi API response — so yes_price was always 50.
   2. Falls back to last_price_dollars if bid/ask are both zero (illiquid market)
-  3. Skips markets with zero liquidity (both bid and ask at 0 AND no last price)
-  4. Debug log line removed now that field names are confirmed
+  3. Skips markets with zero liquidity
+  4. DEBUG: logs how many of the 10000 markets actually have price data
+     — remove this after one deploy once we confirm the count
 
 Every SCAN_INTERVAL_SEC:
   1. Pull all open Kalshi markets
@@ -237,6 +238,28 @@ class FlywheelOrchestrator:
             logger.error("Failed to fetch markets: %s", e)
             return
         logger.info("Fetched %d open markets", len(markets))
+
+        # ── DEBUG: count how many markets actually have price data ─────────────
+        # Remove this block after one deploy once we confirm the count.
+        priced = [
+            m for m in markets
+            if float(m.get("yes_bid_dollars") or 0) > 0
+            or float(m.get("yes_ask_dollars") or 0) > 0
+            or float(m.get("last_price_dollars") or 0) > 0
+        ]
+        logger.info(
+            "Markets with price data: %d / %d (%.1f%%)",
+            len(priced), len(markets),
+            len(priced) / len(markets) * 100 if markets else 0,
+        )
+        # Also log a sample of priced markets so we can verify bot matching
+        if priced:
+            logger.info(
+                "Sample priced tickers: %s",
+                [m.get("event_ticker", "") for m in priced[:10]],
+            )
+        # ── END DEBUG ──────────────────────────────────────────────────────────
+
         for market in markets:
             self._evaluate_market(market)
         logger.info("Scan complete")
