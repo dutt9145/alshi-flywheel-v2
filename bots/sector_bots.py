@@ -1,26 +1,20 @@
 """
-bots/sector_bots.py  (v2 — event_ticker matching + correct price field)
+bots/sector_bots.py  (v3 — KXMVE multivariate market matching)
 
-Fixes vs v1:
-  1. is_relevant() now checks event_ticker AND ticker for Kalshi category codes
-     (e.g. KXNBA, KXBTC, KXCPI) in addition to title keyword matching.
-     Previously only checked title which contains outcome labels like
-     "yes Detroit wins by over 16.5 Points" — not the question text.
-     This is why all bots returned None for every market.
-  2. _detect_coin() uses event_ticker prefix for coin detection (KXBTC→bitcoin)
-  3. _extract_teams() uses event_ticker prefix for league detection (KXNBA→NBA)
-  4. _detect_company() uses event_ticker for company/ticker detection
-  5. Number extraction for targets still uses title — that part was correct
-     since title does contain the numeric outcome values
+Fixes vs v2:
+  1. SportsBot now matches KXMVESPORTSMULTIGAMEEXTENDED and KXMVECROSSCATEGORY
+     — these are the dominant liquid market types on Kalshi right now
+       (March Madness + NBA season = ~2300 of the 2302 priced markets)
+     — previously none of the bots matched any KXMVE prefix so all 2302
+       liquid markets were invisible to every bot
+  2. Added kxmvesports, kxmvesportsmulti, kxmvecross to SportsBot keywords
+  3. All other bots unchanged — they'll activate when their markets
+     get liquidity (economics events, crypto price markets etc.)
 
-Kalshi event_ticker format examples:
-  KXNBASPREAD-26MAR19DETWAS  → NBA spread market
-  KXBTC-26MAR19              → Bitcoin price market
-  KXCPI-26MAR                → CPI economics market
-  KXFED-26MAR                → Fed rate market
-  KXPRES-2026                → Presidential market
-  KXWTHR-NYC-26MAR           → Weather market
-  KXAAPL-26MAR               → Apple earnings market
+Kalshi KXMVE format:
+  KXMVESPORTSMULTIGAMEEXTENDED  → multi-game sports parlay
+  KXMVECROSSCATEGORY            → cross-team spread combos (still sports)
+  KXMVECROSSCAT                 → same family, shorter prefix variant
 """
 
 import logging
@@ -41,7 +35,7 @@ logger = logging.getLogger(__name__)
 def _search_fields(market: dict, keywords: list[str]) -> bool:
     """
     Search across all useful Kalshi market fields for any keyword match.
-    Checks: event_ticker, ticker, title — covers category codes + outcome text.
+    Checks: event_ticker, ticker, title, subtitle.
     """
     haystack = " ".join([
         market.get("event_ticker", ""),
@@ -64,12 +58,11 @@ class EconomicsBot(BaseBot):
     - "Will unemployment exceed X%?"
     """
 
-    # event_ticker codes + human-readable keywords
     KEYWORDS = [
         # Kalshi event_ticker prefixes
         "kxcpi", "kxfed", "kxfomc", "kxgdp", "kxjobs", "kxunrate",
         "kxpce", "kxnfp", "kxyield", "kxrate", "kxinfl",
-        # Human-readable fallback (title / subtitle)
+        # Human-readable fallback
         "cpi", "inflation", "fed", "unemployment", "nonfarm",
         "payroll", "gdp", "recession", "rate hike", "rate cut",
         "pce", "fomc", "interest rate", "treasury", "yield",
@@ -100,8 +93,6 @@ class EconomicsBot(BaseBot):
 class CryptoBot(BaseBot):
     """
     Markets resolved by crypto price thresholds, dominance, ETF flows.
-    - "Will BTC close above $X on date Y?"
-    - "Will ETH dominance exceed X%?"
     """
 
     KEYWORDS = [
@@ -114,7 +105,6 @@ class CryptoBot(BaseBot):
         "blockchain", "coinbase", "binance", "stablecoin",
     ]
 
-    # event_ticker prefix → CoinGecko coin_id
     TICKER_COIN_MAP = {
         "kxbtc":  "bitcoin",
         "kxeth":  "ethereum",
@@ -123,12 +113,11 @@ class CryptoBot(BaseBot):
         "kxdoge": "dogecoin",
     }
 
-    # Title keyword → CoinGecko coin_id
     TITLE_COIN_MAP = {
-        "btc":      "bitcoin",  "bitcoin":  "bitcoin",
-        "eth":      "ethereum", "ethereum": "ethereum",
-        "sol":      "solana",   "solana":   "solana",
-        "xrp":      "ripple",   "ripple":   "ripple",
+        "btc": "bitcoin",  "bitcoin":  "bitcoin",
+        "eth": "ethereum", "ethereum": "ethereum",
+        "sol": "solana",   "solana":   "solana",
+        "xrp": "ripple",   "ripple":   "ripple",
     }
 
     @property
@@ -139,12 +128,10 @@ class CryptoBot(BaseBot):
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_coin(self, market: dict) -> str:
-        # Check event_ticker first (most reliable)
         et = market.get("event_ticker", "").lower()
         for prefix, coin_id in self.TICKER_COIN_MAP.items():
             if et.startswith(prefix):
                 return coin_id
-        # Fall back to title keyword scan
         title = market.get("title", "").lower()
         for kw, coin_id in self.TITLE_COIN_MAP.items():
             if kw in title:
@@ -158,7 +145,7 @@ class CryptoBot(BaseBot):
         numbers = re.findall(r"[\d,]+\.?\d*", title.replace(",", ""))
         target  = float(numbers[0]) if numbers else 0.0
         current_price = context.get("price", 1.0) or 1.0
-        ratio = current_price / target if target > 0 else 1.0
+        ratio   = current_price / target if target > 0 else 1.0
         features = np.append(features, [target, ratio])
         context["contract_target"] = target
         context["price_vs_target"]  = ratio
@@ -263,8 +250,8 @@ class WeatherBot(BaseBot):
         target_c = (target_f - 32) * 5 / 9
         delta    = context.get("temp_max_c", 0.0) - target_c
         features = np.append(features, [target_c, delta])
-        context["target_c"]           = target_c
-        context["delta_from_target"]  = delta
+        context["target_c"]          = target_c
+        context["delta_from_target"] = delta
         return features, context
 
 
@@ -290,14 +277,12 @@ class TechBot(BaseBot):
         "stock", "share", "market cap", "nasdaq", "tech",
     ]
 
-    # event_ticker prefix → stock symbol
     TICKER_PREFIX_MAP = {
         "kxaapl": "AAPL", "kxgoog": "GOOGL", "kxmsft": "MSFT",
         "kxamzn": "AMZN", "kxmeta": "META",  "kxnvda": "NVDA",
         "kxtsla": "TSLA",
     }
 
-    # Title keyword → stock symbol
     TITLE_TICKER_MAP = {
         "apple": "AAPL", "google": "GOOGL", "microsoft": "MSFT",
         "amazon": "AMZN", "meta": "META",   "nvidia": "NVDA",
@@ -339,27 +324,44 @@ class TechBot(BaseBot):
 
 class SportsBot(BaseBot):
     """
-    Markets on game outcomes, over/unders, season props.
+    Markets on game outcomes, over/unders, season props, parlays.
+
+    Covers all liquid Kalshi sports markets including:
+      KXMVESPORTSMULTIGAMEEXTENDED — multi-game parlay markets (dominant)
+      KXMVECROSSCATEGORY           — cross-team spread combos (dominant)
+      KXNBA, KXNFL, KXMLB etc.    — single-game markets (less liquid)
     """
 
     KEYWORDS = [
-        # Kalshi event_ticker prefixes
+        # ── KXMVE multivariate sports (these are the 2300 liquid markets) ──
+        "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
+        "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
+        "kxmve",  # broad catch-all for any multivariate market
+
+        # ── Standard single-game Kalshi prefixes ──
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
-        "kxncaa", "kxcbb", "kxcfb", "kxsoccer", "kxtennis",
-        "kxgolf", "kxf1", "kxnascar", "kxolympic",
-        # Human-readable fallback (title has team names + "Points", "wins")
-        "nba", "nfl", "mlb", "nhl", "soccer", "mls", "ufc", "mma",
+        "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
+        "kxtennis", "kxf1", "kxolympic",
+
+        # ── Title / outcome label keywords ──
+        # (title contains team names + outcome descriptions)
+        "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
         "basketball", "football", "baseball", "hockey", "tennis",
-        "golf", "f1", "formula 1", "champion", "playoff", "super bowl",
-        "world series", "finals", "wins by", "points scored",
-        "over", "under", "spread", "mvp",
+        "golf", "f1", "formula 1", "champion", "playoff",
+        "super bowl", "world series", "finals", "march madness",
+        "wins by", "points scored", "over", "under", "spread", "mvp",
+        "lakers", "celtics", "warriors", "bulls", "heat", "knicks",
+        "patriots", "chiefs", "cowboys", "eagles",
     ]
 
-    # event_ticker prefix → league name
     LEAGUE_MAP = {
         "kxnba":  "NBA", "kxnfl":  "NFL", "kxmlb": "MLB",
         "kxnhl":  "NHL", "kxmls":  "MLS", "kxufc": "UFC",
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
+        # KXMVE markets are mostly NBA/NCAAB this time of year
+        "kxmvesports":  "NBA",
+        "kxmvecross":   "NBA",
+        "kxmve":        "NBA",
     }
 
     @property
@@ -370,23 +372,28 @@ class SportsBot(BaseBot):
         return _search_fields(market, self.KEYWORDS)
 
     def _extract_teams_and_league(self, market: dict) -> tuple[str, str, str]:
-        # Detect league from event_ticker first (reliable)
         et     = market.get("event_ticker", "").lower()
         league = "NBA"
+
+        # Check event_ticker prefix for league
         for prefix, lg in self.LEAGUE_MAP.items():
             if et.startswith(prefix):
                 league = lg
                 break
 
-        # Fall back to title scan for league if not in event_ticker
+        # Refine league from title if we only have generic KXMVE
         title = market.get("title", "")
-        if league == "NBA":
-            for lg in ["NFL", "MLB", "NHL", "MLS", "UFC"]:
-                if lg.lower() in title.lower():
-                    league = lg
-                    break
+        title_lower = title.lower()
+        if "nfl" in title_lower or "touchdown" in title_lower:
+            league = "NFL"
+        elif "mlb" in title_lower or "home run" in title_lower:
+            league = "MLB"
+        elif "nhl" in title_lower or "goal" in title_lower:
+            league = "NHL"
+        elif "ncaa" in title_lower or "college" in title_lower:
+            league = "NCAAB"
 
-        # Extract teams from title (still the right place — has team names)
+        # Extract teams from title (title has real team names)
         team_a, team_b = "Team A", "Team B"
         if " vs " in title:
             parts  = title.split(" vs ")
@@ -396,9 +403,11 @@ class SportsBot(BaseBot):
             idx    = title.lower().index(" beat ")
             team_a = title[:idx].split()[-1]
             team_b = title[idx + 6:].split()[0]
-        elif "wins" in title.lower():
-            # Format: "yes Detroit wins by over 16.5 Points"
-            words  = title.replace("yes ", "").replace("no ", "").split()
+        elif "wins" in title_lower:
+            # Format: "yes Detroit wins by over 16.5 Points,..."
+            # Extract first team name after "yes "
+            clean = title.replace("yes ", "").replace("no ", "")
+            words = clean.split()
             team_a = words[0] if words else "Team A"
 
         return team_a, team_b, league
