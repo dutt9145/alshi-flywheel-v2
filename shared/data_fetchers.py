@@ -386,18 +386,9 @@ def fetch_politics_features(polymarket_slug: Optional[str] = None) -> tuple[np.n
             pass
 
     # ── Metaculus (free) — superforecaster probability ────────────────────────
+    # Metaculus requires auth as of 2026 — disabled, defaulting to neutral 0.5
+    # Re-enable if you add a METACULUS_API_KEY to settings
     metaculus_prob = 0.5
-    mc = _get("https://www.metaculus.com/api2/questions/",
-              {"order_by": "-activity", "limit": 1,
-               "type": "forecast", "status": "open"}, ttl=3600)
-    if mc:
-        try:
-            q = mc["results"][0]
-            metaculus_prob = float(
-                q.get("community_prediction", {}).get("full", {}).get("q2", 0.5)
-            )
-        except Exception:
-            pass
 
     # ── Finnhub news sentiment (Tier 1 — free 60 req/min) ────────────────────
     news_sentiment = 0.0
