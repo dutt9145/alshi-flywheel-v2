@@ -1,13 +1,13 @@
 """
-orchestrator.py  (v5 — resolution ingestion wired)
+orchestrator.py  (v6 — ghost signal entries eliminated)
 
-Changes vs v4:
-  1. _ingest_resolved_markets() added — fetches settled Kalshi markets,
-     matches against our logged signals, calls bot.record_outcome(),
-     and writes to outcomes table via log_outcome()
-  2. retrain_models() now calls _ingest_resolved_markets() FIRST
-     so Bayesian models learn from outcomes before calibration runs
-  3. log_outcome import added to calibration_logger import line
+Changes vs v5:
+  1. log_signal() moved to AFTER consensus.execute check
+     — previously logged every market that got signals regardless of
+       whether consensus passed, producing ghost entries with None
+       direction, 0% edge, 0% confidence in Supabase
+     — now only logs markets that actually pass all consensus gates
+     — signal counts will drop but every logged signal is meaningful
 """
 
 import logging
@@ -116,13 +116,11 @@ class FlywheelOrchestrator:
 
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
-        # Tickers we've already recorded — skip to prevent duplicates
         already_recorded = {
             r["ticker"]
             for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
         }
 
-        # Tickers we actually generated signals for
         our_tickers = {
             r["ticker"]
             for r in _query_signals("SELECT DISTINCT ticker FROM signals")
@@ -132,20 +130,19 @@ class FlywheelOrchestrator:
 
         for market in resolved_markets:
             ticker = market.get("ticker", "")
-            result = market.get("result", "")   # "yes" or "no"
+            result = market.get("result", "")
 
             if not ticker or result not in ("yes", "no"):
-                continue   # voided or not yet final
+                continue
 
             if ticker in already_recorded:
-                continue   # already ingested this one
+                continue
 
             if ticker not in our_tickers:
-                continue   # we never signaled on this market
+                continue
 
             resolved_yes = result == "yes"
 
-            # Feed outcome back into the right bot's Bayesian model
             for bot in self.bots:
                 if not bot.is_relevant(market):
                     continue
@@ -162,7 +159,6 @@ class FlywheelOrchestrator:
                         bot.sector_name, ticker, e
                     )
 
-            # Pull our last prediction for this ticker so we can score it
             sig_rows = _query_signals(
                 "SELECT our_prob, direction FROM signals "
                 "WHERE ticker = %s ORDER BY created_at DESC LIMIT 1"
@@ -183,8 +179,8 @@ class FlywheelOrchestrator:
             try:
                 log_outcome(
                     ticker       = ticker,
-                    resolved     = result.upper(),   # "YES" or "NO"
-                    pnl_usd      = None,             # wired in after fill data available
+                    resolved     = result.upper(),
+                    pnl_usd      = None,
                     trade_id     = None,
                     our_prob     = our_prob,
                     correct      = direction_correct,
@@ -209,6 +205,7 @@ class FlywheelOrchestrator:
         if yes_price <= 2 or yes_price >= 98:
             return
 
+        # ── Collect bot signals ────────────────────────────────────────────────
         signals = []
         for bot in self.bots:
             try:
@@ -223,6 +220,15 @@ class FlywheelOrchestrator:
 
         consensus = self.engine.evaluate(ticker, yes_price, signals)
 
+        # ── Gate: drop markets that don't pass consensus ───────────────────────
+        # log_signal MOVED HERE — only log markets that pass consensus
+        # Previously logged before this check, producing ghost entries with
+        # None direction / 0% edge / 0% confidence for every rejected market
+        if not consensus.execute:
+            logger.debug("Consensus reject %s: %s", ticker, consensus.reject_reason)
+            return
+
+        # ── Log the signal — only reaches here if consensus passed ─────────────
         lead_sector = signals[0].sector
         try:
             log_signal(
@@ -237,10 +243,7 @@ class FlywheelOrchestrator:
         except Exception as e:
             logger.error("log_signal failed for %s: %s", ticker, e)
 
-        if not consensus.execute:
-            logger.debug("Consensus PASS %s: %s", ticker, consensus.reject_reason)
-            return
-
+        # ── Gate 4: Cross-venue arb check ─────────────────────────────────────
         arb = self.arb.check(
             ticker        = ticker,
             kalshi_cents  = yes_price,
@@ -265,6 +268,7 @@ class FlywheelOrchestrator:
                 yes_price - arb.sharp_line_prob * 100,
             )
 
+        # ── Kelly sizing ───────────────────────────────────────────────────────
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
         if consensus.direction == "YES":
@@ -290,6 +294,7 @@ class FlywheelOrchestrator:
             logger.info("Sizing zero for %s — skip", ticker)
             return
 
+        # ── Execute ────────────────────────────────────────────────────────────
         client_order_id = str(uuid.uuid4())
         try:
             order_resp = self.client.place_order(
@@ -346,24 +351,20 @@ class FlywheelOrchestrator:
     def retrain_models(self) -> None:
         logger.info("=== Nightly retrain ===")
 
-        # Step 1: ingest resolved outcomes FIRST so models learn before calibration
         n_resolved = self._ingest_resolved_markets()
         logger.info("Ingested %d new resolved outcomes this cycle", n_resolved)
 
-        # Step 2: recompute calibration — Brier scores now have data to work with
         for bot in self.bots:
             stats = bot.refresh_calibration()
             logger.info("[%s] calibration: %s", bot.sector_name, stats)
             bot.save_model()
 
-        # Step 3: sync bankroll from Kalshi
         try:
             self.bankroll = self.client.get_balance()
             logger.info("Bankroll synced: $%.2f", self.bankroll)
         except Exception as e:
             logger.warning("Bankroll sync failed: %s", e)
 
-        # Step 4: reset intraday sector exposure counters
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
 
         logger.info("=== Retrain complete ===")
@@ -372,7 +373,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v5 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v6 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
