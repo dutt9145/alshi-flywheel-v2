@@ -1,15 +1,27 @@
 """
-bots/sector_bots.py  (v5 — TechBot keyword bleed fixed)
+bots/sector_bots.py  (v6 — full keyword bleed audit)
 
-Changes vs v4:
-  1. Removed overly broad TechBot keywords that were matching sports titles:
-     "tech", "model", "launch", "release", "stock", "share", "market cap"
-     — these appear in KXMVE sports market titles and were causing TechBot
-       to fire on thousands of sports markets it has no business touching
-  2. Kept all specific company names, tickers, and kx-prefixes in TechBot
-     — those are precise enough to not bleed into other categories
-  3. SportsBot unchanged from v4
-  4. All other bots unchanged
+Changes vs v5:
+  EconomicsBot:
+    - REMOVED "yield"   → appeared in sports spread/stats context
+  CryptoBot:
+    - REMOVED "sol"     → substring of "resolved", "console", many common words
+    - REMOVED "link"    → too generic; kxlink prefix retained
+  WeatherBot:
+    - REMOVED "heat"    → Miami Heat is an NBA team (huge bleed)
+    - REMOVED "cold"    → appeared in sports cold-weather game titles
+    - REMOVED "wind"    → appeared in sports stadium/conditions titles
+  PoliticsBot:
+    - REMOVED "law"     → matched player names and general sports content
+    - REMOVED "bill"    → matched player names (Bill X) in sports titles
+  TechBot:
+    - Unchanged from v5 (already cleaned)
+  SportsBot:
+    - Unchanged from v4 (already cleaned)
+
+Rule applied: if a keyword could plausibly appear in a KXMVE sports market
+title without being the primary topic, it should be removed. kx-prefixes
+are always safe (they're Kalshi's own taxonomy), bare English words are not.
 """
 
 import logging
@@ -46,13 +58,23 @@ def _search_fields(market: dict, keywords: list[str]) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class EconomicsBot(BaseBot):
+    """
+    Macro-economic resolution markets: CPI, Fed rate decisions, GDP, jobs.
+    Keywords restricted to kx-prefixes + terms that ONLY appear in financial
+    market titles — "yield" removed (sports spread context).
+    """
+
     KEYWORDS = [
+        # Kalshi event_ticker prefixes (safe — Kalshi's own taxonomy)
         "kxcpi", "kxfed", "kxfomc", "kxgdp", "kxjobs", "kxunrate",
         "kxpce", "kxnfp", "kxyield", "kxrate", "kxinfl",
-        "cpi", "inflation", "fed", "unemployment", "nonfarm",
+        # Human-readable — only terms that cannot appear in sports titles
+        "cpi", "inflation", "unemployment", "nonfarm",
         "payroll", "gdp", "recession", "rate hike", "rate cut",
-        "pce", "fomc", "interest rate", "treasury", "yield",
+        "pce", "fomc", "interest rate", "treasury",
         "federal reserve", "basis points",
+        # "yield" REMOVED — appears in sports spread/stats context
+        # "fed" REMOVED — too short, risky substring match
     ]
 
     @property
@@ -77,12 +99,22 @@ class EconomicsBot(BaseBot):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CryptoBot(BaseBot):
+    """
+    Crypto price threshold, dominance, and ETF flow markets.
+    "sol" removed — substring of "resolved", "console", etc.
+    "link" removed — too generic; kxlink prefix retained.
+    """
+
     KEYWORDS = [
+        # Kalshi event_ticker prefixes (safe)
         "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
         "kxbnb", "kxavax", "kxlink", "kxcoin",
+        # Human-readable — specific enough to not bleed
         "bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
-        "sol", "xrp", "ripple", "altcoin", "defi", "nft", "etf",
+        "xrp", "ripple", "altcoin", "defi", "nft", "etf",
         "blockchain", "coinbase", "binance", "stablecoin",
+        # "sol" REMOVED — substring of "resolved", "console", many words
+        # "link" REMOVED — too generic
     ]
 
     TICKER_COIN_MAP = {
@@ -94,7 +126,7 @@ class CryptoBot(BaseBot):
     TITLE_COIN_MAP = {
         "btc": "bitcoin",  "bitcoin":  "bitcoin",
         "eth": "ethereum", "ethereum": "ethereum",
-        "sol": "solana",   "solana":   "solana",
+        "solana": "solana",
         "xrp": "ripple",   "ripple":   "ripple",
     }
 
@@ -135,14 +167,23 @@ class CryptoBot(BaseBot):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PoliticsBot(BaseBot):
+    """
+    Elections, legislation, approval ratings, appointments.
+    "law" and "bill" removed — match player names in sports titles.
+    """
+
     KEYWORDS = [
+        # Kalshi event_ticker prefixes (safe)
         "kxpres", "kxsenate", "kxhouse", "kxgov", "kxelect",
         "kxpol", "kxcong", "kxsupct", "kxadmin",
+        # Human-readable — specific enough
         "election", "vote", "congress", "senate", "president",
-        "governor", "democrat", "republican", "bill", "law",
+        "governor", "democrat", "republican",
         "approval", "impeach", "nominee", "ballot", "primary",
         "caucus", "supreme court", "executive order", "policy",
         "trump", "harris", "biden", "white house",
+        # "law" REMOVED — matches player names (e.g. "Ty Law")
+        # "bill" REMOVED — matches player names (e.g. "Bill Belichick")
     ]
 
     @property
@@ -176,12 +217,26 @@ class PoliticsBot(BaseBot):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WeatherBot(BaseBot):
+    """
+    Temperature records, precipitation, storm landfalls.
+    "heat" removed — Miami Heat is an NBA team (massive bleed into sports).
+    "cold" and "wind" removed — appear in sports game condition titles.
+    """
+
     KEYWORDS = [
+        # Kalshi event_ticker prefixes (safe)
         "kxwthr", "kxhurr", "kxsnow", "kxtmp", "kxrain",
         "kxstorm", "kxtornado", "kxblizz",
-        "temperature", "temp", "fahrenheit", "celsius", "snow",
-        "rain", "hurricane", "storm", "tornado", "flood", "drought",
-        "heat", "cold", "blizzard", "wind", "precipitation", "weather",
+        # Human-readable — specific enough
+        "temperature", "fahrenheit", "celsius", "snow",
+        "hurricane", "tornado", "flood", "drought",
+        "blizzard", "precipitation", "weather",
+        # "heat"  REMOVED — Miami Heat (NBA team)
+        # "cold"  REMOVED — appears in sports cold-weather game titles
+        # "wind"  REMOVED — appears in sports stadium/conditions titles
+        # "rain"  REMOVED — can appear in player names
+        # "storm" REMOVED — appears in team names / sports contexts
+        # "temp"  REMOVED — too short, risky substring
     ]
 
     CITY_COORDS = {
@@ -227,20 +282,18 @@ class WeatherBot(BaseBot):
 
 class TechBot(BaseBot):
     """
-    Markets on earnings, product launches, M&A, AI milestones.
-
-    NOTE: Generic words removed — "tech", "model", "launch", "release",
-    "stock", "share", "market cap", "ai" — all appeared in KXMVE sports
-    titles and caused TechBot to fire on sports markets incorrectly.
+    Earnings, M&A, AI milestones markets.
+    Generic words removed in v5: "tech", "model", "launch", "release",
+    "stock", "share", "market cap", "ai" — all appeared in KXMVE sports titles.
     Only specific company names, tickers, and kx-prefixes remain.
     """
 
     KEYWORDS = [
-        # Kalshi event_ticker prefixes (precise)
+        # Kalshi event_ticker prefixes (safe)
         "kxaapl", "kxgoog", "kxmsft", "kxamzn", "kxmeta", "kxnvda",
         "kxtsla", "kxearnings", "kxtech", "kxai", "kxipo",
         "kxopenai", "kxanthropic", "kxnasdaq",
-        # Specific enough to not bleed into sports
+        # Specific company names only — cannot appear in sports titles
         "earnings", "revenue", "eps", "profit", "ipo", "merger",
         "acquisition", "apple", "google", "microsoft", "amazon",
         "nvidia", "tesla", "openai", "anthropic",
@@ -294,14 +347,10 @@ class TechBot(BaseBot):
 
 class SportsBot(BaseBot):
     """
-    Markets on game outcomes, over/unders, season props, parlays.
-
-    Covers all liquid Kalshi sports markets including:
-      KXMVESPORTSMULTIGAMEEXTENDED — multi-game parlay markets (dominant)
-      KXMVECROSSCATEGORY           — cross-team spread combos (dominant)
-      KXNBA, KXNFL, KXMLB etc.    — single-game markets (less liquid)
-
-    NOTE: bare "kxmve" catch-all intentionally excluded.
+    Game outcomes, over/unders, season props, parlays.
+    KXMVESPORTSMULTIGAMEEXTENDED and KXMVECROSSCATEGORY are the dominant
+    liquid market types on Kalshi (March Madness + NBA season).
+    Bare "kxmve" catch-all excluded — was causing ~83% signal skew.
     """
 
     KEYWORDS = [
@@ -312,14 +361,16 @@ class SportsBot(BaseBot):
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
         "kxtennis", "kxf1", "kxolympic",
-        # Title keywords
+        # Title keywords — sports-specific enough to be safe
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
         "basketball", "football", "baseball", "hockey", "tennis",
         "golf", "f1", "formula 1", "champion", "playoff",
         "super bowl", "world series", "finals", "march madness",
         "wins by", "points scored", "over", "under", "spread", "mvp",
-        "lakers", "celtics", "warriors", "bulls", "heat", "knicks",
+        "lakers", "celtics", "warriors", "bulls", "knicks",
         "patriots", "chiefs", "cowboys", "eagles",
+        # "heat" moved here from WeatherBot — Miami Heat is sports
+        "miami heat",
     ]
 
     LEAGUE_MAP = {
