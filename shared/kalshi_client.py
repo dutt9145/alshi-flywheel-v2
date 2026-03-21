@@ -1,10 +1,11 @@
 """
-shared/kalshi_client.py
-Handles ALL private key formats:
-  - Base64 encoded (Railway-safe, recommended)
-  - PEM with real newlines (local .env)
-  - PEM with literal \n (Railway default)
-  - File path to .pem or .txt file
+shared/kalshi_client.py  (v2 — get_resolved_markets added)
+
+Changes vs v1:
+  1. get_resolved_markets() fetches settled markets from Kalshi API
+     Paginates up to 1000 markets (10 pages of 100) per nightly retrain
+     Returns only markets with a definitive "yes" or "no" result
+  2. Everything else unchanged
 """
 
 import base64
@@ -39,11 +40,9 @@ def _load_private_key():
             if "BEGIN" in decoded:
                 pem = decoded
             else:
-                # Raw key body only — wrap it
                 wrapped = textwrap.fill(pem, 64)
                 pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
         except Exception:
-            # Not base64 — treat as raw key body
             wrapped = textwrap.fill(pem, 64)
             pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
 
@@ -129,7 +128,7 @@ class KalshiClient:
 
     def get_all_open_markets(self) -> list:
         markets, cursor, page = [], None, 0
-        max_pages = 100 
+        max_pages = 100
         while page < max_pages:
             resp   = self.get_markets(status="open", limit=100, cursor=cursor)
             batch  = resp.get("markets", [])
@@ -139,7 +138,55 @@ class KalshiClient:
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
                 break
-            time.sleep(0.5)  # Rate limit: avoid 429s between paginated requests
+            time.sleep(0.5)
+        return markets
+
+    def get_resolved_markets(self, max_pages: int = 10) -> list:
+        """
+        Fetch recently settled markets from Kalshi.
+
+        Returns a list of market dicts that have a definitive result
+        of "yes" or "no". Paginates up to max_pages * 100 markets.
+
+        Kalshi settled markets endpoint:
+            GET /markets?status=settled&limit=100
+        The result field on each market is "yes", "no", or None (voided).
+        """
+        markets, cursor, page = [], None, 0
+
+        while page < max_pages:
+            params = {"status": "settled", "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                resp  = self._get("/markets", params=params)
+            except Exception as e:
+                logger.error("get_resolved_markets page %d failed: %s", page, e)
+                break
+
+            batch = resp.get("markets", [])
+
+            # Keep only markets with a clean yes/no result
+            clean = [
+                m for m in batch
+                if m.get("result") in ("yes", "no")
+            ]
+            markets.extend(clean)
+            page += 1
+
+            logger.info(
+                "Resolved markets — page %d: %d settled, %d with clean result (%d total)",
+                page, len(batch), len(clean), len(markets)
+            )
+
+            cursor = resp.get("cursor")
+            if not cursor or len(batch) < 100:
+                break
+
+            time.sleep(0.5)   # respect rate limits between pages
+
+        logger.info("get_resolved_markets complete — %d total clean results", len(markets))
         return markets
 
     def get_balance(self) -> float:

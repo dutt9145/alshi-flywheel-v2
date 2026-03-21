@@ -1,16 +1,12 @@
 """
-shared/calibration_logger.py  (v5 — np.float64 cast fix)
+shared/calibration_logger.py  (v6 — log_outcome signature updated)
 
-Fixes vs v4:
-  1. All numeric values explicitly cast to Python float()/int()/str() before
-     being passed to psycopg2. numpy's np.float64 type was being serialized
-     as the literal string "np.float64(0.283...)" which Postgres parsed as
-     schema "np" → column "float64" → crash: schema "np" does not exist.
-  2. Fix applied to log_signal, log_trade, log_outcome, compute_calibration
-
-Automatically detects which database to use:
-  - DATABASE_URL set → Supabase PostgreSQL (Railway production)
-  - DATABASE_URL not set → local SQLite (laptop dev mode)
+Changes vs v5:
+  1. log_outcome() now accepts our_prob and correct parameters
+     so the resolution ingestion pipeline can record what the bot
+     predicted vs what actually happened — required for Brier scoring
+  2. outcomes table INSERT updated to match new columns
+  3. Everything else unchanged from v5
 """
 
 import logging
@@ -120,12 +116,14 @@ def init_db() -> None:
         """,
         f"""
         CREATE TABLE IF NOT EXISTS outcomes (
-            id          {serial},
-            logged_at   TEXT NOT NULL,
-            ticker      TEXT NOT NULL,
-            resolved    TEXT NOT NULL,
-            pnl_usd     REAL,
-            trade_id    INTEGER {ref}
+            id           {serial},
+            logged_at    TEXT NOT NULL,
+            ticker       TEXT NOT NULL,
+            resolved     TEXT NOT NULL,
+            pnl_usd      REAL,
+            trade_id     INTEGER {ref},
+            our_prob     REAL,
+            correct      BOOLEAN
         )
         """,
         f"""
@@ -181,11 +179,6 @@ def log_signal(
     direction: str,
     brier_score: Optional[float] = None,
 ) -> None:
-    """
-    Write one row to the signals table.
-    All numeric values cast to Python native types to prevent
-    np.float64 being serialized as a string by psycopg2.
-    """
     sql = f"""
         INSERT INTO signals
         (created_at, ticker, sector, our_prob, market_prob,
@@ -229,10 +222,6 @@ def log_trade(
     order_id: Optional[str] = None,
     demo_mode: bool = True,
 ) -> int:
-    """
-    Write one row to the trades table. Returns the new trade ID.
-    All numeric values cast to Python native types.
-    """
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
@@ -282,17 +271,34 @@ def log_outcome(
     resolved: str,
     pnl_usd: Optional[float] = None,
     trade_id: Optional[int] = None,
+    our_prob: Optional[float] = None,
+    correct: Optional[bool] = None,
 ) -> None:
+    """
+    Write one row to the outcomes table.
+
+    Parameters
+    ----------
+    ticker    : Kalshi market ticker
+    resolved  : "YES" or "NO" — what the market actually resolved to
+    pnl_usd   : Realised P&L in dollars (None until fill data is available)
+    trade_id  : FK to trades table (None if no trade was placed)
+    our_prob  : The probability our model assigned before resolution
+    correct   : True if our direction call matched the resolution
+    """
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
         str(resolved).upper(),
-        float(pnl_usd) if pnl_usd is not None else None,
-        int(trade_id) if trade_id is not None else None,
+        float(pnl_usd)   if pnl_usd  is not None else None,
+        int(trade_id)    if trade_id is not None else None,
+        float(our_prob)  if our_prob is not None else None,
+        bool(correct)    if correct  is not None else None,
     )
     sql = f"""
-        INSERT INTO outcomes (logged_at, ticker, resolved, pnl_usd, trade_id)
-        VALUES ({_ph(5)})
+        INSERT INTO outcomes
+        (logged_at, ticker, resolved, pnl_usd, trade_id, our_prob, correct)
+        VALUES ({_ph(7)})
     """
     with _db() as conn:
         if USE_POSTGRES:
@@ -300,8 +306,10 @@ def log_outcome(
         else:
             conn.execute(sql, vals)
     logger.info(
-        "OUTCOME logged | %s resolved=%s P&L=%s",
+        "OUTCOME logged | %s resolved=%s our_prob=%s correct=%s P&L=%s",
         ticker, resolved,
+        f"{float(our_prob):.3f}" if our_prob is not None else "n/a",
+        correct,
         f"${float(pnl_usd):.2f}" if pnl_usd is not None else "pending",
     )
 

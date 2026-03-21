@@ -1,18 +1,13 @@
 """
-orchestrator.py  (v4 final — debug lines removed)
+orchestrator.py  (v5 — resolution ingestion wired)
 
-Every SCAN_INTERVAL_SEC:
-  1. Pull all open Kalshi markets
-  2. Each sector bot evaluates relevance + generates BotSignal
-  3. ConsensusEngine: direction + edge + confidence gates (gates 1-3)
-  4. log_signal() — written here regardless of gate 4 outcome
-  5. ArbLayer: cross-venue check vs Polymarket / OddsPapi (gate 4)
-  6. Kelly size + place order + log_trade()
-
-Nightly at RETRAIN_HOUR:
-  7. Feed resolved contracts back into Bayesian models
-  8. Recompute calibration — Brier score updates bot weights
-  9. Save models to disk
+Changes vs v4:
+  1. _ingest_resolved_markets() added — fetches settled Kalshi markets,
+     matches against our logged signals, calls bot.record_outcome(),
+     and writes to outcomes table via log_outcome()
+  2. retrain_models() now calls _ingest_resolved_markets() FIRST
+     so Bayesian models learn from outcomes before calibration runs
+  3. log_outcome import added to calibration_logger import line
 """
 
 import logging
@@ -26,7 +21,7 @@ from config.settings import (
     BANKROLL, DEMO_MODE, RETRAIN_HOUR, SCAN_INTERVAL_SEC,
 )
 from shared.arb_layer import ArbLayer
-from shared.calibration_logger import init_db, log_signal, log_trade, compute_calibration
+from shared.calibration_logger import init_db, log_signal, log_trade, log_outcome, compute_calibration
 from shared.consensus_engine import ConsensusEngine
 from shared.kalshi_client import KalshiClient
 from shared.kelly_sizer import kelly_stake, no_kelly_stake
@@ -40,11 +35,6 @@ logger = logging.getLogger("orchestrator")
 
 
 def _parse_yes_price_cents(market: dict) -> int:
-    """
-    Extract yes price in cents (0-100) from the Kalshi market object.
-    Kalshi returns prices as dollar strings in 0.0-1.0 range.
-    Priority: bid/ask midpoint → last_price → 0 (skip market)
-    """
     try:
         bid = float(market.get("yes_bid_dollars") or 0)
         ask = float(market.get("yes_ask_dollars") or 0)
@@ -63,6 +53,37 @@ def _parse_yes_price_cents(market: dict) -> int:
     return 0
 
 
+def _query_signals(sql: str, params: tuple = ()) -> list:
+    """
+    Lightweight inline query helper for resolution ingestion.
+    Mirrors dashboard.py's query() but lives here to avoid circular imports.
+    """
+    import os
+    database_url = os.getenv("DATABASE_URL", "")
+    db_path      = os.getenv("DB_PATH", "flywheel.db")
+
+    try:
+        if database_url:
+            import psycopg2
+            conn = psycopg2.connect(database_url)
+            cur  = conn.cursor()
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            conn.close()
+            return rows
+        else:
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            conn.close()
+            return rows
+    except Exception as e:
+        logger.error("_query_signals error: %s", e)
+        return []
+
+
 class FlywheelOrchestrator:
 
     def __init__(self):
@@ -72,6 +93,108 @@ class FlywheelOrchestrator:
         self.arb      = ArbLayer()
         self.bankroll = BANKROLL
         self._exposure: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
+
+    # ── Resolution ingestion ───────────────────────────────────────────────────
+
+    def _ingest_resolved_markets(self) -> int:
+        """
+        Fetch all settled markets from Kalshi, match against our signal log,
+        update Bayesian models, and write outcomes to DB.
+        Returns count of new outcomes recorded this cycle.
+        """
+        logger.info("=== Resolution ingestion starting ===")
+
+        try:
+            resolved_markets = self.client.get_resolved_markets()
+        except Exception as e:
+            logger.error("Failed to fetch resolved markets: %s", e)
+            return 0
+
+        if not resolved_markets:
+            logger.info("No resolved markets returned from Kalshi.")
+            return 0
+
+        logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
+
+        # Tickers we've already recorded — skip to prevent duplicates
+        already_recorded = {
+            r["ticker"]
+            for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
+        }
+
+        # Tickers we actually generated signals for
+        our_tickers = {
+            r["ticker"]
+            for r in _query_signals("SELECT DISTINCT ticker FROM signals")
+        }
+
+        recorded = 0
+
+        for market in resolved_markets:
+            ticker = market.get("ticker", "")
+            result = market.get("result", "")   # "yes" or "no"
+
+            if not ticker or result not in ("yes", "no"):
+                continue   # voided or not yet final
+
+            if ticker in already_recorded:
+                continue   # already ingested this one
+
+            if ticker not in our_tickers:
+                continue   # we never signaled on this market
+
+            resolved_yes = result == "yes"
+
+            # Feed outcome back into the right bot's Bayesian model
+            for bot in self.bots:
+                if not bot.is_relevant(market):
+                    continue
+                try:
+                    features, _ = bot.fetch_features(market)
+                    bot.record_outcome(features, resolved_yes)
+                    logger.info(
+                        "[%s] Bayesian update: %s → %s",
+                        bot.sector_name, ticker, result.upper()
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] record_outcome failed for %s: %s",
+                        bot.sector_name, ticker, e
+                    )
+
+            # Pull our last prediction for this ticker so we can score it
+            sig_rows = _query_signals(
+                "SELECT our_prob, direction FROM signals "
+                "WHERE ticker = %s ORDER BY created_at DESC LIMIT 1"
+                if self.client.base.startswith("https") else
+                "SELECT our_prob, direction FROM signals "
+                "WHERE ticker = ? ORDER BY created_at DESC LIMIT 1",
+                (ticker,)
+            )
+
+            our_prob  = float(sig_rows[0]["our_prob"])  if sig_rows else 0.5
+            direction = str(sig_rows[0]["direction"])   if sig_rows else "YES"
+
+            direction_correct = (
+                (direction == "YES" and resolved_yes) or
+                (direction == "NO"  and not resolved_yes)
+            )
+
+            try:
+                log_outcome(
+                    ticker       = ticker,
+                    resolved     = result.upper(),   # "YES" or "NO"
+                    pnl_usd      = None,             # wired in after fill data available
+                    trade_id     = None,
+                    our_prob     = our_prob,
+                    correct      = direction_correct,
+                )
+                recorded += 1
+            except Exception as e:
+                logger.error("log_outcome failed for %s: %s", ticker, e)
+
+        logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
+        return recorded
 
     # ── Per-market pipeline ────────────────────────────────────────────────────
 
@@ -86,7 +209,6 @@ class FlywheelOrchestrator:
         if yes_price <= 2 or yes_price >= 98:
             return
 
-        # ── Gates 1-3: Bot consensus ───────────────────────────────────────────
         signals = []
         for bot in self.bots:
             try:
@@ -101,7 +223,6 @@ class FlywheelOrchestrator:
 
         consensus = self.engine.evaluate(ticker, yes_price, signals)
 
-        # ── Write signal to Supabase regardless of gate 4 outcome ─────────────
         lead_sector = signals[0].sector
         try:
             log_signal(
@@ -120,7 +241,6 @@ class FlywheelOrchestrator:
             logger.debug("Consensus PASS %s: %s", ticker, consensus.reject_reason)
             return
 
-        # ── Gate 4: Cross-venue arb check ─────────────────────────────────────
         arb = self.arb.check(
             ticker        = ticker,
             kalshi_cents  = yes_price,
@@ -145,7 +265,6 @@ class FlywheelOrchestrator:
                 yes_price - arb.sharp_line_prob * 100,
             )
 
-        # ── Kelly sizing ───────────────────────────────────────────────────────
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
         if consensus.direction == "YES":
@@ -171,7 +290,6 @@ class FlywheelOrchestrator:
             logger.info("Sizing zero for %s — skip", ticker)
             return
 
-        # ── Execute ────────────────────────────────────────────────────────────
         client_order_id = str(uuid.uuid4())
         try:
             order_resp = self.client.place_order(
@@ -227,23 +345,34 @@ class FlywheelOrchestrator:
 
     def retrain_models(self) -> None:
         logger.info("=== Nightly retrain ===")
+
+        # Step 1: ingest resolved outcomes FIRST so models learn before calibration
+        n_resolved = self._ingest_resolved_markets()
+        logger.info("Ingested %d new resolved outcomes this cycle", n_resolved)
+
+        # Step 2: recompute calibration — Brier scores now have data to work with
         for bot in self.bots:
             stats = bot.refresh_calibration()
-            logger.info("[%s] %s", bot.sector_name, stats)
+            logger.info("[%s] calibration: %s", bot.sector_name, stats)
             bot.save_model()
+
+        # Step 3: sync bankroll from Kalshi
         try:
             self.bankroll = self.client.get_balance()
-            logger.info("Bankroll: $%.2f", self.bankroll)
+            logger.info("Bankroll synced: $%.2f", self.bankroll)
         except Exception as e:
             logger.warning("Bankroll sync failed: %s", e)
+
+        # Step 4: reset intraday sector exposure counters
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
+
         logger.info("=== Retrain complete ===")
 
     # ── Run ────────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v4 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v5 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()

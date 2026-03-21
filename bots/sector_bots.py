@@ -1,20 +1,13 @@
 """
-bots/sector_bots.py  (v3 — KXMVE multivariate market matching)
+bots/sector_bots.py  (v4 — bare kxmve catch-all removed)
 
-Fixes vs v2:
-  1. SportsBot now matches KXMVESPORTSMULTIGAMEEXTENDED and KXMVECROSSCATEGORY
-     — these are the dominant liquid market types on Kalshi right now
-       (March Madness + NBA season = ~2300 of the 2302 priced markets)
-     — previously none of the bots matched any KXMVE prefix so all 2302
-       liquid markets were invisible to every bot
-  2. Added kxmvesports, kxmvesportsmulti, kxmvecross to SportsBot keywords
-  3. All other bots unchanged — they'll activate when their markets
-     get liquidity (economics events, crypto price markets etc.)
-
-Kalshi KXMVE format:
-  KXMVESPORTSMULTIGAMEEXTENDED  → multi-game sports parlay
-  KXMVECROSSCATEGORY            → cross-team spread combos (still sports)
-  KXMVECROSSCAT                 → same family, shorter prefix variant
+Changes vs v3:
+  1. Removed "kxmve" bare catch-all from SportsBot KEYWORDS and LEAGUE_MAP
+     — was matching every multivariate Kalshi market regardless of category
+     — caused ~83% signal skew toward sports (456k of 550k total signals)
+     — specific prefixes retained: kxmvesports, kxmvesportsmulti,
+       kxmvesportsmultigame, kxmvecross, kxmvecrosscategory, kxmvecrosscat
+  2. All other bots unchanged
 """
 
 import logging
@@ -330,13 +323,16 @@ class SportsBot(BaseBot):
       KXMVESPORTSMULTIGAMEEXTENDED — multi-game parlay markets (dominant)
       KXMVECROSSCATEGORY           — cross-team spread combos (dominant)
       KXNBA, KXNFL, KXMLB etc.    — single-game markets (less liquid)
+
+    NOTE: bare "kxmve" catch-all intentionally excluded — it matched every
+    multivariate market on Kalshi regardless of category and caused ~83%
+    signal skew. Specific prefixes below are sufficient coverage.
     """
 
     KEYWORDS = [
-        # ── KXMVE multivariate sports (these are the 2300 liquid markets) ──
+        # ── KXMVE multivariate sports (specific prefixes only) ──
         "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
         "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
-        "kxmve",  # broad catch-all for any multivariate market
 
         # ── Standard single-game Kalshi prefixes ──
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
@@ -344,7 +340,6 @@ class SportsBot(BaseBot):
         "kxtennis", "kxf1", "kxolympic",
 
         # ── Title / outcome label keywords ──
-        # (title contains team names + outcome descriptions)
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
         "basketball", "football", "baseball", "hockey", "tennis",
         "golf", "f1", "formula 1", "champion", "playoff",
@@ -358,10 +353,9 @@ class SportsBot(BaseBot):
         "kxnba":  "NBA", "kxnfl":  "NFL", "kxmlb": "MLB",
         "kxnhl":  "NHL", "kxmls":  "MLS", "kxufc": "UFC",
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
-        # KXMVE markets are mostly NBA/NCAAB this time of year
-        "kxmvesports":  "NBA",
-        "kxmvecross":   "NBA",
-        "kxmve":        "NBA",
+        # KXMVE sports markets are mostly NBA/NCAAB this time of year
+        "kxmvesports": "NBA",
+        "kxmvecross":  "NBA",
     }
 
     @property
@@ -381,7 +375,7 @@ class SportsBot(BaseBot):
                 league = lg
                 break
 
-        # Refine league from title if we only have generic KXMVE
+        # Refine league from title
         title = market.get("title", "")
         title_lower = title.lower()
         if "nfl" in title_lower or "touchdown" in title_lower:
@@ -393,7 +387,7 @@ class SportsBot(BaseBot):
         elif "ncaa" in title_lower or "college" in title_lower:
             league = "NCAAB"
 
-        # Extract teams from title (title has real team names)
+        # Extract teams from title
         team_a, team_b = "Team A", "Team B"
         if " vs " in title:
             parts  = title.split(" vs ")
@@ -404,8 +398,6 @@ class SportsBot(BaseBot):
             team_a = title[:idx].split()[-1]
             team_b = title[idx + 6:].split()[0]
         elif "wins" in title_lower:
-            # Format: "yes Detroit wins by over 16.5 Points,..."
-            # Extract first team name after "yes "
             clean = title.replace("yes ", "").replace("no ", "")
             words = clean.split()
             team_a = words[0] if words else "Team A"
