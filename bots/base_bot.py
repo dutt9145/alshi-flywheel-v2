@@ -1,13 +1,14 @@
 """
-bots/base_bot.py  (v2 — correct Kalshi price fields)
+bots/base_bot.py  (v3 — double-logging fix)
 
-Fixes vs v1:
-  1. Price now reads yes_bid_dollars / yes_ask_dollars (0.0-1.0 string range)
-     and converts to 0.0-1.0 float. Previously used yes_bid/yes_ask which
-     don't exist in the Kalshi API — so market_prob was always 0.50 for
-     every market regardless of actual price.
-  2. Falls back to last_price_dollars if bid/ask are both zero
-  3. format string bug fixed: %.2%% → %.2f%%
+Changes vs v2:
+  1. Removed log_signal() call from evaluate()
+     — orchestrator.py already calls log_signal() after consensus with
+       better data (consensus prob, edge, confidence vs raw bot output)
+     — calling it in both places was doubling every signal in Supabase
+       and inflating dashboard counts by 2x
+  2. calibration_logger import removed (no longer needed here)
+  3. Everything else unchanged
 """
 
 import logging
@@ -19,7 +20,7 @@ import numpy as np
 from config.settings import MIN_EDGE_PCT
 from shared.bayesian_poly_model import BayesianPolyModel
 from shared.consensus_engine import BotSignal
-from shared.calibration_logger import log_signal, compute_calibration
+from shared.calibration_logger import compute_calibration
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +91,17 @@ class BaseBot(ABC):
     def evaluate(self, market: dict) -> Optional[BotSignal]:
         """
         Full pipeline for one market:
-            fetch → predict → pre-filter on edge → log → return BotSignal
-        Returns None if this bot is not relevant for the market.
+            fetch → predict → pre-filter on edge → return BotSignal
+
+        NOTE: log_signal() is intentionally NOT called here.
+        The orchestrator calls it once after consensus with better data.
+        Calling it here AND in the orchestrator was doubling every signal.
         """
         ticker = market.get("ticker", "UNKNOWN")
 
         if not self.is_relevant(market):
             return None
 
-        # Market's implied probability (correct Kalshi field names)
         market_prob = _market_prob(market)
 
         try:
@@ -120,25 +123,13 @@ class BaseBot(ABC):
             return None
 
         direction = "YES" if our_prob > market_prob else "NO"
-        brier     = self.model.brier_score()
-
-        log_signal(
-            ticker      = ticker,
-            sector      = self.sector_name,
-            our_prob    = our_prob,
-            market_prob = market_prob,
-            edge        = our_prob - market_prob,
-            confidence  = confidence,
-            direction   = direction,
-            brier_score = brier,
-        )
 
         signal = BotSignal(
             sector      = self.sector_name,
             prob        = our_prob,
             confidence  = confidence,
             market_prob = market_prob,
-            brier_score = brier,
+            brier_score = self.model.brier_score(),
         )
         logger.info(
             "[%s] %s → our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
