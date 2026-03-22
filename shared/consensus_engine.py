@@ -1,15 +1,15 @@
 """
-shared/consensus_engine.py
+shared/consensus_engine.py  (v2 — Gate 1 minimum bot fix)
 
-The consensus engine is the flywheel's kill-switch.
-No trade executes unless ALL THREE conditions pass:
-
-    1. Direction agreement — every bot returns the same YES/NO signal
-    2. Weighted-average edge > CONSENSUS_EDGE_PCT (default 5 %)
-    3. Weighted-average confidence > CONSENSUS_CONFIDENCE (default 65 %)
-
-Bots with higher calibration scores (lower Brier scores) receive higher
-weight, so well-calibrated bots drive the decision more than raw newcomers.
+Changes vs v1:
+  1. Gate 1 changed from requiring ALL sectors to respond to requiring
+     at least 1 bot to respond.
+     — Previously: len(signals) < len(SECTORS) killed every market that
+       wasn't covered by all 6 bots simultaneously (i.e. every market)
+     — A sports market only triggers SportsBot — requiring 6/6 responses
+       meant 0 trades would EVER execute regardless of edge or confidence
+     — Now: any market with at least 1 bot signal proceeds to Gates 2 & 3
+  2. Everything else unchanged from v1
 """
 
 import logging
@@ -108,16 +108,19 @@ class ConsensusEngine:
         """
         market_prob = yes_price_cents / 100.0
 
-        if len(signals) < len(SECTORS):
+        # ── Gate 1: at least one bot must respond ──────────────────────────────
+        # Previously required ALL sectors to respond, which killed every market
+        # since a sports market only triggers SportsBot (1/6), never 6/6.
+        if len(signals) < 1:
             return ConsensusResult(
                 ticker=ticker, execute=False,
                 direction=None, avg_prob=0.5,
                 avg_edge=0.0, avg_confidence=0.0,
                 signals=signals,
-                reject_reason=f"Only {len(signals)}/{len(SECTORS)} bots responded",
+                reject_reason="No bots responded",
             )
 
-        # ── Gate 1: direction agreement ────────────────────────────────────────
+        # ── Gate 2: direction agreement ────────────────────────────────────────
         directions = [s.direction for s in signals]
         if len(set(directions)) > 1:
             disagreements = ", ".join(f"{s.sector}={s.direction}" for s in signals)
@@ -144,7 +147,7 @@ class ConsensusEngine:
         if direction == "NO":
             avg_edge = market_prob - avg_prob  # flip sign for NO
 
-        # ── Gate 2: edge threshold ─────────────────────────────────────────────
+        # ── Gate 3: edge threshold ─────────────────────────────────────────────
         if avg_edge < CONSENSUS_EDGE_PCT:
             return ConsensusResult(
                 ticker=ticker, execute=False,
@@ -156,7 +159,7 @@ class ConsensusEngine:
                 ),
             )
 
-        # ── Gate 3: confidence floor ───────────────────────────────────────────
+        # ── Gate 4: confidence floor ───────────────────────────────────────────
         if avg_conf < CONSENSUS_CONFIDENCE:
             return ConsensusResult(
                 ticker=ticker, execute=False,

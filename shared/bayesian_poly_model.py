@@ -1,26 +1,16 @@
 """
-shared/bayesian_poly_model.py
+shared/bayesian_poly_model.py  (v2 — Supabase model persistence)
 
-The heart of the flywheel.  Each sector bot instantiates one of these.
-
-Pipeline
---------
-1. Raw sector features arrive as a 1-D numpy array.
-2. Polynomial features of degree-N are computed.
-3. A logistic regression is fitted on historical resolved contracts
-   (X = poly features, y = 1 if YES resolved, 0 if NO).
-4. The ML probability is blended with a Beta-Binomial Bayesian prior
-   using a data-confidence weight.
-5. The posterior probability is returned alongside a calibrated
-   standard-error estimate.
-
-Why polynomial + Bayesian?
---------------------------
-Polynomial features capture non-linear relationships (e.g. CPI at extreme
-values matters differently than CPI near the mean).  The Bayesian prior
-prevents overconfidence on thin data — when we have few resolved contracts
-the prior pulls the estimate toward 0.5, which is exactly what we want
-to avoid reckless betting.
+Changes vs v1:
+  1. save() now writes to BOTH local disk (fast cache) and Supabase (persistent)
+     — local disk write is unchanged for speed during the same deploy session
+     — Supabase write uses calibration_logger.save_model_state()
+     — if DB write fails it logs a warning but does NOT crash (graceful)
+  2. load() now falls back to Supabase when local disk is empty
+     — Railway ephemeral filesystem wipes models/ on every restart/redeploy
+     — Supabase copy survives indefinitely
+     — load order: disk (fastest) → Supabase (persistent) → fresh model
+  3. Everything else unchanged from v1
 """
 
 import logging
@@ -57,7 +47,7 @@ class BayesianPolyModel:
     def __init__(
         self,
         sector: str,
-        degree: int  = POLY_DEGREE,
+        degree: int   = POLY_DEGREE,
         alpha0: float = BETA_ALPHA_PRIOR,
         beta0:  float = BETA_BETA_PRIOR,
     ):
@@ -193,19 +183,76 @@ class BayesianPolyModel:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, directory: str = "models") -> None:
+        """
+        Save model to local disk (fast cache) AND Supabase (persistent).
+
+        Local disk is fast but wiped on every Railway restart/redeploy.
+        Supabase copy survives indefinitely and is loaded on cold start.
+        """
+        from shared.calibration_logger import save_model_state
+
+        # Serialize once, use for both destinations
+        blob = pickle.dumps(self)
+
+        # 1. Local disk — fast cache for the current deploy session
         Path(directory).mkdir(exist_ok=True)
         path = Path(directory) / f"{self.sector}_model.pkl"
-        with open(path, "wb") as f:
-            pickle.dump(self, f)
-        logger.info("[%s] Model saved to %s", self.sector, path)
+        try:
+            with open(path, "wb") as f:
+                f.write(blob)
+            logger.info("[%s] Model saved to disk (%d obs)", self.sector, self.n_obs)
+        except Exception as e:
+            logger.warning("[%s] Disk save failed: %s", self.sector, e)
+
+        # 2. Supabase — persistent across restarts and redeploys
+        try:
+            save_model_state(self.sector, blob)
+            logger.info("[%s] Model saved to Supabase (%d obs)", self.sector, self.n_obs)
+        except Exception as e:
+            logger.warning("[%s] Supabase model save failed (disk copy still valid): %s",
+                           self.sector, e)
 
     @classmethod
     def load(cls, sector: str, directory: str = "models") -> "BayesianPolyModel":
+        """
+        Load model using a three-tier fallback:
+          1. Local disk  — fastest, used within the same deploy session
+          2. Supabase    — persistent, survives Railway restarts/redeploys
+          3. Fresh model — cold start when no state exists yet
+
+        This fixes the core issue where Railway's ephemeral filesystem
+        wiped all trained model state on every restart, forcing our_p=0.500.
+        """
+        from shared.calibration_logger import load_model_state
+
+        # Tier 1: local disk (fastest)
         path = Path(directory) / f"{sector}_model.pkl"
-        if not path.exists():
-            logger.info("[%s] No saved model found, starting fresh", sector)
-            return cls(sector=sector)
-        with open(path, "rb") as f:
-            model = pickle.load(f)
-        logger.info("[%s] Model loaded (%d obs)", sector, model.n_obs)
-        return model
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    model = pickle.load(f)
+                logger.info("[%s] Model loaded from disk (%d obs)", sector, model.n_obs)
+                return model
+            except Exception as e:
+                logger.warning("[%s] Disk load failed, trying Supabase: %s", sector, e)
+
+        # Tier 2: Supabase (persistent across deploys)
+        try:
+            blob = load_model_state(sector)
+            if blob:
+                model = pickle.loads(blob)
+                logger.info("[%s] Model loaded from Supabase (%d obs)", sector, model.n_obs)
+                # Warm the local disk cache for this session
+                try:
+                    Path(directory).mkdir(exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(blob)
+                except Exception:
+                    pass
+                return model
+        except Exception as e:
+            logger.warning("[%s] Supabase model load failed: %s", sector, e)
+
+        # Tier 3: fresh model — no state exists yet
+        logger.info("[%s] No saved model found anywhere, starting fresh", sector)
+        return cls(sector=sector)

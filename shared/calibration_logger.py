@@ -1,12 +1,16 @@
 """
-shared/calibration_logger.py  (v6 — log_outcome signature updated)
+shared/calibration_logger.py  (v7 — Supabase model persistence)
 
-Changes vs v5:
-  1. log_outcome() now accepts our_prob and correct parameters
-     so the resolution ingestion pipeline can record what the bot
-     predicted vs what actually happened — required for Brier scoring
-  2. outcomes table INSERT updated to match new columns
-  3. Everything else unchanged from v5
+Changes vs v6:
+  1. model_states table added to init_db()
+     — stores serialized BayesianPolyModel pickles as base64 text
+     — keyed by sector name, upserts on conflict
+     — survives Railway restarts / redeploys (ephemeral filesystem fix)
+  2. save_model_state(sector, blob) added
+     — called by BayesianPolyModel.save() after local disk write
+  3. load_model_state(sector) added
+     — called by BayesianPolyModel.load() as fallback when disk is empty
+  4. Everything else unchanged from v6
 """
 
 import logging
@@ -153,6 +157,13 @@ def init_db() -> None:
             notes        TEXT
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS model_states (
+            sector      TEXT PRIMARY KEY,
+            updated_at  TEXT NOT NULL,
+            model_blob  TEXT NOT NULL
+        )
+        """,
     ]
 
     with _db() as conn:
@@ -274,18 +285,6 @@ def log_outcome(
     our_prob: Optional[float] = None,
     correct: Optional[bool] = None,
 ) -> None:
-    """
-    Write one row to the outcomes table.
-
-    Parameters
-    ----------
-    ticker    : Kalshi market ticker
-    resolved  : "YES" or "NO" — what the market actually resolved to
-    pnl_usd   : Realised P&L in dollars (None until fill data is available)
-    trade_id  : FK to trades table (None if no trade was placed)
-    our_prob  : The probability our model assigned before resolution
-    correct   : True if our direction call matched the resolution
-    """
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
@@ -312,6 +311,68 @@ def log_outcome(
         correct,
         f"${float(pnl_usd):.2f}" if pnl_usd is not None else "pending",
     )
+
+
+# ── Model state persistence (survives Railway restarts) ───────────────────────
+
+def save_model_state(sector: str, blob: bytes) -> None:
+    """
+    Upsert a serialized BayesianPolyModel pickle into the model_states table.
+    blob is stored as base64 text so it survives any encoding issues.
+    """
+    import base64
+    encoded = base64.b64encode(blob).decode()
+
+    if USE_POSTGRES:
+        sql = """
+            INSERT INTO model_states (sector, updated_at, model_blob)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (sector) DO UPDATE
+            SET model_blob = EXCLUDED.model_blob,
+                updated_at = EXCLUDED.updated_at
+        """
+    else:
+        sql = """
+            INSERT OR REPLACE INTO model_states (sector, updated_at, model_blob)
+            VALUES (?, ?, ?)
+        """
+
+    vals = (sector, datetime.now(timezone.utc).isoformat(), encoded)
+    with _db() as conn:
+        if USE_POSTGRES:
+            conn.cursor().execute(sql, vals)
+        else:
+            conn.execute(sql, vals)
+    logger.info("[%s] Model state saved to DB", sector)
+
+
+def load_model_state(sector: str) -> Optional[bytes]:
+    """
+    Load a serialized BayesianPolyModel pickle from the model_states table.
+    Returns None if no state exists for this sector yet.
+    """
+    import base64
+
+    sql = (
+        "SELECT model_blob FROM model_states WHERE sector = %s"
+        if USE_POSTGRES else
+        "SELECT model_blob FROM model_states WHERE sector = ?"
+    )
+
+    with _db() as conn:
+        if USE_POSTGRES:
+            cur = conn.cursor()
+            cur.execute(sql, (sector,))
+            row = cur.fetchone()
+        else:
+            row = conn.execute(sql, (sector,)).fetchone()
+
+    if not row:
+        logger.info("[%s] No model state found in DB", sector)
+        return None
+
+    encoded = row[0] if USE_POSTGRES else row["model_blob"]
+    return base64.b64decode(encoded)
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
