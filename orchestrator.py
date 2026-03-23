@@ -1,13 +1,14 @@
 """
-orchestrator.py  (v6 — ghost signal entries eliminated)
+orchestrator.py  (v7 — 4-hour resolution reconciliation watchdog)
 
-Changes vs v5:
-  1. log_signal() moved to AFTER consensus.execute check
-     — previously logged every market that got signals regardless of
-       whether consensus passed, producing ghost entries with None
-       direction, 0% edge, 0% confidence in Supabase
-     — now only logs markets that actually pass all consensus gates
-     — signal counts will drop but every logged signal is meaningful
+Changes vs v6:
+  1. Added schedule.every(4).hours.do(self._ingest_resolved_markets)
+     — Resolution ingestion now runs every 4 hours automatically
+     — If the 2am retrain misses (Railway restart, redeploy timing, etc.)
+       the next 4-hour cycle catches and ingests any missed outcomes
+     — Fully automatic, no manual intervention or notification needed
+     — Tables will populate silently in the background
+  2. Everything else unchanged from v6
 """
 
 import logging
@@ -100,6 +101,11 @@ class FlywheelOrchestrator:
         """
         Fetch all settled markets from Kalshi, match against our signal log,
         update Bayesian models, and write outcomes to DB.
+
+        Runs:
+          - Every 4 hours (watchdog — catches anything the 2am job missed)
+          - As part of nightly retrain at 2am
+
         Returns count of new outcomes recorded this cycle.
         """
         logger.info("=== Resolution ingestion starting ===")
@@ -220,15 +226,10 @@ class FlywheelOrchestrator:
 
         consensus = self.engine.evaluate(ticker, yes_price, signals)
 
-        # ── Gate: drop markets that don't pass consensus ───────────────────────
-        # log_signal MOVED HERE — only log markets that pass consensus
-        # Previously logged before this check, producing ghost entries with
-        # None direction / 0% edge / 0% confidence for every rejected market
         if not consensus.execute:
             logger.debug("Consensus reject %s: %s", ticker, consensus.reject_reason)
             return
 
-        # ── Log the signal — only reaches here if consensus passed ─────────────
         lead_sector = signals[0].sector
         try:
             log_signal(
@@ -243,7 +244,6 @@ class FlywheelOrchestrator:
         except Exception as e:
             logger.error("log_signal failed for %s: %s", ticker, e)
 
-        # ── Gate 4: Cross-venue arb check ─────────────────────────────────────
         arb = self.arb.check(
             ticker        = ticker,
             kalshi_cents  = yes_price,
@@ -268,7 +268,6 @@ class FlywheelOrchestrator:
                 yes_price - arb.sharp_line_prob * 100,
             )
 
-        # ── Kelly sizing ───────────────────────────────────────────────────────
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
         if consensus.direction == "YES":
@@ -294,7 +293,6 @@ class FlywheelOrchestrator:
             logger.info("Sizing zero for %s — skip", ticker)
             return
 
-        # ── Execute ────────────────────────────────────────────────────────────
         client_order_id = str(uuid.uuid4())
         try:
             order_resp = self.client.place_order(
@@ -373,12 +371,22 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v6 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v7 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
+
+        # Market scanning — runs every SCAN_INTERVAL_SEC seconds
         schedule.every(SCAN_INTERVAL_SEC).seconds.do(self.scan_markets)
+
+        # Nightly retrain — runs at 2am, includes resolution ingestion
         schedule.every().day.at(f"{RETRAIN_HOUR:02d}:00").do(self.retrain_models)
+
+        # Watchdog — resolution ingestion every 4 hours
+        # Automatically catches any outcomes missed by the 2am retrain
+        # (e.g. redeploy timing, Railway restart, Kalshi API blip)
+        schedule.every(4).hours.do(self._ingest_resolved_markets)
+
         self.scan_markets()
         while True:
             schedule.run_pending()
