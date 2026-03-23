@@ -1,18 +1,15 @@
 """
-orchestrator.py  (v8 — threaded resolution ingestion watchdog)
+orchestrator.py  (v9 — removed ticker matching filter from resolution ingestion)
 
-Changes vs v7:
-  1. Resolution ingestion now runs in a background thread
-     — Previously the schedule library was single-threaded, meaning the
-       market scanner (which runs every 5 min and takes ~7 min) would
-       block the watchdog from ever executing
-     — Now _ingest_resolved_markets() runs in a daemon thread completely
-       independent of the main scan loop
-     — On startup: fires immediately once in a background thread to catch
-       any missed outcomes from previous cycles
-     — Every 4 hours: fires again in a new background thread via
-       _run_ingestion_thread()
-  2. Everything else unchanged from v7
+Changes vs v8:
+  1. Removed "if ticker not in our_tickers: continue" check
+     — Previously only logged outcomes for markets we had previously signaled
+     — Since we have no trade history yet, this filtered out ALL 1000 resolved
+       markets, resulting in 0 new outcomes every cycle
+     — Now logs ALL resolved markets from Kalshi directly into outcomes table
+     — This immediately populates outcomes with real data for Brier scoring
+     — Once we have enough signal/outcome overlap, the filter can be re-added
+  2. Everything else unchanged from v8
 """
 
 import logging
@@ -100,8 +97,11 @@ class FlywheelOrchestrator:
 
     def _ingest_resolved_markets(self) -> int:
         """
-        Fetch all settled markets from Kalshi, match against our signal log,
-        update Bayesian models, and write outcomes to DB.
+        Fetch all settled markets from Kalshi and write outcomes to DB.
+
+        Logs ALL resolved markets — no ticker matching filter.
+        Previously filtering to only our signaled tickers resulted in
+        0 outcomes since resolved markets predate our signal history.
 
         Runs in a background daemon thread so it never blocks the main
         scan loop. Fires immediately on startup and every 4 hours after.
@@ -125,11 +125,6 @@ class FlywheelOrchestrator:
             for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
         }
 
-        our_tickers = {
-            r["ticker"]
-            for r in _query_signals("SELECT DISTINCT ticker FROM signals")
-        }
-
         recorded = 0
 
         for market in resolved_markets:
@@ -142,27 +137,9 @@ class FlywheelOrchestrator:
             if ticker in already_recorded:
                 continue
 
-            if ticker not in our_tickers:
-                continue
-
             resolved_yes = result == "yes"
 
-            for bot in self.bots:
-                if not bot.is_relevant(market):
-                    continue
-                try:
-                    features, _ = bot.fetch_features(market)
-                    bot.record_outcome(features, resolved_yes)
-                    logger.info(
-                        "[%s] Bayesian update: %s → %s",
-                        bot.sector_name, ticker, result.upper()
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "[%s] record_outcome failed for %s: %s",
-                        bot.sector_name, ticker, e
-                    )
-
+            # Try to find a matching signal for this ticker
             sig_rows = _query_signals(
                 "SELECT our_prob, direction FROM signals "
                 "WHERE ticker = %s ORDER BY created_at DESC LIMIT 1"
@@ -179,6 +156,23 @@ class FlywheelOrchestrator:
                 (direction == "YES" and resolved_yes) or
                 (direction == "NO"  and not resolved_yes)
             )
+
+            # Feed resolved outcome into relevant bot models
+            for bot in self.bots:
+                if not bot.is_relevant(market):
+                    continue
+                try:
+                    features, _ = bot.fetch_features(market)
+                    bot.record_outcome(features, resolved_yes)
+                    logger.info(
+                        "[%s] Bayesian update: %s → %s",
+                        bot.sector_name, ticker, result.upper()
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] record_outcome failed for %s: %s",
+                        bot.sector_name, ticker, e
+                    )
 
             try:
                 log_outcome(
@@ -380,7 +374,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v8 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v9 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
