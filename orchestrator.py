@@ -1,17 +1,22 @@
 """
-orchestrator.py  (v7 — 4-hour resolution reconciliation watchdog)
+orchestrator.py  (v8 — threaded resolution ingestion watchdog)
 
-Changes vs v6:
-  1. Added schedule.every(4).hours.do(self._ingest_resolved_markets)
-     — Resolution ingestion now runs every 4 hours automatically
-     — If the 2am retrain misses (Railway restart, redeploy timing, etc.)
-       the next 4-hour cycle catches and ingests any missed outcomes
-     — Fully automatic, no manual intervention or notification needed
-     — Tables will populate silently in the background
-  2. Everything else unchanged from v6
+Changes vs v7:
+  1. Resolution ingestion now runs in a background thread
+     — Previously the schedule library was single-threaded, meaning the
+       market scanner (which runs every 5 min and takes ~7 min) would
+       block the watchdog from ever executing
+     — Now _ingest_resolved_markets() runs in a daemon thread completely
+       independent of the main scan loop
+     — On startup: fires immediately once in a background thread to catch
+       any missed outcomes from previous cycles
+     — Every 4 hours: fires again in a new background thread via
+       _run_ingestion_thread()
+  2. Everything else unchanged from v7
 """
 
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -55,10 +60,6 @@ def _parse_yes_price_cents(market: dict) -> int:
 
 
 def _query_signals(sql: str, params: tuple = ()) -> list:
-    """
-    Lightweight inline query helper for resolution ingestion.
-    Mirrors dashboard.py's query() but lives here to avoid circular imports.
-    """
     import os
     database_url = os.getenv("DATABASE_URL", "")
     db_path      = os.getenv("DB_PATH", "flywheel.db")
@@ -102,11 +103,8 @@ class FlywheelOrchestrator:
         Fetch all settled markets from Kalshi, match against our signal log,
         update Bayesian models, and write outcomes to DB.
 
-        Runs:
-          - Every 4 hours (watchdog — catches anything the 2am job missed)
-          - As part of nightly retrain at 2am
-
-        Returns count of new outcomes recorded this cycle.
+        Runs in a background daemon thread so it never blocks the main
+        scan loop. Fires immediately on startup and every 4 hours after.
         """
         logger.info("=== Resolution ingestion starting ===")
 
@@ -198,6 +196,19 @@ class FlywheelOrchestrator:
         logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
 
+    def _run_ingestion_thread(self) -> None:
+        """
+        Launch _ingest_resolved_markets() in a background daemon thread.
+        This ensures the market scanner never blocks resolution ingestion.
+        """
+        t = threading.Thread(
+            target=self._ingest_resolved_markets,
+            daemon=True,
+            name="resolution-ingestion"
+        )
+        t.start()
+        logger.info("Resolution ingestion thread started")
+
     # ── Per-market pipeline ────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
@@ -207,11 +218,9 @@ class FlywheelOrchestrator:
 
         if yes_price == 0:
             return
-
         if yes_price <= 2 or yes_price >= 98:
             return
 
-        # ── Collect bot signals ────────────────────────────────────────────────
         signals = []
         for bot in self.bots:
             try:
@@ -371,7 +380,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v7 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v8 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
@@ -382,10 +391,13 @@ class FlywheelOrchestrator:
         # Nightly retrain — runs at 2am, includes resolution ingestion
         schedule.every().day.at(f"{RETRAIN_HOUR:02d}:00").do(self.retrain_models)
 
-        # Watchdog — resolution ingestion every 4 hours
-        # Automatically catches any outcomes missed by the 2am retrain
-        # (e.g. redeploy timing, Railway restart, Kalshi API blip)
-        schedule.every(4).hours.do(self._ingest_resolved_markets)
+        # Watchdog — fires every 4 hours in a background thread
+        # Never blocked by the market scanner
+        schedule.every(4).hours.do(self._run_ingestion_thread)
+
+        # Fire immediately on startup in background thread
+        # catches any outcomes missed before this deploy
+        self._run_ingestion_thread()
 
         self.scan_markets()
         while True:
