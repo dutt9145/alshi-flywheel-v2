@@ -1,15 +1,16 @@
 """
-orchestrator.py  (v9 — removed ticker matching filter from resolution ingestion)
+orchestrator.py  (v10 — P&L calculation on resolution)
 
-Changes vs v8:
-  1. Removed "if ticker not in our_tickers: continue" check
-     — Previously only logged outcomes for markets we had previously signaled
-     — Since we have no trade history yet, this filtered out ALL 1000 resolved
-       markets, resulting in 0 new outcomes every cycle
-     — Now logs ALL resolved markets from Kalshi directly into outcomes table
-     — This immediately populates outcomes with real data for Brier scoring
-     — Once we have enough signal/outcome overlap, the filter can be re-added
-  2. Everything else unchanged from v8
+Changes vs v9:
+  1. pnl_usd is now calculated at resolution time instead of always None
+     — queries trades table for matching ticker/direction/contracts
+     — Kalshi contract math:
+         YES bought @ X cents, resolves YES  → pnl = contracts * (1.00 - X/100)
+         YES bought @ X cents, resolves NO   → pnl = contracts * -(X/100)
+         NO  bought @ (100-X) cents, resolves NO  → pnl = contracts * (X/100)
+         NO  bought @ (100-X) cents, resolves YES → pnl = contracts * -((100-X)/100)
+     — falls back to None gracefully if no matching trade found
+  2. Everything else unchanged from v9
 """
 
 import logging
@@ -83,6 +84,58 @@ def _query_signals(sql: str, params: tuple = ()) -> list:
         return []
 
 
+def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str | None]:
+    """
+    Look up the most recent trade for this ticker and calculate P&L.
+
+    Kalshi contract math (each contract pays $1.00 if it resolves in your favor):
+        YES bought @ X cents, resolves YES  → profit = 1.00 - X/100  per contract
+        YES bought @ X cents, resolves NO   → loss   = -(X/100)      per contract
+        NO  bought @ (100-X) cents, resolves NO  → profit = X/100    per contract
+        NO  bought @ (100-X) cents, resolves YES → loss   = -((100-X)/100) per contract
+
+    Returns (pnl_usd, trade_id) or (None, None) if no matching trade found.
+    """
+    import os
+    is_postgres = bool(os.getenv("DATABASE_URL", ""))
+    placeholder = "%s" if is_postgres else "?"
+
+    trade_rows = _query_signals(
+        f"SELECT id, direction, contracts, yes_price_cents "
+        f"FROM trades WHERE ticker = {placeholder} "
+        f"ORDER BY created_at DESC LIMIT 1",
+        (ticker,)
+    )
+
+    if not trade_rows:
+        return None, None
+
+    trade      = trade_rows[0]
+    trade_id   = str(trade.get("id", ""))
+    direction  = str(trade.get("direction", "YES")).upper()
+    contracts  = int(trade.get("contracts", 0))
+    yes_price  = int(trade.get("yes_price_cents", 50))
+
+    if contracts <= 0:
+        return None, trade_id
+
+    yes_price_frac = yes_price / 100.0   # e.g. 0.60 for 60 cents
+
+    if direction == "YES":
+        if resolved_yes:
+            pnl = contracts * (1.00 - yes_price_frac)
+        else:
+            pnl = contracts * (-yes_price_frac)
+    else:  # direction == "NO" — bought at (1 - yes_price_frac) per contract
+        no_price_frac = 1.00 - yes_price_frac
+        if not resolved_yes:
+            pnl = contracts * no_price_frac        # NO wins — collect no_price profit
+        else:
+            pnl = contracts * (-yes_price_frac)    # NO loses — lose what YES would have paid
+
+    return round(pnl, 2), trade_id
+
+
 class FlywheelOrchestrator:
 
     def __init__(self):
@@ -102,6 +155,10 @@ class FlywheelOrchestrator:
         Logs ALL resolved markets — no ticker matching filter.
         Previously filtering to only our signaled tickers resulted in
         0 outcomes since resolved markets predate our signal history.
+
+        P&L is now calculated at resolution time by looking up the
+        matching trade in the trades table. Falls back to None gracefully
+        if no trade record exists for that ticker.
 
         Runs in a background daemon thread so it never blocks the main
         scan loop. Fires immediately on startup and every 4 hours after.
@@ -157,6 +214,20 @@ class FlywheelOrchestrator:
                 (direction == "NO"  and not resolved_yes)
             )
 
+            # Calculate P&L from the matching trade record
+            pnl_usd, trade_id = _calculate_pnl(ticker, resolved_yes)
+
+            if pnl_usd is not None:
+                logger.info(
+                    "[P&L] %s resolved %s → $%+.2f (trade_id=%s)",
+                    ticker, result.upper(), pnl_usd, trade_id
+                )
+            else:
+                logger.debug(
+                    "[P&L] %s resolved %s — no matching trade found, pnl=None",
+                    ticker, result.upper()
+                )
+
             # Feed resolved outcome into relevant bot models
             for bot in self.bots:
                 if not bot.is_relevant(market):
@@ -178,8 +249,8 @@ class FlywheelOrchestrator:
                 log_outcome(
                     ticker       = ticker,
                     resolved     = result.upper(),
-                    pnl_usd      = None,
-                    trade_id     = None,
+                    pnl_usd      = pnl_usd,
+                    trade_id     = trade_id,
                     our_prob     = our_prob,
                     correct      = direction_correct,
                 )
@@ -374,7 +445,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v9 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v10 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
