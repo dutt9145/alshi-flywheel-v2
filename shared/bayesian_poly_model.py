@@ -1,16 +1,12 @@
 """
-shared/bayesian_poly_model.py  (v2 — Supabase model persistence)
+shared/bayesian_poly_model.py  (v3 — feature dimension mismatch guard)
 
-Changes vs v1:
-  1. save() now writes to BOTH local disk (fast cache) and Supabase (persistent)
-     — local disk write is unchanged for speed during the same deploy session
-     — Supabase write uses calibration_logger.save_model_state()
-     — if DB write fails it logs a warning but does NOT crash (graceful)
-  2. load() now falls back to Supabase when local disk is empty
-     — Railway ephemeral filesystem wipes models/ on every restart/redeploy
-     — Supabase copy survives indefinitely
-     — load order: disk (fastest) → Supabase (persistent) → fresh model
-  3. Everything else unchanged from v1
+Changes vs v2:
+  1. predict() now checks feature vector length against the trained pipeline's
+     expected input shape before inference. If a mismatch is detected (e.g.
+     WeatherBot grew from 7 → 9 features after NOAA integration), the stored
+     model resets gracefully to bayes_only mode rather than crashing sklearn.
+  2. Everything else unchanged from v2 (Supabase persistence, disk cache, etc.)
 """
 
 import logging
@@ -124,6 +120,27 @@ class BayesianPolyModel:
             "method"    : str,     # 'ml+bayes' | 'bayes_only'
         }
         """
+        # ── Feature dimension guard (NEW in v3) ────────────────────────────────
+        # If the stored pipeline was trained on a different feature count (e.g.
+        # WeatherBot grew from 7 → 9 features after NOAA integration), reset the
+        # ML model gracefully rather than crashing sklearn with a shape mismatch.
+        if self.trained:
+            try:
+                expected = self._pipeline.named_steps["poly"].n_features_in_
+                if features.shape[0] != expected:
+                    logger.warning(
+                        "[%s] Feature dim mismatch: got %d, expected %d — "
+                        "resetting ML model, falling back to bayes_only",
+                        self.sector, features.shape[0], expected,
+                    )
+                    self.trained = False
+                    self._X_buf  = []
+                    self._y_buf  = []
+                    self.n_obs   = 0
+            except Exception as e:
+                logger.warning("[%s] Dimension check failed: %s", self.sector, e)
+        # ── End guard ──────────────────────────────────────────────────────────
+
         bayes_prior = self.alpha_post / (self.alpha_post + self.beta_post)
 
         if not self.trained:

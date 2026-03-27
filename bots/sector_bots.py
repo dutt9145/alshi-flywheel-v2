@@ -1,29 +1,21 @@
 """
-bots/sector_bots.py  (v6 — full keyword bleed audit)
+bots/sector_bots.py  (v8 — skip_noaa flag for ingestion safety)
 
-Changes vs v5:
-  EconomicsBot:
-    - REMOVED "yield"   → appeared in sports spread/stats context
-  CryptoBot:
-    - REMOVED "sol"     → substring of "resolved", "console", many common words
-    - REMOVED "link"    → too generic; kxlink prefix retained
+Changes vs v7:
   WeatherBot:
-    - REMOVED "heat"    → Miami Heat is an NBA team (huge bleed)
-    - REMOVED "cold"    → appeared in sports cold-weather game titles
-    - REMOVED "wind"    → appeared in sports stadium/conditions titles
-  PoliticsBot:
-    - REMOVED "law"     → matched player names and general sports content
-    - REMOVED "bill"    → matched player names (Bill X) in sports titles
-  TechBot:
-    - Unchanged from v5 (already cleaned)
-  SportsBot:
-    - Unchanged from v4 (already cleaned)
+    - fetch_features() now accepts skip_noaa=False parameter
+    - When skip_noaa=True (called from orchestrator resolution ingestion),
+      NOAA HTTP calls are bypassed entirely — feature vector is padded with
+      [0.5, 0.0] to maintain consistent shape, noaa_summary = "skipped"
+    - Live signal evaluation (skip_noaa=False, the default) unchanged —
+      still gets full NOAA enrichment
+    - Prevents NOAA rate-limiting / slowdown during bulk historical ingestion
+      (e.g. 3,600+ resolved sports markets triggering weather fetches)
 
-Rule applied: if a keyword could plausibly appear in a KXMVE sports market
-title without being the primary topic, it should be removed. kx-prefixes
-are always safe (they're Kalshi's own taxonomy), bare English words are not.
+All other bots: unchanged from v7.
 """
 
+import asyncio
 import logging
 import re
 from typing import Optional
@@ -34,6 +26,16 @@ from bots.base_bot import BaseBot
 from shared.data_fetchers import (
     fetch_economics_features, fetch_crypto_features, fetch_politics_features,
     fetch_weather_features, fetch_tech_features, fetch_sports_features,
+)
+from shared.noaa_client import (
+    fetch_weather_package,
+    city_to_coords,
+    extract_temp_signals,
+    extract_precip_signals,
+    extract_alert_signals,
+    parse_market_date,
+    parse_temp_threshold,
+    classify_weather_market,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,7 +86,7 @@ class EconomicsBot(BaseBot):
     def is_relevant(self, market: dict) -> bool:
         return _search_fields(market, self.KEYWORDS)
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         features, context = fetch_economics_features()
         title   = market.get("title", "")
         numbers = re.findall(r"\d+\.?\d*", title)
@@ -148,7 +150,7 @@ class CryptoBot(BaseBot):
                 return coin_id
         return "bitcoin"
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         coin_id  = self._detect_coin(market)
         features, context = fetch_crypto_features(coin_id=coin_id)
         title   = market.get("title", "")
@@ -193,7 +195,7 @@ class PoliticsBot(BaseBot):
     def is_relevant(self, market: dict) -> bool:
         return _search_fields(market, self.KEYWORDS)
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         poly_slug  = market.get("polymarket_slug")
         features, context = fetch_politics_features(poly_slug)
         title   = market.get("title", "")
@@ -213,14 +215,16 @@ class PoliticsBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  4. WEATHER BOT
+#  4. WEATHER BOT  (v8 — skip_noaa flag)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WeatherBot(BaseBot):
     """
     Temperature records, precipitation, storm landfalls.
-    "heat" removed — Miami Heat is an NBA team (massive bleed into sports).
-    "cold" and "wind" removed — appear in sports game condition titles.
+    v7: NOAA API integrated.
+    v8: fetch_features() accepts skip_noaa=True to bypass NOAA HTTP calls
+        during bulk historical ingestion, preventing rate-limiting and
+        blocking the resolution watchdog thread.
     """
 
     KEYWORDS = [
@@ -239,6 +243,7 @@ class WeatherBot(BaseBot):
         # "temp"  REMOVED — too short, risky substring
     ]
 
+    # Local fallback coords (noaa_client.CITY_COORDS is the master list)
     CITY_COORDS = {
         "new york": (40.71, -74.01), "nyc": (40.71, -74.01),
         "los angeles": (34.05, -118.24), "la": (34.05, -118.24),
@@ -262,9 +267,110 @@ class WeatherBot(BaseBot):
                 return coords[0], coords[1], city
         return 40.71, -74.01, "New York"
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def _get_noaa_prior(self, market: dict) -> Optional[dict]:
+        """
+        Sync wrapper around the async NOAA enrichment pipeline.
+        Returns a dict with prior_yes, confidence, noaa_summary, etc.
+        or None if NOAA is unavailable / city not parseable.
+        """
+        title      = market.get("title", "")
+        close_time = market.get("close_time")
+
+        city_str = self._parse_city_from_title(title)
+        if not city_str:
+            return None
+        coords = city_to_coords(city_str)
+        if not coords:
+            return None
+
+        lat, lon      = coords
+        target_date   = parse_market_date(title, close_time)
+        market_type   = classify_weather_market(title)
+
+        try:
+            pkg = asyncio.run(fetch_weather_package(lat, lon))
+        except RuntimeError:
+            # Already inside a running event loop (e.g. during testing)
+            loop = asyncio.get_event_loop()
+            pkg  = loop.run_until_complete(fetch_weather_package(lat, lon))
+
+        if not pkg:
+            return None
+
+        prior_yes  = 0.5
+        confidence = 0.30
+        summary    = "NOAA: no signal matched"
+
+        if market_type in ("temp_high", "temp_low"):
+            temps     = extract_temp_signals(pkg["hourly"], target_date)
+            threshold = parse_temp_threshold(title)
+            if temps and threshold is not None:
+                observed = temps["high_f"] if market_type == "temp_high" else temps["low_f"]
+                spread   = max((temps["high_f"] - temps["low_f"]) / 2, 1.0)
+                z        = (observed - threshold) / spread
+                prior_yes  = round(1 / (1 + pow(2.718, -1.7 * z)), 4)
+                confidence = min(0.85, 0.4 + 0.05 * temps["sample_count"])
+                summary    = (
+                    f"NOAA temp: observed={observed:.1f}°F "
+                    f"threshold={threshold:.1f}°F P(YES)={prior_yes:.2f}"
+                )
+
+        elif market_type == "precipitation":
+            precip = extract_precip_signals(pkg["forecast"], target_date)
+            if precip:
+                prior_yes  = round(precip["precip_pct"] / 100.0, 4)
+                confidence = 0.70
+                summary    = f"NOAA precip: PoP={precip['precip_pct']:.0f}%"
+
+        elif market_type == "snow":
+            precip     = extract_precip_signals(pkg["forecast"], target_date)
+            alerts     = extract_alert_signals(pkg["alerts"])
+            snow_alert = any("snow" in (a or "").lower() for a in alerts["alert_types"])
+            base       = precip["precip_pct"] / 100.0 * 0.6
+            if snow_alert:
+                base = min(1.0, base + 0.25)
+            prior_yes  = round(base, 4)
+            confidence = 0.65
+            summary    = f"NOAA snow: precip={precip['precip_pct']:.0f}% snow_alert={snow_alert}"
+
+        elif market_type == "severe_weather":
+            alerts = extract_alert_signals(pkg["alerts"])
+            if alerts["has_severe_alert"]:
+                prior_yes, confidence = 0.82, 0.80
+            else:
+                prior_yes, confidence = 0.12, 0.60
+            summary = f"NOAA alerts: severity={alerts['highest_severity']}"
+
+        logger.info(f"[NOAA] {city_str} | {target_date} | {market_type} | {summary}")
+
+        return {
+            "prior_yes":    prior_yes,
+            "confidence":   confidence,
+            "market_type":  market_type,
+            "noaa_summary": summary,
+            "city":         city_str,
+            "target_date":  target_date,
+        }
+
+    @staticmethod
+    def _parse_city_from_title(title: str) -> Optional[str]:
+        """Extract city substring from market title for noaa_client lookup."""
+        patterns = [
+            r"\bin\s+([A-Za-z\s]+?)(?:\s+on|\s+exceed|\s+be|\s+reach|\?|$)",
+            r"^Will\s+([A-Za-z\s]+?)\s+(?:high|low|temp)",
+            r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:temperature|temp|high|low|weather)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, title, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         lat, lon, city = self._detect_city(market)
         features, context = fetch_weather_features(lat, lon, city)
+
+        # ── Numeric targets from title ───────────────────────────
         title    = market.get("title", "")
         numbers  = re.findall(r"\d+\.?\d*", title)
         target_f = float(numbers[0]) if numbers else 75.0
@@ -273,6 +379,41 @@ class WeatherBot(BaseBot):
         features = np.append(features, [target_c, delta])
         context["target_c"]          = target_c
         context["delta_from_target"] = delta
+
+        # ── NOAA enrichment ──────────────────────────────────────
+        # skip_noaa=True during historical ingestion — avoids hammering
+        # the NOAA API across thousands of resolved markets and blocking
+        # the resolution watchdog thread. Live signals always get full
+        # enrichment (skip_noaa=False is the default).
+        if not skip_noaa:
+            noaa = self._get_noaa_prior(market)
+            if noaa:
+                existing_prob = context.get("model_probability", 0.5)
+                w_noaa   = noaa["confidence"]
+                w_model  = 1.0 - w_noaa
+                blended  = round(w_noaa * noaa["prior_yes"] + w_model * existing_prob, 4)
+
+                features = np.append(features, [noaa["prior_yes"], noaa["confidence"]])
+                context["noaa_prior"]        = noaa["prior_yes"]
+                context["noaa_confidence"]   = noaa["confidence"]
+                context["noaa_blended_prob"] = blended
+                context["noaa_summary"]      = noaa["noaa_summary"]
+                context["noaa_city"]         = noaa["city"]
+                context["noaa_date"]         = noaa["target_date"]
+                context["noaa_market_type"]  = noaa["market_type"]
+            else:
+                # NOAA unavailable but still on live path — pad to keep shape
+                features = np.append(features, [0.5, 0.0])
+                context["noaa_prior"]      = None
+                context["noaa_confidence"] = 0.0
+                context["noaa_summary"]    = "NOAA unavailable"
+        else:
+            # Historical ingestion path — skip all NOAA calls, pad shape
+            features = np.append(features, [0.5, 0.0])
+            context["noaa_prior"]      = None
+            context["noaa_confidence"] = 0.0
+            context["noaa_summary"]    = "skipped during ingestion"
+
         return features, context
 
 
@@ -330,7 +471,7 @@ class TechBot(BaseBot):
                 return symbol
         return "AAPL"
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         company  = self._detect_company(market)
         features, context = fetch_tech_features(company)
         title   = market.get("title", "")
@@ -424,7 +565,7 @@ class SportsBot(BaseBot):
 
         return team_a, team_b, league
 
-    def fetch_features(self, market: dict) -> tuple[np.ndarray, dict]:
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
         team_a, team_b, league = self._extract_teams_and_league(market)
         features, context = fetch_sports_features(team_a, team_b, league)
         title   = market.get("title", "")

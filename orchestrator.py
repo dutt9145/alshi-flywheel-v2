@@ -233,7 +233,7 @@ class FlywheelOrchestrator:
                 if not bot.is_relevant(market):
                     continue
                 try:
-                    features, _ = bot.fetch_features(market)
+                    features, _ = bot.fetch_features(market, skip_noaa=True)
                     bot.record_outcome(features, resolved_yes)
                     logger.info(
                         "[%s] Bayesian update: %s → %s",
