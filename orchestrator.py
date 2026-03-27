@@ -232,6 +232,8 @@ class FlywheelOrchestrator:
             for bot in self.bots:
                 if not bot.is_relevant(market):
                     continue
+                if not sig_rows:         
+                    continue              
                 try:
                     features, _ = bot.fetch_features(market, skip_noaa=True)
                     bot.record_outcome(features, resolved_yes)
