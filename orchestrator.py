@@ -840,6 +840,11 @@ class FlywheelOrchestrator:
         # Startup: fire ingestion immediately to catch overnight resolutions
         self._run_ingestion_thread()
 
+        # Stagger first scan 30s so ingestion and scan threads
+        # don't hammer the API simultaneously on startup
+        logger.info("Waiting 30s before first scan to stagger API calls...")
+        time.sleep(30)
+
         self.scan_markets()
         while True:
             schedule.run_pending()

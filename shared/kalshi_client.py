@@ -201,7 +201,7 @@ class KalshiClient:
             if not cursor or len(batch) < 100:
                 break
 
-            time.sleep(0.3)
+            time.sleep(1.0)
 
         return markets
 
@@ -268,7 +268,7 @@ class KalshiClient:
             if not cursor or len(batch) < 100:
                 break
 
-            time.sleep(0.3)
+            time.sleep(1.0)
 
         logger.info("get_resolved_markets complete — %d total clean results", len(markets))
         return markets
@@ -286,7 +286,7 @@ class KalshiClient:
                 import psycopg2
                 conn = psycopg2.connect(database_url)
                 cur  = conn.cursor()
-                cur.execute("SELECT MAX(resolved_at) FROM outcomes")
+                cur.execute("SELECT MAX(logged_at) FROM outcomes")
                 row  = cur.fetchone()
                 conn.close()
                 if row and row[0]:
@@ -299,7 +299,7 @@ class KalshiClient:
             else:
                 import sqlite3
                 conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
-                row  = conn.execute("SELECT MAX(resolved_at) FROM outcomes").fetchone()
+                row  = conn.execute("SELECT MAX(logged_at) FROM outcomes").fetchone()
                 conn.close()
                 if row and row[0]:
                     return str(row[0])
