@@ -1,16 +1,17 @@
 """
-orchestrator.py  (v10 — P&L calculation on resolution)
+orchestrator.py  (v11 — Brier score writeback to signals table)
 
-Changes vs v9:
-  1. pnl_usd is now calculated at resolution time instead of always None
-     — queries trades table for matching ticker/direction/contracts
-     — Kalshi contract math:
-         YES bought @ X cents, resolves YES  → pnl = contracts * (1.00 - X/100)
-         YES bought @ X cents, resolves NO   → pnl = contracts * -(X/100)
-         NO  bought @ (100-X) cents, resolves NO  → pnl = contracts * (X/100)
-         NO  bought @ (100-X) cents, resolves YES → pnl = contracts * -((100-X)/100)
-     — falls back to None gracefully if no matching trade found
-  2. Everything else unchanged from v9
+Changes vs v10:
+  1. Added _update_signal_brier() helper
+     — writes outcome (1/0), outcome_at (UTC timestamp), and
+       brier_score = (our_prob - outcome)^2 back to the signals row
+     — only updates rows where outcome IS NULL (idempotent)
+     — only fires when sig_rows exists (avoids polluting signals with
+       default 0.5 prob Brier scores for markets we never signaled)
+  2. _ingest_resolved_markets() calls _update_signal_brier() after
+     log_outcome() succeeds — outside the try/except so a log_outcome
+     failure does not block the signal writeback
+  3. Everything else unchanged from v10
 """
 
 import logging
@@ -136,6 +137,62 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str |
     return round(pnl, 2), trade_id
 
 
+def _update_signal_brier(ticker: str, resolved_yes: bool, our_prob: float) -> None:
+    """
+    Write outcome + brier_score back to the matching signals row.
+
+    Only updates rows where outcome IS NULL so this is safe to call
+    multiple times (idempotent). Skips gracefully on any DB error.
+
+    outcome:     1 if resolved YES, 0 if resolved NO
+    brier_score: (our_prob - outcome)^2  — lower is better, range [0, 1]
+    outcome_at:  UTC timestamp of when resolution was recorded
+    """
+    import os
+    is_postgres = bool(os.getenv("DATABASE_URL", ""))
+    p           = "%s" if is_postgres else "?"
+    outcome     = 1 if resolved_yes else 0
+    brier       = round((our_prob - outcome) ** 2, 6)
+    now         = datetime.now(timezone.utc)
+
+    try:
+        if is_postgres:
+            import psycopg2
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+            cur  = conn.cursor()
+            cur.execute(
+                f"""
+                UPDATE signals
+                SET outcome = {p}, outcome_at = {p}, brier_score = {p}
+                WHERE ticker = {p}
+                  AND outcome IS NULL
+                """,
+                (outcome, now, brier, ticker)
+            )
+            conn.commit()
+            conn.close()
+        else:
+            import sqlite3
+            conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
+            conn.execute(
+                f"""
+                UPDATE signals
+                SET outcome = {p}, outcome_at = {p}, brier_score = {p}
+                WHERE ticker = {p}
+                  AND outcome IS NULL
+                """,
+                (outcome, now, brier, ticker)
+            )
+            conn.commit()
+            conn.close()
+        logger.debug(
+            "Signal brier updated: %s → outcome=%d brier=%.4f",
+            ticker, outcome, brier
+        )
+    except Exception as e:
+        logger.warning("_update_signal_brier failed for %s: %s", ticker, e)
+
+
 class FlywheelOrchestrator:
 
     def __init__(self):
@@ -159,6 +216,11 @@ class FlywheelOrchestrator:
         P&L is now calculated at resolution time by looking up the
         matching trade in the trades table. Falls back to None gracefully
         if no trade record exists for that ticker.
+
+        Brier score is written back to the signals table for any ticker
+        that has a matching signal row (sig_rows non-empty). Markets with
+        no signal row are skipped to avoid polluting metrics with the
+        default 0.5 probability.
 
         Runs in a background daemon thread so it never blocks the main
         scan loop. Fires immediately on startup and every 4 hours after.
@@ -232,8 +294,8 @@ class FlywheelOrchestrator:
             for bot in self.bots:
                 if not bot.is_relevant(market):
                     continue
-                if not sig_rows:         
-                    continue              
+                if not sig_rows:
+                    continue
                 try:
                     features, _ = bot.fetch_features(market, skip_noaa=True)
                     bot.record_outcome(features, resolved_yes)
@@ -259,6 +321,12 @@ class FlywheelOrchestrator:
                 recorded += 1
             except Exception as e:
                 logger.error("log_outcome failed for %s: %s", ticker, e)
+
+            # Write brier score back to signals table.
+            # Only fires when we had an actual signal for this ticker —
+            # skips markets we never evaluated to keep metrics clean.
+            if sig_rows:
+                _update_signal_brier(ticker, resolved_yes, our_prob)
 
         logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
@@ -447,7 +515,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v10 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v11 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
