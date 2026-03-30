@@ -313,7 +313,10 @@ class FlywheelOrchestrator:
         logger.info("=== Resolution ingestion starting ===")
 
         try:
-            resolved_markets = self.client.get_resolved_markets()
+            min_ts = self.client.get_latest_outcome_ts()
+            if min_ts:
+                logger.info("Incremental ingestion — fetching markets after %s", min_ts)
+            resolved_markets = self.client.get_resolved_markets(min_close_ts=min_ts)
         except Exception as e:
             logger.error("Failed to fetch resolved markets: %s", e)
             return 0

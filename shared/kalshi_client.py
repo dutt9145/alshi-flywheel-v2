@@ -1,11 +1,16 @@
 """
-shared/kalshi_client.py  (v2 — get_resolved_markets added)
+shared/kalshi_client.py  (v3 — rate limit handling + smart resolved market fetching)
 
-Changes vs v1:
-  1. get_resolved_markets() fetches settled markets from Kalshi API
-     Paginates up to 1000 markets (10 pages of 100) per nightly retrain
-     Returns only markets with a definitive "yes" or "no" result
-  2. Everything else unchanged
+Changes vs v2:
+  1. get_all_open_markets() — added 429 retry with 60s backoff, reduced
+     inter-page sleep to 0.3s (was 0.5s, still safe under rate limits)
+  2. get_resolved_markets() — added 429 retry with 60s backoff + inter-page
+     sleep. max_pages raised to 350 (35,000 markets) for full history on
+     first run. Accepts optional min_close_ts to filter by close time so
+     subsequent runs only fetch recent resolutions instead of all 34k+
+  3. _get() now surfaces the raw status code in exceptions so callers
+     can detect 429 vs other errors cleanly
+  4. Everything else unchanged from v2
 """
 
 import base64
@@ -13,6 +18,7 @@ import json
 import time
 import logging
 import textwrap
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -25,6 +31,12 @@ from config.settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How long to wait after a 429 before retrying
+_RATE_LIMIT_BACKOFF_SEC = 60
+
+# Max retries per page on 429
+_MAX_RETRIES = 3
 
 
 def _load_private_key():
@@ -51,10 +63,15 @@ def _load_private_key():
         pem = pem.replace("\\n", "\n")
 
     # Format 3: PEM header present but no line breaks in body
-    if "-----BEGIN RSA PRIVATE KEY-----" in pem and "\n" not in pem.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", ""):
-        body = pem.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
+    if (
+        "-----BEGIN RSA PRIVATE KEY-----" in pem and
+        "\n" not in pem
+            .replace("-----BEGIN RSA PRIVATE KEY-----", "")
+            .replace("-----END RSA PRIVATE KEY-----", "")
+    ):
+        body    = pem.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
         wrapped = textwrap.fill(body, 64)
-        pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+        pem     = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
 
     # Format 4: File path
     if not pem.startswith("-----") and len(pem) < 200:
@@ -64,9 +81,9 @@ def _load_private_key():
             if "\\n" in raw:
                 raw = raw.replace("\\n", "\n")
             if "\n" not in raw.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", ""):
-                body = raw.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
+                body    = raw.replace("-----BEGIN RSA PRIVATE KEY-----", "").replace("-----END RSA PRIVATE KEY-----", "").strip()
                 wrapped = textwrap.fill(body, 64)
-                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
+                raw     = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
             pem = raw
         except Exception:
             pass
@@ -85,9 +102,9 @@ def _sign_request(method: str, path: str) -> dict:
         msg_bytes,
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
+            salt_length=padding.PSS.DIGEST_LENGTH,
         ),
-        hashes.SHA256()
+        hashes.SHA256(),
     )
     sig_b64 = base64.b64encode(signature).decode("utf-8")
     return {
@@ -104,53 +121,113 @@ class KalshiClient:
         self.base    = KALSHI_API_BASE
         self.session = requests.Session()
 
+    # ── Core HTTP ──────────────────────────────────────────────────────────────
+
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        headers = _sign_request("GET", path)
-        r = self.session.get(self.base + path, headers=headers,
-                             params=params, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        """
+        Signed GET with retry on 429.
+        Raises requests.HTTPError on non-retriable errors.
+        """
+        for attempt in range(_MAX_RETRIES):
+            headers = _sign_request("GET", path)
+            r = self.session.get(
+                self.base + path,
+                headers=headers,
+                params=params,
+                timeout=10,
+            )
+            if r.status_code == 429:
+                wait = _RATE_LIMIT_BACKOFF_SEC * (attempt + 1)
+                logger.warning(
+                    "429 rate limit on GET %s — waiting %ds (attempt %d/%d)",
+                    path, wait, attempt + 1, _MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+
+        # Exhausted retries
+        raise requests.HTTPError(f"429 rate limit not resolved after {_MAX_RETRIES} retries on {path}")
 
     def _post(self, path: str, body: dict) -> dict:
         body_str = json.dumps(body)
         headers  = _sign_request("POST", path)
-        r = self.session.post(self.base + path, headers=headers,
-                              data=body_str, timeout=10)
+        r = self.session.post(
+            self.base + path,
+            headers=headers,
+            data=body_str,
+            timeout=10,
+        )
         r.raise_for_status()
         return r.json()
 
-    def get_markets(self, status: str = "open", limit: int = 100,
-                    cursor: Optional[str] = None) -> dict:
+    # ── Market fetching ────────────────────────────────────────────────────────
+
+    def get_markets(
+        self,
+        status: str = "open",
+        limit:  int = 100,
+        cursor: Optional[str] = None,
+    ) -> dict:
         params = {"status": status, "limit": limit}
         if cursor:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
 
     def get_all_open_markets(self) -> list:
+        """
+        Fetch all open markets with pagination.
+        Retries on 429 automatically via _get().
+        Uses 0.3s inter-page sleep — stays comfortably under rate limits.
+        """
         markets, cursor, page = [], None, 0
         max_pages = 100
+
         while page < max_pages:
-            resp   = self.get_markets(status="open", limit=100, cursor=cursor)
-            batch  = resp.get("markets", [])
+            try:
+                resp = self.get_markets(status="open", limit=100, cursor=cursor)
+            except Exception as e:
+                logger.error("get_all_open_markets page %d failed: %s", page + 1, e)
+                break
+
+            batch = resp.get("markets", [])
             markets.extend(batch)
-            page  += 1
+            page += 1
+
             logger.info("Fetched page %d (%d markets so far)", page, len(markets))
+
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
                 break
-            time.sleep(0.5)
+
+            time.sleep(0.3)
+
         return markets
 
-    def get_resolved_markets(self, max_pages: int = 10) -> list:
+    def get_resolved_markets(
+        self,
+        max_pages:    int = 350,
+        min_close_ts: Optional[str] = None,
+    ) -> list:
         """
-        Fetch recently settled markets from Kalshi.
+        Fetch settled markets from Kalshi.
 
-        Returns a list of market dicts that have a definitive result
-        of "yes" or "no". Paginates up to max_pages * 100 markets.
+        Parameters
+        ----------
+        max_pages : int
+            Maximum pages to fetch (100 markets each).
+            Default 350 = up to 35,000 markets (for full first-run history).
+            Subsequent runs should pass a min_close_ts to limit the fetch.
+        min_close_ts : str, optional
+            ISO 8601 timestamp. If provided, stop paginating once we see
+            markets with close_time older than this value.
+            Use the timestamp of your most recent outcome to avoid
+            re-fetching the entire history every 4 hours.
 
-        Kalshi settled markets endpoint:
-            GET /markets?status=settled&limit=100
-        The result field on each market is "yes", "no", or None (voided).
+        Returns
+        -------
+        list of market dicts with result in ("yes", "no")
         """
         markets, cursor, page = [], None, 0
 
@@ -160,34 +237,77 @@ class KalshiClient:
                 params["cursor"] = cursor
 
             try:
-                resp  = self._get("/markets", params=params)
+                resp = self._get("/markets", params=params)
             except Exception as e:
-                logger.error("get_resolved_markets page %d failed: %s", page, e)
+                logger.error("get_resolved_markets page %d failed: %s", page + 1, e)
                 break
 
             batch = resp.get("markets", [])
 
-            # Keep only markets with a clean yes/no result
-            clean = [
-                m for m in batch
-                if m.get("result") in ("yes", "no")
-            ]
+            # Filter to clean yes/no results only
+            clean = [m for m in batch if m.get("result") in ("yes", "no")]
             markets.extend(clean)
             page += 1
 
             logger.info(
                 "Resolved markets — page %d: %d settled, %d with clean result (%d total)",
-                page, len(batch), len(clean), len(markets)
+                page, len(batch), len(clean), len(markets),
             )
+
+            # Timestamp cutoff — stop early on subsequent runs
+            if min_close_ts and batch:
+                oldest_close = batch[-1].get("close_time", "")
+                if oldest_close and oldest_close < min_close_ts:
+                    logger.info(
+                        "Reached min_close_ts cutoff (%s) at page %d — stopping",
+                        min_close_ts, page,
+                    )
+                    break
 
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
                 break
 
-            time.sleep(0.5)   # respect rate limits between pages
+            time.sleep(0.3)
 
         logger.info("get_resolved_markets complete — %d total clean results", len(markets))
         return markets
+
+    def get_latest_outcome_ts(self) -> Optional[str]:
+        """
+        Query the outcomes table for the most recent resolved_at timestamp.
+        Used to build min_close_ts for incremental resolved market fetching.
+        Returns ISO string or None if no outcomes yet.
+        """
+        import os
+        database_url = os.getenv("DATABASE_URL", "")
+        try:
+            if database_url:
+                import psycopg2
+                conn = psycopg2.connect(database_url)
+                cur  = conn.cursor()
+                cur.execute("SELECT MAX(resolved_at) FROM outcomes")
+                row  = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    # Subtract 1 day buffer to catch any stragglers
+                    ts = row[0]
+                    if hasattr(ts, "isoformat"):
+                        buffered = ts - timedelta(days=1)
+                        return buffered.isoformat()
+                    return str(row[0])
+            else:
+                import sqlite3
+                conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
+                row  = conn.execute("SELECT MAX(resolved_at) FROM outcomes").fetchone()
+                conn.close()
+                if row and row[0]:
+                    return str(row[0])
+        except Exception as e:
+            logger.warning("get_latest_outcome_ts failed: %s", e)
+        return None
+
+    # ── Portfolio ──────────────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
         resp = self._get("/portfolio/balance")
@@ -196,13 +316,25 @@ class KalshiClient:
     def get_positions(self) -> list:
         return self._get("/portfolio/positions").get("market_positions", [])
 
-    def place_order(self, ticker: str, side: str, count: int,
-                    yes_price: int, client_order_id: str) -> dict:
+    # ── Orders ─────────────────────────────────────────────────────────────────
+
+    def place_order(
+        self,
+        ticker:          str,
+        side:            str,
+        count:           int,
+        yes_price:       int,
+        client_order_id: str,
+    ) -> dict:
         if DEMO_MODE:
-            logger.info("[DEMO] Would place %s %s x%d @ %dc",
-                        side.upper(), ticker, count, yes_price)
-            return {"status": "demo", "ticker": ticker, "side": side,
-                    "count": count, "yes_price": yes_price}
+            logger.info(
+                "[DEMO] Would place %s %s x%d @ %dc",
+                side.upper(), ticker, count, yes_price,
+            )
+            return {
+                "status": "demo", "ticker": ticker, "side": side,
+                "count": count, "yes_price": yes_price,
+            }
         body = {
             "action": "buy", "ticker": ticker, "type": "limit",
             "side": side, "count": count, "yes_price": yes_price,
