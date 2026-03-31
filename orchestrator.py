@@ -649,6 +649,8 @@ class FlywheelOrchestrator:
             # Build a mock consensus from the fade signal
             from shared.consensus_engine import ConsensusResult
             mock_consensus = ConsensusResult(
+                ticker          = fade.ticker,
+                signals         = [],
                 execute         = True,
                 direction       = fade.direction,
                 avg_prob        = fade.our_prob,
@@ -700,6 +702,8 @@ class FlywheelOrchestrator:
             ]:
                 from shared.consensus_engine import ConsensusResult
                 mock_consensus = ConsensusResult(
+                    ticker         = ticker,
+                    signals        = [],
                     execute        = True,
                     direction      = direction,
                     avg_prob       = sig.cheap_price_cents / 100 if direction == "YES" else 1 - sig.expensive_price_cents / 100,
@@ -737,6 +741,8 @@ class FlywheelOrchestrator:
 
             from shared.consensus_engine import ConsensusResult
             mock_consensus = ConsensusResult(
+                ticker         = sig.ticker,
+                signals        = [],
                 execute        = True,
                 direction      = sig.direction,
                 avg_prob       = sig.our_prob,
