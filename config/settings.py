@@ -62,7 +62,7 @@ MAX_SINGLE_TRADE_PCT = 0.04
 # Hard dollar cap per trade regardless of bankroll size.
 # Prevents the % cap from scaling to market-moving sizes.
 # Raise this deliberately as you verify edge, not automatically.
-MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "2000"))
+MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "150"))
 
 # Maximum exposure in one sector as % of bankroll.
 MAX_SECTOR_EXPOSURE = 0.15

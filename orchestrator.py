@@ -834,8 +834,11 @@ class FlywheelOrchestrator:
         # Start news velocity background poller
         self.news.start_background_poller()
 
-        # Market scanning — every SCAN_INTERVAL_SEC
-        schedule.every(SCAN_INTERVAL_SEC).seconds.do(self.scan_markets)
+        # Market scanning — every SCAN_INTERVAL_SEC with random jitter
+        # Jitter makes the bot look less like an algo to Kalshi's pattern detection
+        import random
+        jitter = random.randint(-45, 45)
+        schedule.every(SCAN_INTERVAL_SEC + jitter).seconds.do(self.scan_markets)
 
         # Nightly retrain — at RETRAIN_HOUR (2am)
         schedule.every().day.at(f"{RETRAIN_HOUR:02d}:00").do(self.retrain_models)
