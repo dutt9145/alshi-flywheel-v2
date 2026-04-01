@@ -182,7 +182,7 @@ class KalshiClient:
         Uses 0.3s inter-page sleep — stays comfortably under rate limits.
         """
         markets, cursor, page = [], None, 0
-        max_pages = 100
+        max_pages = 40
 
         while page < max_pages:
             try:
@@ -201,7 +201,7 @@ class KalshiClient:
             if not cursor or len(batch) < 100:
                 break
 
-            time.sleep(1.0)
+            time.sleep(0.5)
 
         return markets
 
