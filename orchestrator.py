@@ -337,6 +337,9 @@ class FlywheelOrchestrator:
 
         for market in resolved_markets:
             ticker = market.get("ticker", "")
+            # Normalize to match signal ticker format
+            if "-S" in ticker and len(ticker) > 40:
+                ticker = ticker.split("-S")[0]  
             result = market.get("result", "")
 
             if not ticker or result not in ("yes", "no"):
