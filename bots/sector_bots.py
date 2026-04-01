@@ -143,6 +143,13 @@ class EconomicsBot(BaseBot):
         "russell 2000", "vix", "volatility index", "ftse", "dax",
         "cac 40", "nikkei", "hang seng", "shanghai composite",
         "sensex", "kospi", "asx 200", "tsx",
+
+        # ── Financial sector earnings ──────────────────────────────────────
+        "bank earnings", "tech earnings", "energy sector",
+        "financial sector", "big banks", "jpmorgan", "goldman sachs",
+        "wells fargo", "bank of america", "citigroup", "morgan stanley",
+        "blackrock", "berkshire", "hedge fund", "private equity",
+        "venture capital", "ipo filing", "spac",
     ]
 
     @property
@@ -304,6 +311,12 @@ class PoliticsBot(BaseBot):
         "north korea", "iran nuclear", "south china sea",
         "nato expansion", "un resolution", "war", "conflict",
         "trade sanctions", "export controls",
+
+        # ── Supreme Court ──────────────────────────────────────────────────
+        "supreme court ruling", "scotus", "oral arguments",
+        "majority opinion", "dissent", "overturned", "landmark ruling",
+        "constitutional", "first amendment", "second amendment",
+        "roe v wade", "affirmative action", "title ix",
     ]
 
     @property
@@ -431,6 +444,11 @@ class WeatherBot(BaseBot):
         "sydney", "melbourne", "brisbane", "perth", "adelaide",
         "canberra", "darwin", "auckland", "wellington",
         "christchurch", "suva", "port moresby",
+
+        # ── US airport codes (NWS uses these in market titles) ────────────
+        "jfk", "lax", "ord", "dfw", "atl", "sfo", "mia", "sea",
+        "den", "bos", "iah", "phx", "las", "msp", "dtw", "ewr",
+        "phl", "slc", "pdx", "mco", "tpa", "mdw", "bwi", "iad",
     ]
 
     CITY_COORDS = {
