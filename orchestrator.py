@@ -1,20 +1,19 @@
 """
-orchestrator.py  (v16 — additional Supabase IO reduction)
+orchestrator.py  (v17 — duplicate trade guard + KXMVE sector bleed fix)
 
-Changes vs v15:
-  1. sync_bankroll() and daily_summary() called once at the top of
-     scan_markets() and cached as self._scan_bankroll /
-     self._scan_summary for the duration of each scan cycle.
-     Previously called once per _execute_trade — 10+ round-trips
-     per burst cycle.
-  2. arb.log_arb_opportunity() gated behind `if arb.arb_exists` so
-     non-arb markets don't produce writes.
-  3. SELECT DISTINCT ticker FROM outcomes bounded to the same min_ts
-     window used by get_resolved_markets() — prevents a full table
-     scan every 4-hour ingestion cycle as the outcomes table grows.
-  4. _calculate_pnl SELECT bounded with ORDER BY created_at DESC +
-     LIMIT 50 to prevent unbounded full-table reads as trades grows.
-  5. Version bump to v16.
+Changes vs v16:
+  1. _recently_traded dict added — 5-minute per-ticker cooldown blocks
+     the same ticker from being entered twice across consecutive scan
+     cycles. Fixes the KXMVESPORTSMULTIGAMEEXTENDED 4x duplicate trades
+     visible at 18:04–18:05.
+  2. _has_sports_prefix() now also checks the UUID-normalized ticker
+     (tk_norm). KXMVE tickers were leaking into ECONOMICS because the
+     event_ticker field returned by Kalshi sometimes doesn't carry the
+     full prefix — the raw ticker with UUID stripped does.
+  3. RECENT_TRADE_WINDOW_SEC constant added to config block (300s).
+  4. _recently_traded cleared on retrain_models() so daily reset doesn't
+     lock out legitimate re-entries after market structure changes.
+  5. Version bump to v17.
 """
 
 import logging
@@ -59,6 +58,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
+# ── Duplicate trade cooldown ───────────────────────────────────────────────────
+# How long (seconds) before the same ticker can be entered again.
+# Prevents back-to-back scan cycles double-entering the same position.
+RECENT_TRADE_WINDOW_SEC = 300  # 5 minutes
+
 # ── Ticker normalization ───────────────────────────────────────────────────────
 _UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
 
@@ -66,6 +70,35 @@ _UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
 def _normalize_ticker(ticker: str) -> str:
     """Strip Kalshi UUID suffix from multivariate market tickers."""
     return _UUID_SUFFIX_RE.sub('', ticker)
+
+
+# ── Sports prefix guard ────────────────────────────────────────────────────────
+# FIX 2: Also check tk_norm (UUID-stripped ticker). Kalshi sometimes returns
+# a generic event_ticker for KXMVE markets that doesn't carry the full prefix,
+# allowing them to slip past into EconomicsBot. The raw ticker with UUID
+# stripped always starts with the correct prefix.
+
+_SPORTS_PREFIXES = (
+    "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
+    "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
+    "kxmvecbchampionship",
+    "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
+    "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
+    "kxtennis", "kxf1", "kxolympic", "kxthail", "kxsl",
+    "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
+    "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
+    "kxrugby", "kxesport",
+)
+
+
+def _has_sports_prefix(market: dict) -> bool:
+    et      = market.get("event_ticker", "").lower()
+    tk      = market.get("ticker", "").lower()
+    tk_norm = _UUID_SUFFIX_RE.sub('', tk)   # strip UUID so KXMVE always matches
+    return any(
+        et.startswith(p) or tk.startswith(p) or tk_norm.startswith(p)
+        for p in _SPORTS_PREFIXES
+    )
 
 
 # ── Connection pool ────────────────────────────────────────────────────────────
@@ -143,9 +176,6 @@ def _parse_yes_price_cents(market: dict) -> int:
 
 def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str | None]:
     p = _ph()
-    # FIX 4: ORDER BY + LIMIT 50 prevents full table scans as the trades
-    # table grows. 50 is a safe ceiling — no single ticker should have
-    # more open legs than this.
     trade_rows = _query_signals(
         f"SELECT id, direction, contracts, yes_price_cents "
         f"FROM trades "
@@ -293,12 +323,14 @@ class FlywheelOrchestrator:
         self._resolved_count_cache:    dict[str, int] = {}
         self._resolved_count_cache_ts: float          = 0.0
 
-        # v16 FIX 1: scan-cycle bankroll + summary cache.
-        # Populated once at the top of scan_markets(); used by all
-        # _execute_trade calls in that cycle. Avoids sync_bankroll() +
-        # daily_summary() DB hits per trade during burst cycles.
+        # v16: scan-cycle bankroll + summary cache
         self._scan_bankroll: float = self.bankroll
         self._scan_summary:  dict  = {}
+
+        # FIX 1: Per-ticker cooldown — ticker → monotonic timestamp of last
+        # trade. Blocks re-entry within RECENT_TRADE_WINDOW_SEC (5 min).
+        # Fixes duplicate entries across consecutive scan cycles.
+        self._recently_traded: dict[str, float] = {}
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
@@ -340,9 +372,6 @@ class FlywheelOrchestrator:
 
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
-        # FIX 3: Scope already_recorded to the same min_ts window used to
-        # fetch resolved markets. Without this bound, every 4-hour ingestion
-        # cycle does a full table scan on outcomes regardless of table size.
         p = _ph()
         if min_ts:
             already_recorded = {
@@ -517,8 +546,6 @@ class FlywheelOrchestrator:
             market_title  = title,
         )
 
-        # FIX 2: Only write arb opportunities that actually exist.
-        # Previously called unconditionally on every consensus-passing market.
         if arb.arb_exists:
             self.arb.log_arb_opportunity(arb)
 
@@ -529,7 +556,6 @@ class FlywheelOrchestrator:
             )
             return
 
-        # v15: log_signal fires only after the arb gate passes.
         try:
             log_signal(
                 ticker      = ticker,
@@ -562,6 +588,20 @@ class FlywheelOrchestrator:
         arb,
         fade:        bool = False,
     ) -> None:
+        # ── Duplicate trade guard (FIX 1) ─────────────────────────────────
+        # Blocks re-entry on the same ticker within RECENT_TRADE_WINDOW_SEC.
+        # Consecutive scan cycles were re-evaluating open markets and
+        # entering the same position multiple times (visible 18:04–18:05).
+        now      = time.monotonic()
+        last_ts  = self._recently_traded.get(ticker, 0.0)
+        elapsed  = now - last_ts
+        if elapsed < RECENT_TRADE_WINDOW_SEC:
+            logger.info(
+                "DUPLICATE GUARD skip %s — last trade %.0fs ago (cooldown=%ds)",
+                ticker, elapsed, RECENT_TRADE_WINDOW_SEC,
+            )
+            return
+
         # ── Circuit breaker ────────────────────────────────────────────────
         if self.circuit_breaker.is_halted():
             logger.warning("CIRCUIT BREAKER HALT — skipping trade for %s", ticker)
@@ -583,8 +623,7 @@ class FlywheelOrchestrator:
             )
             return
 
-        # FIX 1: Use scan-cycle cached values instead of hitting Supabase
-        # once per trade. Refreshed once at the top of scan_markets().
+        # ── Scan-cycle cached bankroll + summary ───────────────────────────
         live_bankroll   = self._scan_bankroll
         summary         = self._scan_summary
         daily_pnl       = float(summary.get("realized_pnl", 0.0))
@@ -594,7 +633,7 @@ class FlywheelOrchestrator:
             if daily_pnl < 0 and loss_limit > 0 else 1.0
         )
 
-        # v15: cached resolved count
+        # ── Exploration Kelly ──────────────────────────────────────────────
         resolved_count = self._get_sector_resolved_count(lead_sector)
         kf             = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
@@ -658,8 +697,10 @@ class FlywheelOrchestrator:
                 logger.error("Order failed %s: %s", ticker, e)
                 return
 
-        self._exposure[lead_sector] = sector_exp + sizing["dollars"]
-        self.bankroll = live_bankroll
+        # Record cooldown timestamp only after a successful trade
+        self._recently_traded[ticker]   = now
+        self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
+        self.bankroll                   = live_bankroll
 
         arb_note  = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
         fade_note = " [FADE]" if fade else ""
@@ -803,10 +844,6 @@ class FlywheelOrchestrator:
     def scan_markets(self) -> None:
         logger.info("Scanning markets...")
 
-        # FIX 1: Fetch bankroll and daily summary once per scan cycle and
-        # cache on self. All _execute_trade calls below use the cached values,
-        # avoiding one sync_bankroll() + one daily_summary() DB hit per trade
-        # during burst cycles (was 10–20 extra round-trips at 18:14).
         self._scan_bankroll = self.circuit_breaker.sync_bankroll()
         self._scan_summary  = self.circuit_breaker.daily_summary()
         self.bankroll       = self._scan_bankroll
@@ -861,8 +898,10 @@ class FlywheelOrchestrator:
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
 
-        # Invalidate resolved count cache so fresh outcomes are reflected
-        # immediately in exploration thresholds after retrain.
+        # Clear cooldowns on retrain so legitimate re-entries after overnight
+        # market structure changes aren't blocked by stale timestamps.
+        self._recently_traded.clear()
+
         self._resolved_count_cache.clear()
         self._resolved_count_cache_ts = 0.0
 
@@ -872,7 +911,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v16 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v17 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
