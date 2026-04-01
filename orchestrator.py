@@ -439,7 +439,11 @@ class FlywheelOrchestrator:
     # ── Per-market pipeline ────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
-        ticker    = market.get("ticker", "UNKNOWN")
+        # Prefer human-readable ticker over UUID-style market ID
+        ticker = market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
+        # Strip UUID suffix if Kalshi appended one (e.g. KXMVECROSS-S20265EDEF...)
+        if "-S" in ticker and len(ticker) > 40:
+        ticker = ticker.split("-S")[0]
         title     = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
