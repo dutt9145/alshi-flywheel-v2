@@ -328,7 +328,8 @@ class FlywheelOrchestrator:
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
         already_recorded = {
-            r["ticker"]
+            r["ticker"].split("-S")[0] if "-S" in r["ticker"] and len(r["ticker"]) > 40 
+            else r["ticker"]
             for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
         }
 
@@ -446,7 +447,7 @@ class FlywheelOrchestrator:
         ticker = market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
         # Strip UUID suffix if Kalshi appended one (e.g. KXMVECROSS-S20265EDEF...)
         if "-S" in ticker and len(ticker) > 40:
-        ticker = ticker.split("-S")[0]
+            ticker = ticker.split("-S")[0]
         title     = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
