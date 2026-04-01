@@ -1,22 +1,21 @@
 """
-orchestrator.py  (v13 — per-sector loss caps + exploration Kelly)
+orchestrator.py  (v14 — precise ticker normalization regex)
 
-Changes vs v12:
-  1. Per-sector daily loss cap — each sector has a hard dollar stop from
-     settings.SECTOR_MAX_DAILY_LOSS. Once hit, no new trades fire in that
-     sector until midnight reset. Prevents any single sector from blowing
-     the account while models are still calibrating.
-  2. Exploration Kelly — sectors below SECTOR_MIN_RESOLVED resolved trades
-     trade at 25% of normal Kelly (very small bets while the model learns).
-     Uses settings.sector_kelly_fraction() helper.
-  3. Sector daily P&L tracking — _sector_daily_pnl dict tracks realized
-     P&L per sector within each day, reset during nightly retrain.
-  4. sector column now written to trades table on every log_trade() call.
-  5. Version bump to v13.
+Changes vs v13:
+  1. Ticker normalization uses precise regex instead of naive split("-S")[0].
+     The old approach was splitting on ANY "-S" in the ticker, which broke
+     legitimate tickers like KXNBASTL (contains "-S" in "BASTL").
+     New pattern only strips actual UUID suffixes: -S[hex]{4,}-[hex]+
+  2. _normalize_ticker() extracted as a named module-level function,
+     called consistently in _evaluate_market() and _ingest_resolved_markets()
+     and already_recorded set — all three spots now use identical logic.
+  3. import re added at top level.
+  4. Version bump to v14.
 """
 
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -55,6 +54,26 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("orchestrator")
+
+# ── Ticker normalization ───────────────────────────────────────────────────────
+# Strips UUID suffixes appended by Kalshi to multivariate market tickers.
+# Pattern: -S followed by 4+ hex chars, a dash, then more hex chars at end.
+#
+# Examples STRIPPED:
+#   KXMVECROSS-S20265EDEF7A4844-B67B70E26B6      → KXMVECROSS
+#   KXMVECBCHAMPIONSHIP-S2026FF6F0D0CBE856AD-...  → KXMVECBCHAMPIONSHIP
+#
+# Examples PRESERVED (no UUID suffix):
+#   KXNBASTL-26APR01DENUTA-DENNJOKIC15-1          → unchanged
+#   KXNBABLK-26APR01PHIWAS-PHIJEMBIID21-1         → unchanged
+#   KXMVECROSSCATEGORY (already stripped)          → unchanged
+_UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
+
+
+def _normalize_ticker(ticker: str) -> str:
+    """Strip Kalshi UUID suffix from multivariate market tickers."""
+    return _UUID_SUFFIX_RE.sub('', ticker)
+
 
 # ── Connection pool ────────────────────────────────────────────────────────────
 _pg_pool = None
@@ -215,10 +234,6 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
 
 
 def _get_sector_resolved_count(sector: str) -> int:
-    """
-    Returns how many resolved signals exist for this sector.
-    Used by exploration Kelly to determine if a sector is calibrated.
-    """
     p = _ph()
     rows = _query_signals(
         f"SELECT COUNT(*) as n FROM signals WHERE sector = {p} AND outcome IS NOT NULL",
@@ -277,14 +292,9 @@ class FlywheelOrchestrator:
             velocity_spike_threshold = NEWS_VELOCITY_SPIKE_THRESHOLD,
         )
 
-        # Dollar exposure per sector (reset nightly)
-        self._exposure: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
-
-        # Realized P&L per sector today (reset nightly)
-        # Used for per-sector loss cap enforcement
+        self._exposure: dict[str, float]         = {b.sector_name: 0.0 for b in self.bots}
         self._sector_daily_pnl: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
-
-        self._ingestion_lock = threading.Lock()
+        self._ingestion_lock                     = threading.Lock()
         self._last_bot_probs:   dict[str, float] = {}
         self._last_bot_sectors: dict[str, str]   = {}
 
@@ -309,8 +319,7 @@ class FlywheelOrchestrator:
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
         already_recorded = {
-            r["ticker"].split("-S")[0] if "-S" in r["ticker"] and len(r["ticker"]) > 40
-            else r["ticker"]
+            _normalize_ticker(r["ticker"])
             for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
         }
 
@@ -318,9 +327,7 @@ class FlywheelOrchestrator:
         p        = _ph()
 
         for market in resolved_markets:
-            ticker = market.get("ticker", "")
-            if "-S" in ticker and len(ticker) > 40:
-                ticker = ticker.split("-S")[0]
+            ticker = _normalize_ticker(market.get("ticker", ""))
             result = market.get("result", "")
 
             if not ticker or result not in ("yes", "no"):
@@ -374,8 +381,6 @@ class FlywheelOrchestrator:
                 )
                 self.circuit_breaker.record_pnl(pnl_usd)
 
-                # Update per-sector daily P&L tracking
-                # Determine sector from signals table
                 sec_rows = _query_signals(
                     f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
                     (ticker,),
@@ -426,9 +431,9 @@ class FlywheelOrchestrator:
     # ── Per-market pipeline ────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
-        ticker = market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
-        if "-S" in ticker and len(ticker) > 40:
-            ticker = ticker.split("-S")[0]
+        ticker = _normalize_ticker(
+            market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
+        )
         title     = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
@@ -551,10 +556,10 @@ class FlywheelOrchestrator:
             if daily_pnl < 0 and loss_limit > 0 else 1.0
         )
 
-        # ── Exploration Kelly — reduce sizing on uncalibrated sectors ──────
-        resolved_count  = _get_sector_resolved_count(lead_sector)
-        kf              = sector_kelly_fraction(lead_sector, resolved_count)
-        in_exploration  = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
+        # ── Exploration Kelly ──────────────────────────────────────────────
+        resolved_count = _get_sector_resolved_count(lead_sector)
+        kf             = sector_kelly_fraction(lead_sector, resolved_count)
+        in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
         if in_exploration:
             logger.info(
                 "[EXPLORATION] %s resolved=%d — trading at %.0f%% Kelly",
@@ -571,7 +576,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor * kf / 0.25,  # scale by exploration factor
+                drawdown_factor = drawdown_factor * kf / 0.25,
             )
             side = "yes"
         else:
@@ -597,7 +602,7 @@ class FlywheelOrchestrator:
                 "DEMO TRADE %s | %s | %s %dx@%dc | $%.2f%s%s",
                 ticker, title[:40], consensus.direction.upper(),
                 sizing["contracts"], yes_price, sizing["dollars"],
-                " [FADE]"       if fade          else "",
+                " [FADE]"        if fade          else "",
                 " [EXPLORATION]" if in_exploration else "",
             )
             order_id = f"demo-{client_order_id}"
@@ -623,7 +628,7 @@ class FlywheelOrchestrator:
 
         trade_id = log_trade(
             ticker          = ticker,
-            sector          = lead_sector,    # ← now written on every trade
+            sector          = lead_sector,
             direction       = consensus.direction,
             contracts       = sizing["contracts"],
             yes_price_cents = yes_price,
@@ -804,9 +809,8 @@ class FlywheelOrchestrator:
         self.bankroll = live_bankroll
         logger.info("Bankroll synced: $%.2f", live_bankroll)
 
-        # Reset all daily tracking
-        self._exposure          = {b.sector_name: 0.0 for b in self.bots}
-        self._sector_daily_pnl  = {b.sector_name: 0.0 for b in self.bots}
+        self._exposure         = {b.sector_name: 0.0 for b in self.bots}
+        self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
 
@@ -816,7 +820,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v13 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v14 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
