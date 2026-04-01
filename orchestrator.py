@@ -1,31 +1,18 @@
 """
-orchestrator.py  (v12 — full feature suite)
+orchestrator.py  (v13 — per-sector loss caps + exploration Kelly)
 
-Changes vs v11:
-  1. CircuitBreaker integrated — daily P&L tracking, halt flag, real-time
-     bankroll sync before every trade
-  2. SharpDetector integrated — order book analysis before every evaluate;
-     trades blocked if sharp money opposes our direction
-  3. FadeScanner integrated — runs after every market scan cycle to catch
-     closing-time crowding opportunities; executes fades as trades
-  4. NewsSignal integrated — background poller started on init; velocity
-     features injected into every bot.evaluate() call
-  5. CorrelationEngine integrated — runs after every scan to detect
-     divergent market pairs and leg into both sides
-  6. ResolutionTimer integrated — rebuilds patterns during nightly retrain;
-     scans for overdue markets during each cycle
-  7. Ingestion thread lock added — prevents concurrent resolution threads
-  8. Postgres placeholder consistent — all SQL uses os.getenv("DATABASE_URL")
-     check, not self.client.base heuristic
-  9. Connection pooling — psycopg2 ThreadedConnectionPool replaces
-     per-call psycopg2.connect()
- 10. Bayesian models now learn from ALL relevant resolved markets, not
-     just ones we signaled (sig_rows guard removed from bot update loop)
- 11. log_outcome() only called when we have an actual signal (sig_rows)
-     to prevent phantom correct/incorrect metrics
- 12. _update_signal_brier() per-row calculation — DB computes brier
-     per-row using stored our_prob, not single last-signal value
- 13. Nightly retrain rebuilds resolution timing patterns
+Changes vs v12:
+  1. Per-sector daily loss cap — each sector has a hard dollar stop from
+     settings.SECTOR_MAX_DAILY_LOSS. Once hit, no new trades fire in that
+     sector until midnight reset. Prevents any single sector from blowing
+     the account while models are still calibrating.
+  2. Exploration Kelly — sectors below SECTOR_MIN_RESOLVED resolved trades
+     trade at 25% of normal Kelly (very small bets while the model learns).
+     Uses settings.sector_kelly_fraction() helper.
+  3. Sector daily P&L tracking — _sector_daily_pnl dict tracks realized
+     P&L per sector within each day, reset during nightly retrain.
+  4. sector column now written to trades table on every log_trade() call.
+  5. Version bump to v13.
 """
 
 import logging
@@ -47,6 +34,8 @@ from config.settings import (
     RESTIME_MIN_OVERDUE_MIN, RESTIME_MIN_PROB, RESTIME_MIN_SAMPLES,
     NEWS_POLL_INTERVAL_SEC, NEWS_VELOCITY_WINDOW_MIN, NEWS_VELOCITY_SPIKE_THRESHOLD,
     NEWSAPI_KEY,
+    SECTOR_MAX_DAILY_LOSS, SECTOR_MIN_RESOLVED,
+    sector_kelly_fraction, sector_loss_cap,
 )
 from shared.arb_layer import ArbLayer
 from shared.calibration_logger import init_db, log_signal, log_trade, log_outcome
@@ -73,7 +62,6 @@ _pool_lock = threading.Lock()
 
 
 def _get_pool():
-    """Lazy-init a psycopg2 ThreadedConnectionPool (Postgres only)."""
     global _pg_pool
     if _pg_pool is None and os.getenv("DATABASE_URL"):
         with _pool_lock:
@@ -96,11 +84,6 @@ def _ph() -> str:
 
 
 def _query_signals(sql: str, params: tuple = ()) -> list:
-    """
-    Execute a SQL query and return rows as list of dicts.
-    Uses connection pool for Postgres, direct connection for SQLite.
-    Placeholder selection is consistent: DATABASE_URL env var, not client heuristic.
-    """
     pool = _get_pool()
     try:
         if pool:
@@ -147,10 +130,6 @@ def _parse_yes_price_cents(market: dict) -> int:
 
 
 def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str | None]:
-    """
-    Aggregate P&L across ALL trades for this ticker (not just the last one).
-    Returns (total_pnl_usd, comma-joined trade ids).
-    """
     p = _ph()
     trade_rows = _query_signals(
         f"SELECT id, direction, contracts, yes_price_cents FROM trades WHERE ticker = {p}",
@@ -160,14 +139,13 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str |
     if not trade_rows:
         return None, None
 
-    total_pnl  = 0.0
-    trade_ids  = []
+    total_pnl, trade_ids = 0.0, []
 
     for trade in trade_rows:
-        trade_id   = str(trade.get("id", ""))
-        direction  = str(trade.get("direction", "YES")).upper()
-        contracts  = int(trade.get("contracts", 0))
-        yes_price  = int(trade.get("yes_price_cents", 50))
+        trade_id       = str(trade.get("id", ""))
+        direction      = str(trade.get("direction", "YES")).upper()
+        contracts      = int(trade.get("contracts", 0))
+        yes_price      = int(trade.get("yes_price_cents", 50))
 
         if contracts <= 0:
             continue
@@ -190,16 +168,11 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str |
 
 
 def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
-    """
-    Write outcome + brier_score back to ALL signal rows for this ticker.
-    brier_score is computed per-row using each row's stored our_prob,
-    not a single last-signal value. This is the correct calculation.
-    """
     outcome = 1 if resolved_yes else 0
     now     = datetime.now(timezone.utc)
     p       = _ph()
+    pool    = _get_pool()
 
-    pool = _get_pool()
     try:
         if pool:
             conn = pool.getconn()
@@ -241,6 +214,19 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
         logger.warning("_update_signal_brier failed for %s: %s", ticker, e)
 
 
+def _get_sector_resolved_count(sector: str) -> int:
+    """
+    Returns how many resolved signals exist for this sector.
+    Used by exploration Kelly to determine if a sector is calibrated.
+    """
+    p = _ph()
+    rows = _query_signals(
+        f"SELECT COUNT(*) as n FROM signals WHERE sector = {p} AND outcome IS NOT NULL",
+        (sector,),
+    )
+    return int(rows[0]["n"]) if rows else 0
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 class FlywheelOrchestrator:
@@ -251,7 +237,6 @@ class FlywheelOrchestrator:
         self.engine  = ConsensusEngine()
         self.arb     = ArbLayer()
 
-        # ── Circuit breaker (capital protection) ───────────────────────────
         self.circuit_breaker = CircuitBreaker(
             kalshi_client        = self.client,
             bankroll             = BANKROLL,
@@ -259,7 +244,6 @@ class FlywheelOrchestrator:
         )
         self.bankroll = self.circuit_breaker.sync_bankroll()
 
-        # ── Sharp detector ────────────────────────────────────────────────
         self.sharp = SharpDetector(
             kalshi_client            = self.client,
             spread_threshold_pct     = SHARP_SPREAD_THRESHOLD_PCT,
@@ -267,7 +251,6 @@ class FlywheelOrchestrator:
             volume_spike_multiplier  = SHARP_VOLUME_SPIKE_MULTIPLIER,
         )
 
-        # ── Fade scanner ──────────────────────────────────────────────────
         self.fade_scanner = FadeScanner(
             kalshi_client          = self.client,
             sharp_detector         = self.sharp,
@@ -276,20 +259,17 @@ class FlywheelOrchestrator:
             fade_min_disagreement  = FADE_MIN_DISAGREEMENT,
         )
 
-        # ── Correlation engine ────────────────────────────────────────────
         self.corr_engine = CorrelationEngine(
             min_divergence_cents = CORR_MIN_DIVERGENCE_CENTS,
             max_group_size       = CORR_MAX_GROUP_SIZE,
         )
 
-        # ── Resolution timer ──────────────────────────────────────────────
         self.res_timer = ResolutionTimer(
             min_overdue_minutes = RESTIME_MIN_OVERDUE_MIN,
             min_prob_to_trade   = RESTIME_MIN_PROB,
             min_sample_count    = RESTIME_MIN_SAMPLES,
         )
 
-        # ── News signal ───────────────────────────────────────────────────
         self.news = NewsSignal(
             api_key                  = NEWSAPI_KEY,
             poll_interval_sec        = NEWS_POLL_INTERVAL_SEC,
@@ -297,13 +277,14 @@ class FlywheelOrchestrator:
             velocity_spike_threshold = NEWS_VELOCITY_SPIKE_THRESHOLD,
         )
 
-        # ── Exposure tracking ─────────────────────────────────────────────
+        # Dollar exposure per sector (reset nightly)
         self._exposure: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
 
-        # ── Ingestion thread lock (prevents concurrent ingestion runs) ────
-        self._ingestion_lock = threading.Lock()
+        # Realized P&L per sector today (reset nightly)
+        # Used for per-sector loss cap enforcement
+        self._sector_daily_pnl: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
 
-        # ── Per-scan state (bot_probs, bot_sectors for cross-system use) ──
+        self._ingestion_lock = threading.Lock()
         self._last_bot_probs:   dict[str, float] = {}
         self._last_bot_sectors: dict[str, str]   = {}
 
@@ -328,7 +309,7 @@ class FlywheelOrchestrator:
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
         already_recorded = {
-            r["ticker"].split("-S")[0] if "-S" in r["ticker"] and len(r["ticker"]) > 40 
+            r["ticker"].split("-S")[0] if "-S" in r["ticker"] and len(r["ticker"]) > 40
             else r["ticker"]
             for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
         }
@@ -338,9 +319,8 @@ class FlywheelOrchestrator:
 
         for market in resolved_markets:
             ticker = market.get("ticker", "")
-            # Normalize to match signal ticker format
             if "-S" in ticker and len(ticker) > 40:
-                ticker = ticker.split("-S")[0]  
+                ticker = ticker.split("-S")[0]
             result = market.get("result", "")
 
             if not ticker or result not in ("yes", "no"):
@@ -350,21 +330,17 @@ class FlywheelOrchestrator:
 
             resolved_yes = result == "yes"
 
-            # Only use actual signal data — no phantom 0.5 defaults
             sig_rows = _query_signals(
                 f"SELECT our_prob, direction FROM signals "
                 f"WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
                 (ticker,),
             )
 
-            # Feed resolved outcome into ALL relevant bot models
-            # (not gated on sig_rows — we want to learn from every resolved market)
             for bot in self.bots:
                 if not bot.is_relevant(market):
                     continue
                 try:
                     features, _ = bot.fetch_features(market, skip_noaa=True)
-                    # Pad news features since we're in historical ingestion
                     import numpy as np
                     features = np.append(features, [0.0, 0.0])
                     bot.record_outcome(features, resolved_yes)
@@ -378,7 +354,6 @@ class FlywheelOrchestrator:
                         bot.sector_name, ticker, e,
                     )
 
-            # Only record outcome + P&L + Brier when we had an actual signal
             if not sig_rows:
                 continue
 
@@ -397,8 +372,18 @@ class FlywheelOrchestrator:
                     "[P&L] %s resolved %s → $%+.2f (trade_id=%s)",
                     ticker, result.upper(), pnl_usd, trade_id,
                 )
-                # Record resolved P&L in circuit breaker
                 self.circuit_breaker.record_pnl(pnl_usd)
+
+                # Update per-sector daily P&L tracking
+                # Determine sector from signals table
+                sec_rows = _query_signals(
+                    f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
+                    (ticker,),
+                )
+                if sec_rows:
+                    sec = sec_rows[0].get("sector", "")
+                    if sec in self._sector_daily_pnl:
+                        self._sector_daily_pnl[sec] += pnl_usd
             else:
                 logger.debug(
                     "[P&L] %s resolved %s — no matching trade",
@@ -418,14 +403,12 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.error("log_outcome failed for %s: %s", ticker, e)
 
-            # Per-row Brier writeback (uses stored our_prob in DB, not variable)
             _update_signal_brier(ticker, resolved_yes)
 
         logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
 
     def _run_ingestion_thread(self) -> None:
-        """Launch _ingest_resolved_markets() in a background daemon thread with lock."""
         if not self._ingestion_lock.acquire(blocking=False):
             logger.warning("Ingestion already running — skipping this cycle")
             return
@@ -443,9 +426,7 @@ class FlywheelOrchestrator:
     # ── Per-market pipeline ────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
-        # Prefer human-readable ticker over UUID-style market ID
         ticker = market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
-        # Strip UUID suffix if Kalshi appended one (e.g. KXMVECROSS-S20265EDEF...)
         if "-S" in ticker and len(ticker) > 40:
             ticker = ticker.split("-S")[0]
         title     = market.get("title", "")
@@ -456,10 +437,7 @@ class FlywheelOrchestrator:
         if yes_price <= 2 or yes_price >= 98:
             return
 
-        # Register market with news signal tracker
         self.news.register_market(title)
-
-        # Sharp money check — analyze order book before evaluating
         sharp_signal = self.sharp.analyze(market)
 
         signals = []
@@ -480,7 +458,6 @@ class FlywheelOrchestrator:
             logger.debug("Consensus reject %s: %s", ticker, consensus.reject_reason)
             return
 
-        # Sharp money veto — don't trade against sharp money
         if sharp_signal.sharp_detected and not sharp_signal.aligned_with(consensus.direction):
             logger.info(
                 "SHARP VETO %s | sharp_dir=%s our_dir=%s sharp_conf=%.2f",
@@ -491,7 +468,6 @@ class FlywheelOrchestrator:
 
         lead_sector = signals[0].sector
 
-        # Store bot prob for fade scanner and resolution timer
         self._last_bot_probs[ticker]   = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
@@ -542,24 +518,48 @@ class FlywheelOrchestrator:
         arb,
         fade:        bool = False,
     ) -> None:
-        """
-        Common trade execution path used by both regular signals and fades.
-        Handles circuit breaker check, bankroll sync, Kelly sizing, and order.
-        """
-        # Circuit breaker check before every trade
+        # ── Circuit breaker ────────────────────────────────────────────────
         if self.circuit_breaker.is_halted():
             logger.warning("CIRCUIT BREAKER HALT — skipping trade for %s", ticker)
             return
 
-        # Real-time bankroll sync before sizing
+        # ── Per-sector loss cap ────────────────────────────────────────────
+        cap = sector_loss_cap(lead_sector)
+        if cap == 0.0:
+            logger.warning(
+                "SECTOR DISABLED: %s cap=0 — skipping %s", lead_sector, ticker
+            )
+            return
+
+        sector_loss_today = self._sector_daily_pnl.get(lead_sector, 0.0)
+        if sector_loss_today <= -cap:
+            logger.warning(
+                "SECTOR LOSS CAP hit: %s daily_loss=$%.2f cap=$%.2f — skipping %s",
+                lead_sector, sector_loss_today, cap, ticker,
+            )
+            return
+
+        # ── Real-time bankroll sync ────────────────────────────────────────
         live_bankroll = self.circuit_breaker.sync_bankroll()
 
-        # Drawdown factor — reduces Kelly when we've been losing
-        summary      = self.circuit_breaker.daily_summary()
-        daily_pnl    = float(summary.get("realized_pnl", 0.0))
-        loss_limit   = live_bankroll * CIRCUIT_BREAKER_PCT
-        # Scale from 1.0 (no loss) down to 0.5 (at 50% of loss limit)
-        drawdown_factor = max(0.5, 1.0 + (daily_pnl / loss_limit) * 0.5) if daily_pnl < 0 and loss_limit > 0 else 1.0
+        # ── Drawdown factor ────────────────────────────────────────────────
+        summary         = self.circuit_breaker.daily_summary()
+        daily_pnl       = float(summary.get("realized_pnl", 0.0))
+        loss_limit      = live_bankroll * CIRCUIT_BREAKER_PCT
+        drawdown_factor = (
+            max(0.5, 1.0 + (daily_pnl / loss_limit) * 0.5)
+            if daily_pnl < 0 and loss_limit > 0 else 1.0
+        )
+
+        # ── Exploration Kelly — reduce sizing on uncalibrated sectors ──────
+        resolved_count  = _get_sector_resolved_count(lead_sector)
+        kf              = sector_kelly_fraction(lead_sector, resolved_count)
+        in_exploration  = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
+        if in_exploration:
+            logger.info(
+                "[EXPLORATION] %s resolved=%d — trading at %.0f%% Kelly",
+                lead_sector, resolved_count, kf * 100,
+            )
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
@@ -571,7 +571,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,
+                drawdown_factor = drawdown_factor * kf / 0.25,  # scale by exploration factor
             )
             side = "yes"
         else:
@@ -582,7 +582,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,
+                drawdown_factor = drawdown_factor * kf / 0.25,
             )
             side = "no"
 
@@ -594,10 +594,11 @@ class FlywheelOrchestrator:
 
         if DEMO_MODE:
             logger.info(
-                "DEMO TRADE %s | %s | %s %dx@%dc | $%.2f%s",
+                "DEMO TRADE %s | %s | %s %dx@%dc | $%.2f%s%s",
                 ticker, title[:40], consensus.direction.upper(),
                 sizing["contracts"], yes_price, sizing["dollars"],
-                " [FADE]" if fade else "",
+                " [FADE]"       if fade          else "",
+                " [EXPLORATION]" if in_exploration else "",
             )
             order_id = f"demo-{client_order_id}"
         else:
@@ -615,13 +616,14 @@ class FlywheelOrchestrator:
                 return
 
         self._exposure[lead_sector] = sector_exp + sizing["dollars"]
-        self.bankroll = live_bankroll  # keep in sync
+        self.bankroll = live_bankroll
 
-        arb_note = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
+        arb_note  = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
         fade_note = " [FADE]" if fade else ""
 
         trade_id = log_trade(
             ticker          = ticker,
+            sector          = lead_sector,    # ← now written on every trade
             direction       = consensus.direction,
             contracts       = sizing["contracts"],
             yes_price_cents = yes_price,
@@ -634,8 +636,8 @@ class FlywheelOrchestrator:
         )
 
         logger.info(
-            "TRADE #%d | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%%s%s",
-            trade_id, ticker, consensus.direction.upper(),
+            "TRADE #%d | %s | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%%s%s",
+            trade_id, ticker, lead_sector.upper(), consensus.direction.upper(),
             sizing["contracts"], yes_price, sizing["dollars"],
             consensus.avg_edge * 100, consensus.avg_confidence * 100,
             arb_note, fade_note,
@@ -644,27 +646,22 @@ class FlywheelOrchestrator:
     # ── Fade execution ─────────────────────────────────────────────────────────
 
     def _execute_fades(self, open_markets: list[dict]) -> None:
-        """
-        Run fade scanner and execute qualifying fade trades.
-        Called after every scan_markets() cycle.
-        """
         if not self._last_bot_probs:
             return
 
         fades = self.fade_scanner.scan(open_markets, self._last_bot_probs)
 
         for fade in fades:
-            # Build a mock consensus from the fade signal
             from shared.consensus_engine import ConsensusResult
             mock_consensus = ConsensusResult(
-                ticker          = fade.ticker,
-                signals         = [],
-                execute         = True,
-                direction       = fade.direction,
-                avg_prob        = fade.our_prob,
-                avg_edge        = abs(fade.our_prob - fade.market_prob),
-                avg_confidence  = fade.confidence,
-                reject_reason   = "",
+                ticker         = fade.ticker,
+                signals        = [],
+                execute        = True,
+                direction      = fade.direction,
+                avg_prob       = fade.our_prob,
+                avg_edge       = abs(fade.our_prob - fade.market_prob),
+                avg_confidence = fade.confidence,
+                reject_reason  = "",
             )
 
             sector = self._last_bot_sectors.get(fade.ticker, "sports")
@@ -683,10 +680,6 @@ class FlywheelOrchestrator:
     # ── Correlation execution ──────────────────────────────────────────────────
 
     def _execute_correlations(self, open_markets: list[dict]) -> None:
-        """
-        Run correlation engine and leg into divergent pairs.
-        Called after every scan_markets() cycle.
-        """
         corr_signals = self.corr_engine.scan(open_markets)
 
         for sig in corr_signals:
@@ -701,12 +694,9 @@ class FlywheelOrchestrator:
                 sig.divergence_cents,
             )
 
-            # Leg 1: buy the cheap side
-            # Leg 2: buy the expensive side in the opposite direction
-            # We execute as two separate orders with reduced sizing (half Kelly each)
             for ticker, direction, price in [
-                (sig.cheap_ticker,      sig.cheap_direction,      sig.cheap_price_cents),
-                (sig.expensive_ticker,  sig.expensive_direction,  sig.expensive_price_cents),
+                (sig.cheap_ticker,     sig.cheap_direction,     sig.cheap_price_cents),
+                (sig.expensive_ticker, sig.expensive_direction, sig.expensive_price_cents),
             ]:
                 from shared.consensus_engine import ConsensusResult
                 mock_consensus = ConsensusResult(
@@ -725,7 +715,7 @@ class FlywheelOrchestrator:
                     title       = f"[CORR] {sig.event_group}",
                     yes_price   = price,
                     consensus   = mock_consensus,
-                    lead_sector = "economics",   # correlation trades are sector-agnostic
+                    lead_sector = "economics",
                     arb         = None,
                     fade        = False,
                 )
@@ -733,10 +723,6 @@ class FlywheelOrchestrator:
     # ── Resolution timing execution ────────────────────────────────────────────
 
     def _execute_resolution_timing(self, open_markets: list[dict]) -> None:
-        """
-        Scan for markets that should have resolved by now and enter positions.
-        Called after every scan_markets() cycle.
-        """
         signals = self.res_timer.scan(
             open_markets,
             self._last_bot_probs,
@@ -782,21 +768,20 @@ class FlywheelOrchestrator:
 
         logger.info("Fetched %d open markets", len(markets))
 
-        # Core evaluation loop
         for market in markets:
             self._evaluate_market(market)
 
-        # Post-scan strategies (run after all bot probs are populated)
         self._execute_fades(markets)
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
 
         summary = self.circuit_breaker.daily_summary()
         logger.info(
-            "Scan complete | daily_pnl=$%.2f trades=%d halted=%s",
+            "Scan complete | daily_pnl=$%.2f trades=%d halted=%s | sector_pnl=%s",
             summary.get("realized_pnl", 0.0),
             summary.get("trade_count", 0),
             summary.get("halted", False),
+            {k: f"${v:+.2f}" for k, v in self._sector_daily_pnl.items()},
         )
 
     # ── Nightly retrain ────────────────────────────────────────────────────────
@@ -807,7 +792,6 @@ class FlywheelOrchestrator:
         n_resolved = self._ingest_resolved_markets()
         logger.info("Ingested %d new resolved outcomes this cycle", n_resolved)
 
-        # Rebuild resolution timing patterns from accumulated outcomes
         n_patterns = self.res_timer.rebuild_patterns()
         logger.info("Rebuilt %d resolution timing patterns", n_patterns)
 
@@ -816,15 +800,13 @@ class FlywheelOrchestrator:
             logger.info("[%s] calibration: %s", bot.sector_name, stats)
             bot.save_model()
 
-        # Sync bankroll via circuit breaker
         live_bankroll = self.circuit_breaker.sync_bankroll()
         self.bankroll = live_bankroll
         logger.info("Bankroll synced: $%.2f", live_bankroll)
 
-        # Reset sector exposure tracking
-        self._exposure = {b.sector_name: 0.0 for b in self.bots}
-
-        # Reset bot prob cache
+        # Reset all daily tracking
+        self._exposure          = {b.sector_name: 0.0 for b in self.bots}
+        self._sector_daily_pnl  = {b.sector_name: 0.0 for b in self.bots}
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
 
@@ -834,31 +816,21 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v12 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v13 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
 
-        # Start news velocity background poller
         self.news.start_background_poller()
 
-        # Market scanning — every SCAN_INTERVAL_SEC with random jitter
-        # Jitter makes the bot look less like an algo to Kalshi's pattern detection
         import random
         jitter = random.randint(-45, 45)
         schedule.every(SCAN_INTERVAL_SEC + jitter).seconds.do(self.scan_markets)
-
-        # Nightly retrain — at RETRAIN_HOUR (2am)
         schedule.every().day.at(f"{RETRAIN_HOUR:02d}:00").do(self.retrain_models)
-
-        # Resolution watchdog — every 4 hours in background thread
         schedule.every(4).hours.do(self._run_ingestion_thread)
 
-        # Startup: fire ingestion immediately to catch overnight resolutions
         self._run_ingestion_thread()
 
-        # Stagger first scan 30s so ingestion and scan threads
-        # don't hammer the API simultaneously on startup
         logger.info("Waiting 30s before first scan to stagger API calls...")
         time.sleep(30)
 

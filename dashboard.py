@@ -1,5 +1,12 @@
 """
-dashboard.py  (v3 — fixed f-string escaping)
+dashboard.py  (v4 — direct sector queries + demo mode indicator)
+
+Changes vs v3:
+  1. Trades query uses sector column directly (no join through signals)
+  2. P&L query joins outcomes to trades directly (faster, no signal join)
+  3. DEMO_MODE indicator added to topbar — green LIVE / amber DEMO MODE
+  4. created_at no longer needs ::timestamptz cast (fixed in schema tonight)
+
 LOCAL:   python3 dashboard.py
 RAILWAY: set DATABASE_URL env var
 Open http://localhost:5555
@@ -14,6 +21,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH      = os.getenv("DB_PATH", "flywheel.db")
 USE_POSTGRES = bool(DATABASE_URL)
 PORT         = int(os.getenv("PORT", "5555"))
+DEMO_MODE    = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 SECTORS      = ["economics", "crypto", "politics", "weather", "tech", "sports"]
 SECTOR_ICONS = {
@@ -58,15 +66,16 @@ def get_overview():
     except Exception:
         pass
     return {
-        "trades":   (t[0]["n"]   if t else 0) or 0,
-        "signals":  (s[0]["n"]   if s else 0) or 0,
-        "arbs":     (a[0]["n"]   if a else 0) or 0,
-        "resolved": (o[0]["n"]   if o else 0) or 0,
-        "pnl":      round((o[0]["pnl"] if o else 0) or 0, 2),
+        "trades":   (t[0]["n"]     if t else 0) or 0,
+        "signals":  (s[0]["n"]     if s else 0) or 0,
+        "arbs":     (a[0]["n"]     if a else 0) or 0,
+        "resolved": (o[0]["n"]     if o else 0) or 0,
+        "pnl":      round((o[0]["pnl"]   if o else 0) or 0, 2),
         "volume":   round((t[0]["total"] if t else 0) or 0, 2),
     }
 
 def get_sector_stats():
+    # Signals — pulled directly from signals table
     sigs = query("""
         SELECT sector, COUNT(*) AS signals, AVG(edge) AS avg_edge,
                AVG(confidence) AS avg_conf,
@@ -76,23 +85,32 @@ def get_sector_stats():
         FROM signals GROUP BY sector
     """)
     sig_map = {r["sector"]: r for r in sigs}
+
+    # Trades — direct query using sector column (no join needed)
     trd = query("""
-        SELECT s.sector, COUNT(t.id) AS trades, SUM(t.dollars_risked) AS dollars
-        FROM trades t JOIN signals s ON t.ticker = s.ticker GROUP BY s.sector
+        SELECT sector, COUNT(id) AS trades, SUM(dollars_risked) AS dollars
+        FROM trades
+        GROUP BY sector
     """)
     trd_map = {r["sector"]: r for r in trd}
+
+    # P&L — join outcomes to trades directly using ticker
     pnl = query("""
-        SELECT s.sector, SUM(o.pnl_usd) AS pnl, COUNT(*) AS resolved
-        FROM outcomes o JOIN signals s ON o.ticker = s.ticker GROUP BY s.sector
+        SELECT t.sector, SUM(o.pnl_usd) AS pnl, COUNT(*) AS resolved
+        FROM outcomes o
+        JOIN trades t ON o.ticker = t.ticker
+        GROUP BY t.sector
     """)
     pnl_map = {r["sector"]: r for r in pnl}
+
     result = []
     for sec in SECTORS:
         b = sig_map.get(sec, {})
         t = trd_map.get(sec, {})
         p = pnl_map.get(sec, {})
         result.append({
-            "sector":   sec, "icon": SECTOR_ICONS[sec],
+            "sector":   sec,
+            "icon":     SECTOR_ICONS[sec],
             "signals":  b.get("signals", 0) or 0,
             "trades":   t.get("trades", 0) or 0,
             "dollars":  round((t.get("dollars") or 0), 2),
@@ -108,7 +126,7 @@ def get_sector_stats():
 
 def get_recent_trades(limit=20):
     return query(f"""
-        SELECT ticker, direction, contracts, yes_price_cents,
+        SELECT ticker, sector, direction, contracts, yes_price_cents,
                dollars_risked, avg_edge, avg_confidence, demo_mode, created_at
         FROM trades ORDER BY created_at DESC LIMIT {limit}
     """)
@@ -148,8 +166,15 @@ padding:0 32px;display:flex;align-items:center;justify-content:space-between;
 height:60px;position:sticky;top:0;z-index:100}
 .logo{font-family:var(--mono);font-size:14px;font-weight:700;color:var(--green);letter-spacing:2px}
 .logo span{color:var(--muted)}
+.topbar-right{display:flex;align-items:center;gap:12px}
 .db-badge{font-family:var(--mono);font-size:10px;color:var(--muted);
 background:var(--border);padding:4px 10px;border-radius:4px;letter-spacing:1px}
+.demo-badge{font-family:var(--mono);font-size:10px;padding:4px 10px;
+border-radius:4px;letter-spacing:1px;font-weight:700}
+.demo-badge.demo{background:rgba(255,170,0,.15);color:var(--amber);
+border:1px solid rgba(255,170,0,.3)}
+.demo-badge.live{background:rgba(0,255,136,.15);color:var(--green);
+border:1px solid rgba(0,255,136,.3)}
 .live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);
 animation:pulse 2s infinite;display:inline-block;margin-right:8px}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(1.3)}}
@@ -200,6 +225,7 @@ font-family:var(--mono);font-size:12px}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:rgba(255,255,255,.02)}
 .ticker-cell{color:var(--blue)}
+.sector-cell{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px}
 .dir-yes{color:var(--green);font-weight:700}
 .dir-no{color:var(--red);font-weight:700}
 .badge-demo{background:rgba(255,170,0,.12);color:var(--amber);padding:2px 8px;
@@ -213,7 +239,7 @@ color:var(--muted);border-top:1px solid var(--border);margin-top:20px}
 """
 
 def build_chart_js(pnl_labels, pnl_data):
-    pos = len(pnl_data) > 0 and pnl_data[-1] >= 0
+    pos          = len(pnl_data) > 0 and pnl_data[-1] >= 0
     border_color = '#00ff88' if pos else '#ff4444'
     bg_color     = 'rgba(0,255,136,0.05)' if pos else 'rgba(255,68,68,0.05)'
     labels_json  = json.dumps(pnl_labels if pnl_labels else ['No data'])
@@ -249,8 +275,8 @@ new Chart(ctx,{
   }
 });
 setTimeout(function(){location.reload();},60000);
-""".replace("LABELS_JSON", labels_json)\
-   .replace("DATA_JSON",   data_json)\
+""".replace("LABELS_JSON",  labels_json)\
+   .replace("DATA_JSON",    data_json)\
    .replace("BORDER_COLOR", border_color)\
    .replace("BG_COLOR",     bg_color)
 
@@ -292,9 +318,11 @@ def build_html(overview, sectors, trades, arbs, pnl_series):
         dircls = "dir-yes" if t["direction"] == "YES" else "dir-no"
         ec     = "#00ff88" if (t["avg_edge"] or 0) > 0 else "#ff4444"
         ts     = str(t["created_at"] or "")[:16].replace("T", " ")
+        sector = t.get("sector", "—") or "—"
         trade_rows += (
             f'<tr><td>{ts}</td>'
             f'<td class="ticker-cell">{t["ticker"]}</td>'
+            f'<td class="sector-cell">{sector}</td>'
             f'<td><span class="{dircls}">{t["direction"]}</span></td>'
             f'<td>{t["contracts"]}x@{t["yes_price_cents"]}c</td>'
             f'<td>${t["dollars_risked"]:.2f}</td>'
@@ -316,18 +344,20 @@ def build_html(overview, sectors, trades, arbs, pnl_series):
             f'<td>{a["mode"]}</td></tr>'
         )
 
-    pnl_labels = [p["day"] for p in pnl_series]
-    pnl_data   = [p["pnl"] for p in pnl_series]
-    total_pnl  = overview["pnl"]
-    pnl_color  = "#00ff88" if total_pnl >= 0 else "#ff4444"
-    db_mode    = "Supabase PostgreSQL" if USE_POSTGRES else "SQLite"
-    no_data    = "" if db_ready() else '<div class="no-data-banner">No database found — run orchestrator.py first</div>'
-    chart_js   = build_chart_js(pnl_labels, pnl_data)
-    now        = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pnl_labels   = [p["day"] for p in pnl_series]
+    pnl_data     = [p["pnl"] for p in pnl_series]
+    total_pnl    = overview["pnl"]
+    pnl_color    = "#00ff88" if total_pnl >= 0 else "#ff4444"
+    db_mode      = "Supabase PostgreSQL" if USE_POSTGRES else "SQLite"
+    no_data      = "" if db_ready() else '<div class="no-data-banner">No database found — run orchestrator.py first</div>'
+    chart_js     = build_chart_js(pnl_labels, pnl_data)
+    now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    demo_cls     = "demo" if DEMO_MODE else "live"
+    demo_txt     = "⚠ DEMO MODE" if DEMO_MODE else "● LIVE"
 
     trade_table = (
         '<table><thead><tr>'
-        '<th>Time</th><th>Ticker</th><th>Dir</th><th>Size</th>'
+        '<th>Time</th><th>Ticker</th><th>Sector</th><th>Dir</th><th>Size</th>'
         '<th>Risked</th><th>Edge</th><th>Conf</th><th>Mode</th>'
         '</tr></thead><tbody>' + trade_rows + '</tbody></table>'
     ) if trades else '<div class="empty-state">No trades yet</div>'
@@ -348,8 +378,11 @@ def build_html(overview, sectors, trades, arbs, pnl_series):
         '<style>' + CSS + '</style></head><body>'
         '<div class="topbar">'
         '<div class="logo"><span class="live-dot"></span>KALSHI<span>//</span>FLYWHEEL <span>ORACLE</span></div>'
+        '<div class="topbar-right">'
+        f'<span class="demo-badge {demo_cls}">{demo_txt}</span>'
         f'<span class="db-badge">db: {db_mode}</span>'
         '<button class="refresh-btn" onclick="location.reload()">REFRESH</button>'
+        '</div>'
         '</div>'
         '<div class="main">' + no_data +
         '<div class="section-title">// portfolio overview</div>'
@@ -396,5 +429,6 @@ if __name__ == "__main__":
     print(f"\n  KALSHI FLYWHEEL ORACLE")
     print(f"  http://localhost:{PORT}")
     print(f"  DB: {'Supabase' if USE_POSTGRES else DB_PATH}")
+    print(f"  Mode: {'DEMO' if DEMO_MODE else 'LIVE'}")
     print(f"  Ctrl+C to stop\n")
     server.serve_forever()
