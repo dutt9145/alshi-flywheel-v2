@@ -71,7 +71,12 @@ def _search_fields(market: dict, keywords: list[str]) -> bool:
 
 def _has_sports_prefix(market: dict) -> bool:
     SPORTS_PREFIXES = (
-        "kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
+        # KXMVE family — explicit full prefixes to prevent any bleed
+        "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
+        "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
+        "kxmvecbchampionship",
+        # Standard sport prefixes
+        "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
         "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
         "kxtennis", "kxf1", "kxolympic", "kxthail", "kxsl",
         "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
