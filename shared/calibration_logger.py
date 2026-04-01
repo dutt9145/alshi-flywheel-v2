@@ -1,16 +1,24 @@
 """
-shared/calibration_logger.py  (v8 — sector column on trades)
+shared/calibration_logger.py  (v9 — connection pooling)
 
-Changes vs v7:
-  1. trades table schema — sector TEXT column added
-  2. log_trade() — sector parameter added, written to DB on every trade
-  3. init_db() — ALTER TABLE guard added so existing Supabase tables
-     get the sector column without needing a manual migration
-  4. Everything else unchanged from v7
+Changes vs v8:
+  1. _db() context manager replaced with a ThreadedConnectionPool.
+     Previously opened a brand-new psycopg2 connection on every call
+     (log_signal, log_trade, log_outcome, save_model_state, etc.).
+     Each fresh connection handshake adds latency and Supabase IO.
+     The pool reuses connections across calls — max 5 connections,
+     matching the orchestrator's own pool (combined ceiling = 10,
+     safely under Supabase's default 60).
+  2. _get_pool() is module-level with a threading.Lock guard, same
+     pattern as orchestrator.py.
+  3. _db() context manager retained as the public API — all callers
+     (log_signal, log_trade, etc.) are unchanged.
+  4. Version bump to v9.
 """
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,19 +29,46 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 DB_PATH      = os.getenv("DB_PATH", "flywheel.db")
 USE_POSTGRES = bool(DATABASE_URL)
 
+# ── Connection pool ────────────────────────────────────────────────────────────
+# Module-level pool — initialized once, shared across all calibration_logger
+# calls. Max 5 connections: combined with orchestrator's pool of 8 gives a
+# ceiling of 13, safely under Supabase's default limit of 60.
+
+_pg_pool      = None
+_pg_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pg_pool
+    if _pg_pool is None and USE_POSTGRES:
+        with _pg_pool_lock:
+            if _pg_pool is None:
+                try:
+                    import psycopg2.pool
+                    _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+                        minconn=1,
+                        maxconn=5,
+                        dsn=DATABASE_URL,
+                    )
+                    logger.info(
+                        "calibration_logger: Postgres pool initialized (max=5)"
+                    )
+                except Exception as e:
+                    logger.error(
+                        "calibration_logger: pool init failed: %s", e
+                    )
+    return _pg_pool
+
 
 # ── Connection context manager ────────────────────────────────────────────────
 
 @contextmanager
 def _db():
     if USE_POSTGRES:
-        import psycopg2
-        try:
-            conn = psycopg2.connect(DATABASE_URL)
-        except Exception as e:
-            logger.error("Postgres connection failed: %s", e)
-            raise
-        conn.autocommit = False
+        pool = _get_pool()
+        if pool is None:
+            raise RuntimeError("Postgres pool unavailable")
+        conn = pool.getconn()
         try:
             yield conn
             conn.commit()
@@ -41,7 +76,7 @@ def _db():
             conn.rollback()
             raise
         finally:
-            conn.close()
+            pool.putconn(conn)
     else:
         import sqlite3
         conn = sqlite3.connect(DB_PATH)
@@ -171,8 +206,7 @@ def init_db() -> None:
             for stmt in statements:
                 cur.execute(stmt)
 
-            # ── Migration guard — add columns that didn't exist in older schemas ──
-            # Safe to run repeatedly — DO NOTHING if column already exists
+            # ── Migration guard ────────────────────────────────────────────
             migrations = [
                 "ALTER TABLE trades   ADD COLUMN IF NOT EXISTS sector TEXT",
                 "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS sector TEXT",
@@ -245,7 +279,7 @@ def log_trade(
     avg_confidence: float,
     order_id: Optional[str] = None,
     demo_mode: bool = True,
-    sector: Optional[str] = None,   # ← NEW in v8
+    sector: Optional[str] = None,
 ) -> int:
     vals = (
         datetime.now(timezone.utc).isoformat(),
