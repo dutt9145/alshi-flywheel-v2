@@ -1,16 +1,12 @@
 """
-shared/calibration_logger.py  (v7 — Supabase model persistence)
+shared/calibration_logger.py  (v8 — sector column on trades)
 
-Changes vs v6:
-  1. model_states table added to init_db()
-     — stores serialized BayesianPolyModel pickles as base64 text
-     — keyed by sector name, upserts on conflict
-     — survives Railway restarts / redeploys (ephemeral filesystem fix)
-  2. save_model_state(sector, blob) added
-     — called by BayesianPolyModel.save() after local disk write
-  3. load_model_state(sector) added
-     — called by BayesianPolyModel.load() as fallback when disk is empty
-  4. Everything else unchanged from v6
+Changes vs v7:
+  1. trades table schema — sector TEXT column added
+  2. log_trade() — sector parameter added, written to DB on every trade
+  3. init_db() — ALTER TABLE guard added so existing Supabase tables
+     get the sector column without needing a manual migration
+  4. Everything else unchanged from v7
 """
 
 import logging
@@ -67,7 +63,6 @@ def _rows_to_dicts(rows, cursor=None):
 
 
 def _ph(n: int) -> str:
-    """Return n placeholders: %s for postgres, ? for sqlite."""
     p = "%s" if USE_POSTGRES else "?"
     return ", ".join([p] * n)
 
@@ -91,7 +86,7 @@ def init_db() -> None:
         f"""
         CREATE TABLE IF NOT EXISTS signals (
             id           {serial},
-            created_at   TEXT NOT NULL,
+            created_at   TIMESTAMPTZ NOT NULL,
             ticker       TEXT NOT NULL,
             sector       TEXT NOT NULL,
             our_prob     REAL NOT NULL,
@@ -99,14 +94,17 @@ def init_db() -> None:
             edge         REAL NOT NULL,
             confidence   REAL NOT NULL,
             direction    TEXT NOT NULL,
-            brier_score  REAL
+            brier_score  REAL,
+            outcome      SMALLINT,
+            outcome_at   TIMESTAMPTZ
         )
         """,
         f"""
         CREATE TABLE IF NOT EXISTS trades (
             id              {serial},
-            created_at      TEXT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL,
             ticker          TEXT NOT NULL,
+            sector          TEXT,
             direction       TEXT NOT NULL,
             contracts       INTEGER NOT NULL,
             yes_price_cents INTEGER NOT NULL,
@@ -121,8 +119,9 @@ def init_db() -> None:
         f"""
         CREATE TABLE IF NOT EXISTS outcomes (
             id           {serial},
-            logged_at    TEXT NOT NULL,
+            logged_at    TIMESTAMPTZ NOT NULL,
             ticker       TEXT NOT NULL,
+            sector       TEXT,
             resolved     TEXT NOT NULL,
             pnl_usd      REAL,
             trade_id     INTEGER {ref},
@@ -133,7 +132,7 @@ def init_db() -> None:
         f"""
         CREATE TABLE IF NOT EXISTS calibration_stats (
             id             {serial},
-            computed_at    TEXT NOT NULL,
+            computed_at    TIMESTAMPTZ NOT NULL,
             sector         TEXT NOT NULL,
             window_days    INTEGER,
             n_predictions  INTEGER,
@@ -147,7 +146,7 @@ def init_db() -> None:
         f"""
         CREATE TABLE IF NOT EXISTS arb_opportunities (
             id           {serial},
-            detected_at  TEXT,
+            detected_at  TIMESTAMPTZ,
             ticker       TEXT,
             kalshi_prob  REAL,
             poly_prob    REAL,
@@ -160,7 +159,7 @@ def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS model_states (
             sector      TEXT PRIMARY KEY,
-            updated_at  TEXT NOT NULL,
+            updated_at  TIMESTAMPTZ NOT NULL,
             model_blob  TEXT NOT NULL
         )
         """,
@@ -171,6 +170,20 @@ def init_db() -> None:
             cur = conn.cursor()
             for stmt in statements:
                 cur.execute(stmt)
+
+            # ── Migration guard — add columns that didn't exist in older schemas ──
+            # Safe to run repeatedly — DO NOTHING if column already exists
+            migrations = [
+                "ALTER TABLE trades   ADD COLUMN IF NOT EXISTS sector TEXT",
+                "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS sector TEXT",
+                "ALTER TABLE signals  ADD COLUMN IF NOT EXISTS outcome    SMALLINT",
+                "ALTER TABLE signals  ADD COLUMN IF NOT EXISTS outcome_at TIMESTAMPTZ",
+            ]
+            for m in migrations:
+                try:
+                    cur.execute(m)
+                except Exception as e:
+                    logger.warning("Migration skipped (already exists): %s", e)
         else:
             for stmt in statements:
                 conn.execute(stmt)
@@ -232,10 +245,12 @@ def log_trade(
     avg_confidence: float,
     order_id: Optional[str] = None,
     demo_mode: bool = True,
+    sector: Optional[str] = None,   # ← NEW in v8
 ) -> int:
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
+        str(sector) if sector is not None else None,
         str(direction),
         int(contracts),
         int(yes_price_cents),
@@ -252,25 +267,27 @@ def log_trade(
             cur = conn.cursor()
             cur.execute(f"""
                 INSERT INTO trades
-                (created_at, ticker, direction, contracts, yes_price_cents,
+                (created_at, ticker, sector, direction, contracts, yes_price_cents,
                  dollars_risked, avg_prob, avg_edge, avg_confidence,
                  order_id, demo_mode)
-                VALUES ({_ph(11)}) RETURNING id
+                VALUES ({_ph(12)}) RETURNING id
             """, vals)
             trade_id = int(cur.fetchone()[0])
         else:
             cur = conn.execute(f"""
                 INSERT INTO trades
-                (created_at, ticker, direction, contracts, yes_price_cents,
+                (created_at, ticker, sector, direction, contracts, yes_price_cents,
                  dollars_risked, avg_prob, avg_edge, avg_confidence,
                  order_id, demo_mode)
-                VALUES ({_ph(11)})
+                VALUES ({_ph(12)})
             """, vals)
             trade_id = int(cur.lastrowid)
 
     logger.info(
-        "TRADE logged #%d | %s | %s %dx@%dc | $%.2f | demo=%s",
-        trade_id, ticker, direction,
+        "TRADE logged #%d | %s | %s | %s %dx@%dc | $%.2f | demo=%s",
+        trade_id, ticker,
+        str(sector) if sector else "—",
+        direction,
         int(contracts), int(yes_price_cents),
         float(dollars_risked), bool(demo_mode),
     )
@@ -289,10 +306,10 @@ def log_outcome(
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
         str(resolved).upper(),
-        float(pnl_usd)   if pnl_usd  is not None else None,
-        int(trade_id)    if trade_id is not None else None,
-        float(our_prob)  if our_prob is not None else None,
-        bool(correct)    if correct  is not None else None,
+        float(pnl_usd)  if pnl_usd  is not None else None,
+        int(trade_id)   if trade_id is not None else None,
+        float(our_prob) if our_prob is not None else None,
+        bool(correct)   if correct  is not None else None,
     )
     sql = f"""
         INSERT INTO outcomes
@@ -313,13 +330,9 @@ def log_outcome(
     )
 
 
-# ── Model state persistence (survives Railway restarts) ───────────────────────
+# ── Model state persistence ───────────────────────────────────────────────────
 
 def save_model_state(sector: str, blob: bytes) -> None:
-    """
-    Upsert a serialized BayesianPolyModel pickle into the model_states table.
-    blob is stored as base64 text so it survives any encoding issues.
-    """
     import base64
     encoded = base64.b64encode(blob).decode()
 
@@ -347,10 +360,6 @@ def save_model_state(sector: str, blob: bytes) -> None:
 
 
 def load_model_state(sector: str) -> Optional[bytes]:
-    """
-    Load a serialized BayesianPolyModel pickle from the model_states table.
-    Returns None if no state exists for this sector yet.
-    """
     import base64
 
     sql = (
