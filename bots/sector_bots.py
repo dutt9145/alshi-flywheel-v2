@@ -1,18 +1,27 @@
 """
-bots/sector_bots.py  (v8 — skip_noaa flag for ingestion safety)
+bots/sector_bots.py  (v9 — keyword audit + sports bleed fixes)
 
-Changes vs v7:
+Changes vs v8:
+  EconomicsBot:
+    - Added: retail sales, housing starts, consumer confidence, debt ceiling,
+      deficit, tariff, trade balance + kx-prefixes for each
+  CryptoBot:
+    - "etf" replaced with "bitcoin etf", "crypto etf", "spot etf" (too generic)
+  PoliticsBot:
+    - No changes
   WeatherBot:
-    - fetch_features() now accepts skip_noaa=False parameter
-    - When skip_noaa=True (called from orchestrator resolution ingestion),
-      NOAA HTTP calls are bypassed entirely — feature vector is padded with
-      [0.5, 0.0] to maintain consistent shape, noaa_summary = "skipped"
-    - Live signal evaluation (skip_noaa=False, the default) unchanged —
-      still gets full NOAA enrichment
-    - Prevents NOAA rate-limiting / slowdown during bulk historical ingestion
-      (e.g. 3,600+ resolved sports markets triggering weather fetches)
-
-All other bots: unchanged from v7.
+    - No changes
+  TechBot:
+    - "profit" removed — appears in sports box scores
+    - "meta" removed from KEYWORDS (kept in TITLE_TICKER_MAP for detection only)
+    - "acquisition" removed — risky substring match
+    - Added SPORTS_EXCLUDE list — hard blocks any market with sports ticker prefix
+    - is_relevant() now checks SPORTS_EXCLUDE before keyword match
+  SportsBot:
+    - "over" and "under" removed — appear in economics market titles constantly
+    - "champion" and "finals" replaced with specific sport variants
+    - "champion" REMOVED — "champion the bill" in politics titles
+    - "finals" REMOVED — "Fed finals decision" false positive
 """
 
 import asyncio
@@ -55,26 +64,45 @@ def _search_fields(market: dict, keywords: list[str]) -> bool:
     return any(kw.lower() in haystack for kw in keywords)
 
 
+def _has_sports_prefix(market: dict) -> bool:
+    """
+    Returns True if the market ticker/event_ticker starts with a known
+    sports prefix. Used to hard-exclude sports markets from non-sports bots.
+    """
+    SPORTS_PREFIXES = (
+        "kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
+        "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
+        "kxtennis", "kxf1", "kxolympic", "kxthail", "kxsl",
+        "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
+    )
+    et = market.get("event_ticker", "").lower()
+    tk = market.get("ticker", "").lower()
+    return any(et.startswith(p) or tk.startswith(p) for p in SPORTS_PREFIXES)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  1. ECONOMICS BOT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class EconomicsBot(BaseBot):
     """
-    Macro-economic resolution markets: CPI, Fed rate decisions, GDP, jobs.
-    Keywords restricted to kx-prefixes + terms that ONLY appear in financial
-    market titles — "yield" removed (sports spread context).
+    Macro-economic resolution markets: CPI, Fed rate decisions, GDP, jobs,
+    housing, retail, trade, consumer sentiment.
     """
 
     KEYWORDS = [
         # Kalshi event_ticker prefixes (safe — Kalshi's own taxonomy)
         "kxcpi", "kxfed", "kxfomc", "kxgdp", "kxjobs", "kxunrate",
         "kxpce", "kxnfp", "kxyield", "kxrate", "kxinfl",
+        "kxhousing", "kxretail", "kxdebt", "kxtrade", "kxconsumer",
         # Human-readable — only terms that cannot appear in sports titles
         "cpi", "inflation", "unemployment", "nonfarm",
         "payroll", "gdp", "recession", "rate hike", "rate cut",
         "pce", "fomc", "interest rate", "treasury",
         "federal reserve", "basis points",
+        "retail sales", "housing starts", "consumer confidence",
+        "debt ceiling", "deficit", "tariff", "trade balance",
+        "consumer sentiment", "jobless claims", "trade war",
         # "yield" REMOVED — appears in sports spread/stats context
         # "fed" REMOVED — too short, risky substring match
     ]
@@ -84,6 +112,8 @@ class EconomicsBot(BaseBot):
         return "economics"
 
     def is_relevant(self, market: dict) -> bool:
+        if _has_sports_prefix(market):
+            return False
         return _search_fields(market, self.KEYWORDS)
 
     def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
@@ -105,6 +135,8 @@ class CryptoBot(BaseBot):
     Crypto price threshold, dominance, and ETF flow markets.
     "sol" removed — substring of "resolved", "console", etc.
     "link" removed — too generic; kxlink prefix retained.
+    "etf" replaced with specific "bitcoin etf", "crypto etf" — plain "etf"
+    matches S&P ETF and bond ETF markets which belong in economics.
     """
 
     KEYWORDS = [
@@ -113,8 +145,10 @@ class CryptoBot(BaseBot):
         "kxbnb", "kxavax", "kxlink", "kxcoin",
         # Human-readable — specific enough to not bleed
         "bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
-        "xrp", "ripple", "altcoin", "defi", "nft", "etf",
+        "xrp", "ripple", "altcoin", "defi", "nft",
+        "bitcoin etf", "crypto etf", "spot etf",
         "blockchain", "coinbase", "binance", "stablecoin",
+        # "etf" REMOVED — matches S&P/bond ETF markets (economics territory)
         # "sol" REMOVED — substring of "resolved", "console", many words
         # "link" REMOVED — too generic
     ]
@@ -137,6 +171,8 @@ class CryptoBot(BaseBot):
         return "crypto"
 
     def is_relevant(self, market: dict) -> bool:
+        if _has_sports_prefix(market):
+            return False
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_coin(self, market: dict) -> str:
@@ -193,6 +229,8 @@ class PoliticsBot(BaseBot):
         return "politics"
 
     def is_relevant(self, market: dict) -> bool:
+        if _has_sports_prefix(market):
+            return False
         return _search_fields(market, self.KEYWORDS)
 
     def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
@@ -215,16 +253,13 @@ class PoliticsBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  4. WEATHER BOT  (v8 — skip_noaa flag)
+#  4. WEATHER BOT  (v8 — skip_noaa flag, unchanged in v9)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WeatherBot(BaseBot):
     """
     Temperature records, precipitation, storm landfalls.
-    v7: NOAA API integrated.
-    v8: fetch_features() accepts skip_noaa=True to bypass NOAA HTTP calls
-        during bulk historical ingestion, preventing rate-limiting and
-        blocking the resolution watchdog thread.
+    NOAA API integrated (v7). skip_noaa flag added (v8).
     """
 
     KEYWORDS = [
@@ -243,7 +278,6 @@ class WeatherBot(BaseBot):
         # "temp"  REMOVED — too short, risky substring
     ]
 
-    # Local fallback coords (noaa_client.CITY_COORDS is the master list)
     CITY_COORDS = {
         "new york": (40.71, -74.01), "nyc": (40.71, -74.01),
         "los angeles": (34.05, -118.24), "la": (34.05, -118.24),
@@ -258,6 +292,8 @@ class WeatherBot(BaseBot):
         return "weather"
 
     def is_relevant(self, market: dict) -> bool:
+        if _has_sports_prefix(market):
+            return False
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_city(self, market: dict) -> tuple[float, float, str]:
@@ -268,11 +304,6 @@ class WeatherBot(BaseBot):
         return 40.71, -74.01, "New York"
 
     def _get_noaa_prior(self, market: dict) -> Optional[dict]:
-        """
-        Sync wrapper around the async NOAA enrichment pipeline.
-        Returns a dict with prior_yes, confidence, noaa_summary, etc.
-        or None if NOAA is unavailable / city not parseable.
-        """
         title      = market.get("title", "")
         close_time = market.get("close_time")
 
@@ -290,7 +321,6 @@ class WeatherBot(BaseBot):
         try:
             pkg = asyncio.run(fetch_weather_package(lat, lon))
         except RuntimeError:
-            # Already inside a running event loop (e.g. during testing)
             loop = asyncio.get_event_loop()
             pkg  = loop.run_until_complete(fetch_weather_package(lat, lon))
 
@@ -354,7 +384,6 @@ class WeatherBot(BaseBot):
 
     @staticmethod
     def _parse_city_from_title(title: str) -> Optional[str]:
-        """Extract city substring from market title for noaa_client lookup."""
         patterns = [
             r"\bin\s+([A-Za-z\s]+?)(?:\s+on|\s+exceed|\s+be|\s+reach|\?|$)",
             r"^Will\s+([A-Za-z\s]+?)\s+(?:high|low|temp)",
@@ -370,7 +399,6 @@ class WeatherBot(BaseBot):
         lat, lon, city = self._detect_city(market)
         features, context = fetch_weather_features(lat, lon, city)
 
-        # ── Numeric targets from title ───────────────────────────
         title    = market.get("title", "")
         numbers  = re.findall(r"\d+\.?\d*", title)
         target_f = float(numbers[0]) if numbers else 75.0
@@ -380,11 +408,6 @@ class WeatherBot(BaseBot):
         context["target_c"]          = target_c
         context["delta_from_target"] = delta
 
-        # ── NOAA enrichment ──────────────────────────────────────
-        # skip_noaa=True during historical ingestion — avoids hammering
-        # the NOAA API across thousands of resolved markets and blocking
-        # the resolution watchdog thread. Live signals always get full
-        # enrichment (skip_noaa=False is the default).
         if not skip_noaa:
             noaa = self._get_noaa_prior(market)
             if noaa:
@@ -402,13 +425,11 @@ class WeatherBot(BaseBot):
                 context["noaa_date"]         = noaa["target_date"]
                 context["noaa_market_type"]  = noaa["market_type"]
             else:
-                # NOAA unavailable but still on live path — pad to keep shape
                 features = np.append(features, [0.5, 0.0])
                 context["noaa_prior"]      = None
                 context["noaa_confidence"] = 0.0
                 context["noaa_summary"]    = "NOAA unavailable"
         else:
-            # Historical ingestion path — skip all NOAA calls, pad shape
             features = np.append(features, [0.5, 0.0])
             context["noaa_prior"]      = None
             context["noaa_confidence"] = 0.0
@@ -418,27 +439,35 @@ class WeatherBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. TECH BOT
+#  5. TECH BOT  (v9 — sports bleed fix)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TechBot(BaseBot):
     """
     Earnings, M&A, AI milestones markets.
-    Generic words removed in v5: "tech", "model", "launch", "release",
-    "stock", "share", "market cap", "ai" — all appeared in KXMVE sports titles.
-    Only specific company names, tickers, and kx-prefixes remain.
+
+    v9 changes:
+    - _has_sports_prefix() guard added to is_relevant() — hard blocks the
+      79k+ KXMVE/KXNCAA/KXNBA markets that were bleeding in via generic keywords
+    - "profit" REMOVED — appears in sports box score headlines
+    - "meta" REMOVED from KEYWORDS — too short, matched KXMVE* prefixes.
+      Still used in TITLE_TICKER_MAP for company detection after relevance check.
+    - "acquisition" REMOVED — risky substring match in broader market titles
     """
 
     KEYWORDS = [
-        # Kalshi event_ticker prefixes (safe)
+        # Kalshi event_ticker prefixes (safe — Kalshi's own taxonomy)
         "kxaapl", "kxgoog", "kxmsft", "kxamzn", "kxmeta", "kxnvda",
         "kxtsla", "kxearnings", "kxtech", "kxai", "kxipo",
         "kxopenai", "kxanthropic", "kxnasdaq",
-        # Specific company names only — cannot appear in sports titles
-        "earnings", "revenue", "eps", "profit", "ipo", "merger",
-        "acquisition", "apple", "google", "microsoft", "amazon",
+        # Specific company/tech terms — safe from sports bleed
+        "earnings", "revenue", "eps", "ipo", "merger",
+        "apple", "google", "microsoft", "amazon",
         "nvidia", "tesla", "openai", "anthropic",
         "artificial intelligence", "nasdaq",
+        # "profit"      REMOVED — appears in sports headlines
+        # "meta"        REMOVED — too short, matched KXMVE* sports tickers
+        # "acquisition" REMOVED — risky substring match
     ]
 
     TICKER_PREFIX_MAP = {
@@ -458,6 +487,9 @@ class TechBot(BaseBot):
         return "tech"
 
     def is_relevant(self, market: dict) -> bool:
+        # Hard block — sports prefixes cannot be tech markets
+        if _has_sports_prefix(market):
+            return False
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_company(self, market: dict) -> str:
@@ -483,35 +515,46 @@ class TechBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  6. SPORTS BOT
+#  6. SPORTS BOT  (v9 — removed generic bleed keywords)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SportsBot(BaseBot):
     """
     Game outcomes, over/unders, season props, parlays.
-    KXMVESPORTSMULTIGAMEEXTENDED and KXMVECROSSCATEGORY are the dominant
-    liquid market types on Kalshi (March Madness + NBA season).
-    Bare "kxmve" catch-all excluded — was causing ~83% signal skew.
+
+    v9 changes:
+    - "over" and "under" REMOVED — appear constantly in economics market titles
+      ("will CPI come in over 3%", "will unemployment go under 4%")
+    - "champion" REMOVED — matches "champion the bill" in politics titles
+    - "finals" REMOVED — matches "Fed finals decision" in economics titles
+    - Replaced with specific sport variants: "nba finals", "stanley cup", etc.
     """
 
     KEYWORDS = [
         # KXMVE multivariate sports (specific prefixes only)
         "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
         "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
+        "kxmvecbchampionship",
         # Standard single-game Kalshi prefixes
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
         "kxtennis", "kxf1", "kxolympic",
+        "kxthail", "kxsl", "kxdota", "kxintlf", "kxcs2",
         # Title keywords — sports-specific enough to be safe
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
         "basketball", "football", "baseball", "hockey", "tennis",
-        "golf", "f1", "formula 1", "champion", "playoff",
-        "super bowl", "world series", "finals", "march madness",
-        "wins by", "points scored", "over", "under", "spread", "mvp",
+        "golf", "f1", "formula 1", "playoff",
+        "super bowl", "world series", "march madness",
+        "nba finals", "stanley cup", "nfl championship",
+        "world series finals", "ncaa championship",
+        "wins by", "points scored", "spread", "mvp",
         "lakers", "celtics", "warriors", "bulls", "knicks",
         "patriots", "chiefs", "cowboys", "eagles",
-        # "heat" moved here from WeatherBot — Miami Heat is sports
         "miami heat",
+        # "over"     REMOVED — "will CPI come in over 3%"
+        # "under"    REMOVED — "will unemployment go under 4%"
+        # "champion" REMOVED — "champion the bill" in politics
+        # "finals"   REMOVED — "Fed finals decision" in economics
     ]
 
     LEAGUE_MAP = {
@@ -520,6 +563,7 @@ class SportsBot(BaseBot):
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
         "kxmvesports": "NBA",
         "kxmvecross":  "NBA",
+        "kxmvecbchampionship": "NCAAB",
     }
 
     @property
