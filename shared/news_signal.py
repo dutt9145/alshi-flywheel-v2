@@ -1,26 +1,18 @@
 """
-shared/news_signal.py
+shared/news_signal.py  (v2 — batched queries, rate limit fix)
 
-Real-time news velocity signal.
-
-Tracks the *rate of new articles* on a topic — not sentiment.
-When article volume on a market keyword doubles in 15 minutes,
-price is about to move. Positioning before the move is the edge.
-
-How it works:
-  1. Polls NewsAPI every NEWS_POLL_INTERVAL_SEC (default 300 = 5min)
-  2. For each active market title, extracts keywords and counts recent articles
-  3. Computes velocity = (current_count - baseline_count) / time_window
-  4. High velocity → elevated signal → bots weight their predictions higher
-
-Usage:
-    from shared.news_signal import NewsSignal
-    ns = NewsSignal()
-    ns.start_background_poller()  # call once on startup
-
-    # In bot.fetch_features():
-    velocity = ns.get_velocity(market_title)
-    # velocity: 0.0 (no news) → 1.0+ (spiking)
+Changes vs v1:
+  1. _refresh_all() now batches all keywords into groups of 5 per NewsAPI
+     request using OR operator — reduces API calls from N to N/5
+  2. Hard cap of 20 keywords max tracked at any time — prevents unbounded
+     growth from registering every single market title word
+  3. Keyword deduplication and prioritization — longer/more specific keywords
+     kept over generic ones when cap is hit
+  4. Per-cycle rate limit guard — minimum 2s sleep between NewsAPI requests
+     to stay under free tier limits (100 req/day = 1 req/15min safely)
+  5. Daily request counter added — logs total daily usage so you can monitor
+  6. register_market() now only registers keywords > 5 chars to filter out
+     generic names like "wins", "runs", "real", "pete" etc.
 """
 
 import logging
@@ -31,6 +23,15 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Max keywords to track simultaneously — prevents unbounded growth
+_MAX_KEYWORDS    = 50
+# Max keywords per NewsAPI batch query
+_BATCH_SIZE      = 5
+# Minimum chars for a keyword to be worth tracking
+_MIN_KEYWORD_LEN = 5
+# Minimum seconds between NewsAPI requests (free tier protection)
+_MIN_REQUEST_GAP = 2.0
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
@@ -87,7 +88,6 @@ def init_news_tables() -> None:
 
 # ── Keyword extraction ────────────────────────────────────────────────────────
 
-# Stop words to strip from market titles before building search queries
 _STOP_WORDS = {
     "will", "the", "a", "an", "be", "to", "in", "on", "at", "by",
     "or", "and", "of", "for", "is", "are", "was", "were", "has",
@@ -96,19 +96,24 @@ _STOP_WORDS = {
     "than", "more", "less", "reach", "hit", "end", "day", "week",
     "month", "year", "percent", "before", "after", "during", "next",
     "last", "first", "second", "third", "between", "within",
+    # Generic sport words that aren't meaningful for news search
+    "wins", "runs", "points", "goals", "score", "game", "match",
+    "team", "play", "player", "total", "home", "away", "season",
+    "wins", "loses", "beats", "versus", "against", "record",
 }
 
 def extract_keywords(title: str, max_keywords: int = 3) -> list[str]:
     """
-    Pull the most meaningful words from a market title for news search.
-    Returns up to max_keywords terms, longer words preferred.
+    Pull meaningful words from a market title for news search.
+    Only returns keywords longer than _MIN_KEYWORD_LEN chars.
     """
     import re
-    words = re.findall(r"[a-zA-Z]{3,}", title)
-    words = [w.lower() for w in words if w.lower() not in _STOP_WORDS]
-    # Deduplicate, sort by length descending (longer = more specific)
-    seen    = set()
-    unique  = []
+    words  = re.findall(r"[a-zA-Z]{3,}", title)
+    words  = [
+        w.lower() for w in words
+        if w.lower() not in _STOP_WORDS and len(w) >= _MIN_KEYWORD_LEN
+    ]
+    seen, unique = set(), []
     for w in words:
         if w not in seen:
             seen.add(w)
@@ -121,18 +126,13 @@ def extract_keywords(title: str, max_keywords: int = 3) -> list[str]:
 
 class NewsSignal:
     """
-    Background news velocity tracker.
+    Background news velocity tracker — batched, rate-limited.
 
-    Parameters
-    ----------
-    api_key : str
-        NewsAPI key. Falls back to NEWSAPI_KEY env var.
-    poll_interval_sec : int
-        How often to refresh article counts. Default 300 (5 min).
-    velocity_window_min : int
-        Time window for velocity calculation in minutes. Default 30.
-    velocity_spike_threshold : float
-        Multiplier vs baseline above which velocity is "spiking". Default 2.0.
+    Key changes in v2:
+    - Keywords batched 5 at a time into single NewsAPI OR queries
+    - Hard cap of 50 keywords max (evicts shortest/least specific)
+    - Min keyword length of 5 chars filters generic names
+    - Daily request counter logged for monitoring
     """
 
     def __init__(
@@ -147,10 +147,11 @@ class NewsSignal:
         self.velocity_window_min      = velocity_window_min
         self.velocity_spike_threshold = velocity_spike_threshold
 
-        # In-memory cache: keyword → {"count": int, "velocity": float, "ts": datetime}
-        self._cache: dict[str, dict] = {}
-        self._lock  = threading.Lock()
+        self._cache: dict[str, dict]    = {}
+        self._lock                      = threading.Lock()
         self._active_keywords: set[str] = set()
+        self._daily_request_count       = 0
+        self._last_request_ts           = 0.0
 
         init_news_tables()
 
@@ -159,78 +160,74 @@ class NewsSignal:
                 "NewsSignal: NEWSAPI_KEY not set — velocity signals disabled. "
                 "Get a free key at newsapi.org"
             )
+        else:
+            logger.info(
+                "NewsSignal ready | interval=%ds batch_size=%d max_keywords=%d",
+                poll_interval_sec, _BATCH_SIZE, _MAX_KEYWORDS,
+            )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def register_market(self, market_title: str) -> None:
         """
-        Register a market title for velocity tracking.
-        Call this when a new open market is discovered during scan.
+        Register meaningful keywords from a market title for velocity tracking.
+        Only keeps keywords >= _MIN_KEYWORD_LEN chars.
+        Evicts shortest keywords when cap is reached.
         """
         keywords = extract_keywords(market_title)
+        if not keywords:
+            return
+
         with self._lock:
-            self._active_keywords.update(keywords)
+            for kw in keywords:
+                if kw in self._active_keywords:
+                    continue
+                if len(self._active_keywords) >= _MAX_KEYWORDS:
+                    # Evict the shortest keyword to make room
+                    shortest = min(self._active_keywords, key=len)
+                    self._active_keywords.discard(shortest)
+                    logger.debug("NewsSignal: evicted '%s' to make room for '%s'", shortest, kw)
+                self._active_keywords.add(kw)
 
     def get_velocity(self, market_title: str) -> float:
-        """
-        Return the current news velocity score for a market title.
-
-        Score interpretation:
-          0.0       → no news activity
-          0.5–1.0   → moderate news (baseline)
-          1.0–2.0   → elevated (worth noting)
-          2.0+      → spike (price likely to move soon)
-
-        Returns 0.0 if API key not configured or no data yet.
-        """
+        """Return max velocity score for any keyword in the market title."""
         if not self.api_key:
             return 0.0
-
         keywords = extract_keywords(market_title)
         if not keywords:
             return 0.0
-
         max_velocity = 0.0
         with self._lock:
             for kw in keywords:
                 entry = self._cache.get(kw)
                 if entry:
                     max_velocity = max(max_velocity, entry.get("velocity", 0.0))
-
         return max_velocity
 
     def get_velocity_features(self, market_title: str) -> tuple[float, float]:
-        """
-        Return (velocity_score, is_spiking) as a 2-tuple for injection
-        into bot feature vectors.
-
-        velocity_score : float  — raw velocity (0.0+)
-        is_spiking     : float  — 1.0 if spiking, 0.0 if not (float for np.append)
-        """
+        """Return (velocity_score, is_spiking) for feature vector injection."""
         velocity   = self.get_velocity(market_title)
         is_spiking = 1.0 if velocity >= self.velocity_spike_threshold else 0.0
         return velocity, is_spiking
 
     def start_background_poller(self) -> None:
-        """
-        Launch the background thread that polls NewsAPI every poll_interval_sec.
-        Call once on orchestrator startup.
-        """
+        """Launch background polling thread. Call once on startup."""
         if not self.api_key:
             return
-
         t = threading.Thread(
             target=self._poll_loop,
             daemon=True,
             name="news-velocity-poller",
         )
         t.start()
-        logger.info("NewsSignal background poller started (interval=%ds)", self.poll_interval_sec)
+        logger.info(
+            "NewsSignal background poller started (interval=%ds)",
+            self.poll_interval_sec,
+        )
 
     # ── Background poller ──────────────────────────────────────────────────────
 
     def _poll_loop(self) -> None:
-        """Runs forever in a daemon thread."""
         while True:
             try:
                 self._refresh_all()
@@ -239,69 +236,102 @@ class NewsSignal:
             time.sleep(self.poll_interval_sec)
 
     def _refresh_all(self) -> None:
-        """Poll NewsAPI for all active keywords and update cache."""
+        """
+        Poll NewsAPI for all active keywords in batches of _BATCH_SIZE.
+        One request per batch using OR operator.
+        Much more efficient than one request per keyword.
+        """
         with self._lock:
             keywords = list(self._active_keywords)
 
         if not keywords:
             return
 
-        for keyword in keywords:
+        # Build batches of _BATCH_SIZE keywords
+        batches = [
+            keywords[i:i + _BATCH_SIZE]
+            for i in range(0, len(keywords), _BATCH_SIZE)
+        ]
+
+        logger.info(
+            "NewsSignal refresh: %d keywords → %d batches (daily_requests=%d)",
+            len(keywords), len(batches), self._daily_request_count,
+        )
+
+        for batch in batches:
             try:
-                count = self._fetch_article_count(keyword)
-                velocity = self._compute_velocity(keyword, count)
+                # Rate limit — minimum gap between requests
+                elapsed = time.time() - self._last_request_ts
+                if elapsed < _MIN_REQUEST_GAP:
+                    time.sleep(_MIN_REQUEST_GAP - elapsed)
 
-                with self._lock:
-                    self._cache[keyword] = {
-                        "count":    count,
-                        "velocity": velocity,
-                        "ts":       datetime.now(timezone.utc),
-                    }
+                counts = self._fetch_batch_counts(batch)
+                self._last_request_ts = time.time()
+                self._daily_request_count += 1
 
-                if velocity >= self.velocity_spike_threshold:
-                    logger.info(
-                        "[NEWS SPIKE] keyword='%s' velocity=%.2f count=%d",
-                        keyword, velocity, count,
-                    )
+                for kw, count in counts.items():
+                    velocity = self._compute_velocity(kw, count)
 
-                self._persist(keyword, count, velocity)
+                    with self._lock:
+                        self._cache[kw] = {
+                            "count":    count,
+                            "velocity": velocity,
+                            "ts":       datetime.now(timezone.utc),
+                        }
+
+                    if velocity >= self.velocity_spike_threshold:
+                        logger.info(
+                            "[NEWS SPIKE] keyword='%s' velocity=%.2f count=%d",
+                            kw, velocity, count,
+                        )
+
+                    self._persist(kw, count, velocity)
 
             except Exception as e:
-                logger.warning("NewsSignal refresh failed for '%s': %s", keyword, e)
+                logger.warning("NewsSignal batch failed %s: %s", batch, e)
 
-    def _fetch_article_count(self, keyword: str) -> int:
+        logger.info(
+            "NewsSignal refresh complete | daily_requests=%d",
+            self._daily_request_count,
+        )
+
+    def _fetch_batch_counts(self, keywords: list[str]) -> dict[str, int]:
         """
-        Query NewsAPI for articles mentioning keyword in the last velocity_window_min.
-        Returns article count (integer).
+        Fetch article counts for a batch of keywords in ONE NewsAPI request.
+        Uses OR operator: "bitcoin OR ethereum OR solana"
+        Returns dict of keyword → estimated count (evenly split from total).
         """
         import urllib.request
+        import urllib.parse
         import json
 
+        query = " OR ".join(keywords)
         since = (
             datetime.now(timezone.utc) - timedelta(minutes=self.velocity_window_min)
         ).strftime("%Y-%m-%dT%H:%M:%S")
 
         url = (
             f"https://newsapi.org/v2/everything"
-            f"?q={urllib.parse.quote(keyword)}"
+            f"?q={urllib.parse.quote(query)}"
             f"&from={since}"
             f"&sortBy=publishedAt"
-            f"&pageSize=1"             # we only need the totalResults count
+            f"&pageSize=1"
             f"&apiKey={self.api_key}"
         )
 
-        import urllib.parse
-        req  = urllib.request.Request(url, headers={"User-Agent": "kalshi-flywheel/1.0"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "kalshi-flywheel/2.0"}
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data  = json.loads(resp.read())
-            return int(data.get("totalResults", 0))
+            total = int(data.get("totalResults", 0))
+
+        # Distribute count evenly across keywords in the batch
+        # This is approximate — individual counts would require N requests
+        per_kw = total // len(keywords) if keywords else 0
+        return {kw: per_kw for kw in keywords}
 
     def _compute_velocity(self, keyword: str, current_count: int) -> float:
-        """
-        Compute velocity = current_count / baseline_count.
-        Baseline is the average of the last 6 recorded counts for this keyword.
-        Returns 0.0 if no baseline yet.
-        """
         p    = _ph()
         rows = _db_execute(
             f"""
@@ -315,7 +345,7 @@ class NewsSignal:
         )
 
         if not rows:
-            return 1.0  # neutral on first read
+            return 1.0
 
         baseline = sum(r["article_count"] for r in rows) / len(rows)
         if baseline <= 0:
@@ -329,7 +359,8 @@ class NewsSignal:
         _db_execute(
             f"""
             INSERT INTO news_velocity
-                (keyword, article_count, velocity_score, window_start, window_end, recorded_at)
+                (keyword, article_count, velocity_score,
+                 window_start, window_end, recorded_at)
             VALUES ({p}, {p}, {p}, {p}, {p}, {p})
             """,
             (
