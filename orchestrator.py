@@ -1,16 +1,20 @@
 """
-orchestrator.py  (v14 — precise ticker normalization regex)
+orchestrator.py  (v16 — additional Supabase IO reduction)
 
-Changes vs v13:
-  1. Ticker normalization uses precise regex instead of naive split("-S")[0].
-     The old approach was splitting on ANY "-S" in the ticker, which broke
-     legitimate tickers like KXNBASTL (contains "-S" in "BASTL").
-     New pattern only strips actual UUID suffixes: -S[hex]{4,}-[hex]+
-  2. _normalize_ticker() extracted as a named module-level function,
-     called consistently in _evaluate_market() and _ingest_resolved_markets()
-     and already_recorded set — all three spots now use identical logic.
-  3. import re added at top level.
-  4. Version bump to v14.
+Changes vs v15:
+  1. sync_bankroll() and daily_summary() called once at the top of
+     scan_markets() and cached as self._scan_bankroll /
+     self._scan_summary for the duration of each scan cycle.
+     Previously called once per _execute_trade — 10+ round-trips
+     per burst cycle.
+  2. arb.log_arb_opportunity() gated behind `if arb.arb_exists` so
+     non-arb markets don't produce writes.
+  3. SELECT DISTINCT ticker FROM outcomes bounded to the same min_ts
+     window used by get_resolved_markets() — prevents a full table
+     scan every 4-hour ingestion cycle as the outcomes table grows.
+  4. _calculate_pnl SELECT bounded with ORDER BY created_at DESC +
+     LIMIT 50 to prevent unbounded full-table reads as trades grows.
+  5. Version bump to v16.
 """
 
 import logging
@@ -56,17 +60,6 @@ logging.basicConfig(
 logger = logging.getLogger("orchestrator")
 
 # ── Ticker normalization ───────────────────────────────────────────────────────
-# Strips UUID suffixes appended by Kalshi to multivariate market tickers.
-# Pattern: -S followed by 4+ hex chars, a dash, then more hex chars at end.
-#
-# Examples STRIPPED:
-#   KXMVECROSS-S20265EDEF7A4844-B67B70E26B6      → KXMVECROSS
-#   KXMVECBCHAMPIONSHIP-S2026FF6F0D0CBE856AD-...  → KXMVECBCHAMPIONSHIP
-#
-# Examples PRESERVED (no UUID suffix):
-#   KXNBASTL-26APR01DENUTA-DENNJOKIC15-1          → unchanged
-#   KXNBABLK-26APR01PHIWAS-PHIJEMBIID21-1         → unchanged
-#   KXMVECROSSCATEGORY (already stripped)          → unchanged
 _UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
 
 
@@ -150,8 +143,15 @@ def _parse_yes_price_cents(market: dict) -> int:
 
 def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str | None]:
     p = _ph()
+    # FIX 4: ORDER BY + LIMIT 50 prevents full table scans as the trades
+    # table grows. 50 is a safe ceiling — no single ticker should have
+    # more open legs than this.
     trade_rows = _query_signals(
-        f"SELECT id, direction, contracts, yes_price_cents FROM trades WHERE ticker = {p}",
+        f"SELECT id, direction, contracts, yes_price_cents "
+        f"FROM trades "
+        f"WHERE ticker = {p} "
+        f"ORDER BY created_at DESC "
+        f"LIMIT 50",
         (ticker,),
     )
 
@@ -233,15 +233,6 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
         logger.warning("_update_signal_brier failed for %s: %s", ticker, e)
 
 
-def _get_sector_resolved_count(sector: str) -> int:
-    p = _ph()
-    rows = _query_signals(
-        f"SELECT COUNT(*) as n FROM signals WHERE sector = {p} AND outcome IS NOT NULL",
-        (sector,),
-    )
-    return int(rows[0]["n"]) if rows else 0
-
-
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 class FlywheelOrchestrator:
@@ -298,6 +289,37 @@ class FlywheelOrchestrator:
         self._last_bot_probs:   dict[str, float] = {}
         self._last_bot_sectors: dict[str, str]   = {}
 
+        # v15: resolved count cache — 60s TTL, invalidated on retrain
+        self._resolved_count_cache:    dict[str, int] = {}
+        self._resolved_count_cache_ts: float          = 0.0
+
+        # v16 FIX 1: scan-cycle bankroll + summary cache.
+        # Populated once at the top of scan_markets(); used by all
+        # _execute_trade calls in that cycle. Avoids sync_bankroll() +
+        # daily_summary() DB hits per trade during burst cycles.
+        self._scan_bankroll: float = self.bankroll
+        self._scan_summary:  dict  = {}
+
+    # ── Sector resolved count (cached) ────────────────────────────────────────
+
+    def _get_sector_resolved_count(self, sector: str) -> int:
+        """Return resolved outcome count for a sector. Cached for 60s."""
+        now = time.monotonic()
+        if now - self._resolved_count_cache_ts > 60.0:
+            self._resolved_count_cache.clear()
+            self._resolved_count_cache_ts = now
+
+        if sector not in self._resolved_count_cache:
+            p = _ph()
+            rows = _query_signals(
+                f"SELECT COUNT(*) as n FROM signals "
+                f"WHERE sector = {p} AND outcome IS NOT NULL",
+                (sector,),
+            )
+            self._resolved_count_cache[sector] = int(rows[0]["n"]) if rows else 0
+
+        return self._resolved_count_cache[sector]
+
     # ── Resolution ingestion ───────────────────────────────────────────────────
 
     def _ingest_resolved_markets(self) -> int:
@@ -318,13 +340,25 @@ class FlywheelOrchestrator:
 
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
-        already_recorded = {
-            _normalize_ticker(r["ticker"])
-            for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
-        }
+        # FIX 3: Scope already_recorded to the same min_ts window used to
+        # fetch resolved markets. Without this bound, every 4-hour ingestion
+        # cycle does a full table scan on outcomes regardless of table size.
+        p = _ph()
+        if min_ts:
+            already_recorded = {
+                _normalize_ticker(r["ticker"])
+                for r in _query_signals(
+                    f"SELECT DISTINCT ticker FROM outcomes WHERE created_at > {p}",
+                    (min_ts,),
+                )
+            }
+        else:
+            already_recorded = {
+                _normalize_ticker(r["ticker"])
+                for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
+            }
 
         recorded = 0
-        p        = _ph()
 
         for market in resolved_markets:
             ticker = _normalize_ticker(market.get("ticker", ""))
@@ -476,6 +510,26 @@ class FlywheelOrchestrator:
         self._last_bot_probs[ticker]   = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
+        arb = self.arb.check(
+            ticker        = ticker,
+            kalshi_cents  = yes_price,
+            our_direction = consensus.direction,
+            market_title  = title,
+        )
+
+        # FIX 2: Only write arb opportunities that actually exist.
+        # Previously called unconditionally on every consensus-passing market.
+        if arb.arb_exists:
+            self.arb.log_arb_opportunity(arb)
+
+        if not arb.passes:
+            logger.info(
+                "ARB GATE VETO %s | dir_aligned=%s spread=%.2f%% notes=%s",
+                ticker, arb.direction_aligned, arb.cross_spread * 100, arb.notes,
+            )
+            return
+
+        # v15: log_signal fires only after the arb gate passes.
         try:
             log_signal(
                 ticker      = ticker,
@@ -488,21 +542,6 @@ class FlywheelOrchestrator:
             )
         except Exception as e:
             logger.error("log_signal failed for %s: %s", ticker, e)
-
-        arb = self.arb.check(
-            ticker        = ticker,
-            kalshi_cents  = yes_price,
-            our_direction = consensus.direction,
-            market_title  = title,
-        )
-        self.arb.log_arb_opportunity(arb)
-
-        if not arb.passes:
-            logger.info(
-                "ARB GATE VETO %s | dir_aligned=%s spread=%.2f%% notes=%s",
-                ticker, arb.direction_aligned, arb.cross_spread * 100, arb.notes,
-            )
-            return
 
         self._execute_trade(
             ticker      = ticker,
@@ -544,11 +583,10 @@ class FlywheelOrchestrator:
             )
             return
 
-        # ── Real-time bankroll sync ────────────────────────────────────────
-        live_bankroll = self.circuit_breaker.sync_bankroll()
-
-        # ── Drawdown factor ────────────────────────────────────────────────
-        summary         = self.circuit_breaker.daily_summary()
+        # FIX 1: Use scan-cycle cached values instead of hitting Supabase
+        # once per trade. Refreshed once at the top of scan_markets().
+        live_bankroll   = self._scan_bankroll
+        summary         = self._scan_summary
         daily_pnl       = float(summary.get("realized_pnl", 0.0))
         loss_limit      = live_bankroll * CIRCUIT_BREAKER_PCT
         drawdown_factor = (
@@ -556,8 +594,8 @@ class FlywheelOrchestrator:
             if daily_pnl < 0 and loss_limit > 0 else 1.0
         )
 
-        # ── Exploration Kelly ──────────────────────────────────────────────
-        resolved_count = _get_sector_resolved_count(lead_sector)
+        # v15: cached resolved count
+        resolved_count = self._get_sector_resolved_count(lead_sector)
         kf             = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
         if in_exploration:
@@ -765,6 +803,14 @@ class FlywheelOrchestrator:
     def scan_markets(self) -> None:
         logger.info("Scanning markets...")
 
+        # FIX 1: Fetch bankroll and daily summary once per scan cycle and
+        # cache on self. All _execute_trade calls below use the cached values,
+        # avoiding one sync_bankroll() + one daily_summary() DB hit per trade
+        # during burst cycles (was 10–20 extra round-trips at 18:14).
+        self._scan_bankroll = self.circuit_breaker.sync_bankroll()
+        self._scan_summary  = self.circuit_breaker.daily_summary()
+        self.bankroll       = self._scan_bankroll
+
         try:
             markets = self.client.get_all_open_markets()
         except Exception as e:
@@ -780,12 +826,11 @@ class FlywheelOrchestrator:
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
 
-        summary = self.circuit_breaker.daily_summary()
         logger.info(
             "Scan complete | daily_pnl=$%.2f trades=%d halted=%s | sector_pnl=%s",
-            summary.get("realized_pnl", 0.0),
-            summary.get("trade_count", 0),
-            summary.get("halted", False),
+            self._scan_summary.get("realized_pnl", 0.0),
+            self._scan_summary.get("trade_count", 0),
+            self._scan_summary.get("halted", False),
             {k: f"${v:+.2f}" for k, v in self._sector_daily_pnl.items()},
         )
 
@@ -805,8 +850,10 @@ class FlywheelOrchestrator:
             logger.info("[%s] calibration: %s", bot.sector_name, stats)
             bot.save_model()
 
-        live_bankroll = self.circuit_breaker.sync_bankroll()
-        self.bankroll = live_bankroll
+        live_bankroll       = self.circuit_breaker.sync_bankroll()
+        self.bankroll       = live_bankroll
+        self._scan_bankroll = live_bankroll
+        self._scan_summary  = {}
         logger.info("Bankroll synced: $%.2f", live_bankroll)
 
         self._exposure         = {b.sector_name: 0.0 for b in self.bots}
@@ -814,13 +861,18 @@ class FlywheelOrchestrator:
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
 
+        # Invalidate resolved count cache so fresh outcomes are reflected
+        # immediately in exploration thresholds after retrain.
+        self._resolved_count_cache.clear()
+        self._resolved_count_cache_ts = 0.0
+
         logger.info("=== Retrain complete ===")
 
     # ── Run ────────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v14 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v16 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
