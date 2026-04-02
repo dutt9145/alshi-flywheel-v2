@@ -1,16 +1,12 @@
 """
-shared/kalshi_client.py  (v3 — rate limit handling + smart resolved market fetching)
+shared/kalshi_client.py  (v4 — page_sleep_sec param for rate-limit tuning)
 
-Changes vs v2:
-  1. get_all_open_markets() — added 429 retry with 60s backoff, reduced
-     inter-page sleep to 0.3s (was 0.5s, still safe under rate limits)
-  2. get_resolved_markets() — added 429 retry with 60s backoff + inter-page
-     sleep. max_pages raised to 350 (35,000 markets) for full history on
-     first run. Accepts optional min_close_ts to filter by close time so
-     subsequent runs only fetch recent resolutions instead of all 34k+
-  3. _get() now surfaces the raw status code in exceptions so callers
-     can detect 429 vs other errors cleanly
-  4. Everything else unchanged from v2
+Changes vs v3:
+  1. get_all_open_markets() now accepts page_sleep_sec (default 0.25s).
+     Orchestrator passes SCAN_PAGE_SLEEP_SEC (0.25s) to stay under Kalshi's
+     rate limit without relying solely on 429 backoff/retry. Previously
+     hardcoded to 0.5s; 0.25s is still safe and halves pagination time.
+  2. Everything else unchanged from v3.
 """
 
 import base64
@@ -32,20 +28,13 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
-# How long to wait after a 429 before retrying
 _RATE_LIMIT_BACKOFF_SEC = 60
-
-# Max retries per page on 429
 _MAX_RETRIES = 3
 
 
 def _load_private_key():
-    """
-    Load RSA private key — handles every possible format Railway might use.
-    """
     pem = KALSHI_PRIVATE_KEY.strip()
 
-    # Format 1: Base64 encoded entire PEM (most Railway-safe)
     if not pem.startswith("-----"):
         try:
             decoded = base64.b64decode(pem).decode()
@@ -58,11 +47,9 @@ def _load_private_key():
             wrapped = textwrap.fill(pem, 64)
             pem = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
 
-    # Format 2: Has literal \n instead of real newlines
     if "\\n" in pem:
         pem = pem.replace("\\n", "\n")
 
-    # Format 3: PEM header present but no line breaks in body
     if (
         "-----BEGIN RSA PRIVATE KEY-----" in pem and
         "\n" not in pem
@@ -73,7 +60,6 @@ def _load_private_key():
         wrapped = textwrap.fill(body, 64)
         pem     = "-----BEGIN RSA PRIVATE KEY-----\n" + wrapped + "\n-----END RSA PRIVATE KEY-----"
 
-    # Format 4: File path
     if not pem.startswith("-----") and len(pem) < 200:
         try:
             with open(pem, "rb") as f:
@@ -124,10 +110,6 @@ class KalshiClient:
     # ── Core HTTP ──────────────────────────────────────────────────────────────
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        """
-        Signed GET with retry on 429.
-        Raises requests.HTTPError on non-retriable errors.
-        """
         for attempt in range(_MAX_RETRIES):
             headers = _sign_request("GET", path)
             r = self.session.get(
@@ -147,7 +129,6 @@ class KalshiClient:
             r.raise_for_status()
             return r.json()
 
-        # Exhausted retries
         raise requests.HTTPError(f"429 rate limit not resolved after {_MAX_RETRIES} retries on {path}")
 
     def _post(self, path: str, body: dict) -> dict:
@@ -175,11 +156,16 @@ class KalshiClient:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
 
-    def get_all_open_markets(self) -> list:
+    def get_all_open_markets(self, page_sleep_sec: float = 0.25) -> list:
         """
         Fetch all open markets with pagination.
-        Retries on 429 automatically via _get().
-        Uses 0.3s inter-page sleep — stays comfortably under rate limits.
+
+        Parameters
+        ----------
+        page_sleep_sec : float
+            Sleep between pages to stay under Kalshi's rate limit.
+            Default 0.25s. Orchestrator passes SCAN_PAGE_SLEEP_SEC so this
+            can be tuned centrally without touching the client.
         """
         markets, cursor, page = [], None, 0
         max_pages = 40
@@ -201,7 +187,7 @@ class KalshiClient:
             if not cursor or len(batch) < 100:
                 break
 
-            time.sleep(0.5)
+            time.sleep(page_sleep_sec)
 
         return markets
 
@@ -218,16 +204,10 @@ class KalshiClient:
         max_pages : int
             Maximum pages to fetch (100 markets each).
             Default 350 = up to 35,000 markets (for full first-run history).
-            Subsequent runs should pass a min_close_ts to limit the fetch.
         min_close_ts : str, optional
-            ISO 8601 timestamp. If provided, stop paginating once we see
-            markets with close_time older than this value.
-            Use the timestamp of your most recent outcome to avoid
-            re-fetching the entire history every 4 hours.
-
-        Returns
-        -------
-        list of market dicts with result in ("yes", "no")
+            ISO 8601 timestamp. Stop paginating once markets are older than
+            this value. Pass the most recent outcome timestamp to avoid
+            re-fetching full history every 4 hours.
         """
         markets, cursor, page = [], None, 0
 
@@ -243,8 +223,6 @@ class KalshiClient:
                 break
 
             batch = resp.get("markets", [])
-
-            # Filter to clean yes/no results only
             clean = [m for m in batch if m.get("result") in ("yes", "no")]
             markets.extend(clean)
             page += 1
@@ -254,7 +232,6 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
-            # Timestamp cutoff — stop early on subsequent runs
             if min_close_ts and batch:
                 oldest_close = batch[-1].get("close_time", "")
                 if oldest_close and oldest_close < min_close_ts:
@@ -275,9 +252,8 @@ class KalshiClient:
 
     def get_latest_outcome_ts(self) -> Optional[str]:
         """
-        Query the outcomes table for the most recent resolved_at timestamp.
+        Query outcomes table for most recent resolved_at timestamp.
         Used to build min_close_ts for incremental resolved market fetching.
-        Returns ISO string or None if no outcomes yet.
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
@@ -290,7 +266,6 @@ class KalshiClient:
                 row  = cur.fetchone()
                 conn.close()
                 if row and row[0]:
-                    # Subtract 1 day buffer to catch any stragglers
                     ts = row[0]
                     if hasattr(ts, "isoformat"):
                         buffered = ts - timedelta(days=1)
