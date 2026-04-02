@@ -1,19 +1,19 @@
 """
-orchestrator.py  (v17 — duplicate trade guard + KXMVE sector bleed fix)
+orchestrator.py  (v18 — trade_id int fix + re-resolution guard + CB ingestion check)
 
-Changes vs v16:
-  1. _recently_traded dict added — 5-minute per-ticker cooldown blocks
-     the same ticker from being entered twice across consecutive scan
-     cycles. Fixes the KXMVESPORTSMULTIGAMEEXTENDED 4x duplicate trades
-     visible at 18:04–18:05.
-  2. _has_sports_prefix() now also checks the UUID-normalized ticker
-     (tk_norm). KXMVE tickers were leaking into ECONOMICS because the
-     event_ticker field returned by Kalshi sometimes doesn't carry the
-     full prefix — the raw ticker with UUID stripped does.
-  3. RECENT_TRADE_WINDOW_SEC constant added to config block (300s).
-  4. _recently_traded cleared on retrain_models() so daily reset doesn't
-     lock out legitimate re-entries after market structure changes.
-  5. Version bump to v17.
+Changes vs v17:
+  1. _calculate_pnl now returns (pnl, list[int]) instead of a comma-joined
+     string. log_outcome receives only the primary (first) trade_id as int,
+     fixing the "invalid literal for int() with base 10: '239,238,...'" crash
+     that was silently failing every resolution write.
+  2. _ingest_resolved_markets tracks a processed_this_run set. Tickers are
+     added to it BEFORE log_outcome is called, so a failed write no longer
+     causes the same market to be re-resolved on every subsequent ingestion
+     tick in the same run. Eliminates the phantom P&L accumulation loop.
+  3. _ingest_resolved_markets checks circuit_breaker.is_halted() at the top
+     of each iteration and breaks early if the breaker has tripped, preventing
+     further record_pnl() calls from compounding an already-breached day.
+  4. Version bump to v18.
 """
 
 import logging
@@ -59,8 +59,6 @@ logging.basicConfig(
 logger = logging.getLogger("orchestrator")
 
 # ── Duplicate trade cooldown ───────────────────────────────────────────────────
-# How long (seconds) before the same ticker can be entered again.
-# Prevents back-to-back scan cycles double-entering the same position.
 RECENT_TRADE_WINDOW_SEC = 300  # 5 minutes
 
 # ── Ticker normalization ───────────────────────────────────────────────────────
@@ -73,11 +71,6 @@ def _normalize_ticker(ticker: str) -> str:
 
 
 # ── Sports prefix guard ────────────────────────────────────────────────────────
-# FIX 2: Also check tk_norm (UUID-stripped ticker). Kalshi sometimes returns
-# a generic event_ticker for KXMVE markets that doesn't carry the full prefix,
-# allowing them to slip past into EconomicsBot. The raw ticker with UUID
-# stripped always starts with the correct prefix.
-
 _SPORTS_PREFIXES = (
     "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
     "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
@@ -94,7 +87,7 @@ _SPORTS_PREFIXES = (
 def _has_sports_prefix(market: dict) -> bool:
     et      = market.get("event_ticker", "").lower()
     tk      = market.get("ticker", "").lower()
-    tk_norm = _UUID_SUFFIX_RE.sub('', tk)   # strip UUID so KXMVE always matches
+    tk_norm = _UUID_SUFFIX_RE.sub('', tk)
     return any(
         et.startswith(p) or tk.startswith(p) or tk_norm.startswith(p)
         for p in _SPORTS_PREFIXES
@@ -174,7 +167,16 @@ def _parse_yes_price_cents(market: dict) -> int:
     return 0
 
 
-def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str | None]:
+def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[int]]:
+    """
+    Returns (total_pnl_usd, trade_id_list).
+
+    FIX 1: Previously returned (pnl, ",".join(trade_ids)) — a comma-joined
+    string — which caused log_outcome to crash with:
+        ValueError: invalid literal for int() with base 10: '239,238,236,...'
+    Now returns a list of ints so callers can pass trade_id_list[0] as the
+    primary key to log_outcome and log the full list separately if needed.
+    """
     p = _ph()
     trade_rows = _query_signals(
         f"SELECT id, direction, contracts, yes_price_cents "
@@ -186,17 +188,24 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str |
     )
 
     if not trade_rows:
-        return None, None
+        return None, []
 
-    total_pnl, trade_ids = 0.0, []
+    total_pnl: float = 0.0
+    trade_ids: list[int] = []
 
     for trade in trade_rows:
-        trade_id       = str(trade.get("id", ""))
-        direction      = str(trade.get("direction", "YES")).upper()
-        contracts      = int(trade.get("contracts", 0))
-        yes_price      = int(trade.get("yes_price_cents", 50))
+        raw_id    = trade.get("id")
+        direction = str(trade.get("direction", "YES")).upper()
+        contracts = int(trade.get("contracts", 0))
+        yes_price = int(trade.get("yes_price_cents", 50))
 
         if contracts <= 0:
+            continue
+
+        try:
+            trade_ids.append(int(raw_id))
+        except (TypeError, ValueError):
+            logger.warning("Skipping non-integer trade id: %r", raw_id)
             continue
 
         yes_price_frac = yes_price / 100.0
@@ -208,12 +217,11 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, str |
             pnl = contracts * (no_price_frac if not resolved_yes else (-yes_price_frac))
 
         total_pnl += pnl
-        trade_ids.append(trade_id)
 
     if not trade_ids:
-        return None, None
+        return None, []
 
-    return round(total_pnl, 2), ",".join(trade_ids)
+    return round(total_pnl, 2), trade_ids
 
 
 def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
@@ -319,23 +327,17 @@ class FlywheelOrchestrator:
         self._last_bot_probs:   dict[str, float] = {}
         self._last_bot_sectors: dict[str, str]   = {}
 
-        # v15: resolved count cache — 60s TTL, invalidated on retrain
         self._resolved_count_cache:    dict[str, int] = {}
         self._resolved_count_cache_ts: float          = 0.0
 
-        # v16: scan-cycle bankroll + summary cache
         self._scan_bankroll: float = self.bankroll
         self._scan_summary:  dict  = {}
 
-        # FIX 1: Per-ticker cooldown — ticker → monotonic timestamp of last
-        # trade. Blocks re-entry within RECENT_TRADE_WINDOW_SEC (5 min).
-        # Fixes duplicate entries across consecutive scan cycles.
         self._recently_traded: dict[str, float] = {}
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
     def _get_sector_resolved_count(self, sector: str) -> int:
-        """Return resolved outcome count for a sector. Cached for 60s."""
         now = time.monotonic()
         if now - self._resolved_count_cache_ts > 60.0:
             self._resolved_count_cache.clear()
@@ -387,15 +389,32 @@ class FlywheelOrchestrator:
                 for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
             }
 
+        # FIX 2: Track tickers processed during THIS ingestion run.
+        # If log_outcome fails (e.g. DB error), the ticker is still recorded
+        # here so the same market isn't re-resolved on the next loop iteration,
+        # which was causing phantom P&L accumulation in the $200K+ range.
+        processed_this_run: set[str] = set()
+
         recorded = 0
 
         for market in resolved_markets:
+            # FIX 3: Stop processing further resolutions if the circuit breaker
+            # has already tripped. Without this check, record_pnl() calls kept
+            # accumulating the same losses on each re-resolution tick even after
+            # the daily limit was breached, inflating the reported loss figure.
+            if self.circuit_breaker.is_halted():
+                logger.warning(
+                    "Circuit breaker active — stopping ingestion early to prevent "
+                    "further phantom P&L accumulation"
+                )
+                break
+
             ticker = _normalize_ticker(market.get("ticker", ""))
             result = market.get("result", "")
 
             if not ticker or result not in ("yes", "no"):
                 continue
-            if ticker in already_recorded:
+            if ticker in already_recorded or ticker in processed_this_run:
                 continue
 
             resolved_yes = result == "yes"
@@ -425,6 +444,9 @@ class FlywheelOrchestrator:
                     )
 
             if not sig_rows:
+                # FIX 2: Still mark as processed even with no signal rows, so
+                # we don't loop over this market again in the same ingestion run.
+                processed_this_run.add(ticker)
                 continue
 
             our_prob  = float(sig_rows[0]["our_prob"])
@@ -435,12 +457,16 @@ class FlywheelOrchestrator:
                 (direction == "NO"  and not resolved_yes)
             )
 
-            pnl_usd, trade_id = _calculate_pnl(ticker, resolved_yes)
+            # FIX 1: _calculate_pnl now returns (pnl, list[int]) instead of
+            # (pnl, comma-joined-string). Pass trade_ids[0] as the primary key
+            # to log_outcome so it can safely call int() on it.
+            pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
+            primary_trade_id   = trade_ids[0] if trade_ids else None
 
             if pnl_usd is not None:
                 logger.info(
-                    "[P&L] %s resolved %s → $%+.2f (trade_id=%s)",
-                    ticker, result.upper(), pnl_usd, trade_id,
+                    "[P&L] %s resolved %s → $%+.2f (primary_trade_id=%s, all_ids=%s)",
+                    ticker, result.upper(), pnl_usd, primary_trade_id, trade_ids,
                 )
                 self.circuit_breaker.record_pnl(pnl_usd)
 
@@ -458,18 +484,27 @@ class FlywheelOrchestrator:
                     ticker, result.upper(),
                 )
 
+            # FIX 2: Mark ticker as processed BEFORE calling log_outcome.
+            # If log_outcome raises, the ticker is already in processed_this_run
+            # so it won't be re-processed in the same ingestion pass.
+            processed_this_run.add(ticker)
+
             try:
                 log_outcome(
                     ticker   = ticker,
                     resolved = result.upper(),
                     pnl_usd  = pnl_usd,
-                    trade_id = trade_id,
+                    trade_id = primary_trade_id,   # FIX 1: int, not comma-string
                     our_prob = our_prob,
                     correct  = direction_correct,
                 )
                 recorded += 1
             except Exception as e:
-                logger.error("log_outcome failed for %s: %s", ticker, e)
+                logger.error(
+                    "log_outcome failed for %s (trade_id=%s): %s — "
+                    "outcome counted but not persisted; will retry next ingestion cycle",
+                    ticker, primary_trade_id, e,
+                )
 
             _update_signal_brier(ticker, resolved_yes)
 
@@ -588,10 +623,7 @@ class FlywheelOrchestrator:
         arb,
         fade:        bool = False,
     ) -> None:
-        # ── Duplicate trade guard (FIX 1) ─────────────────────────────────
-        # Blocks re-entry on the same ticker within RECENT_TRADE_WINDOW_SEC.
-        # Consecutive scan cycles were re-evaluating open markets and
-        # entering the same position multiple times (visible 18:04–18:05).
+        # ── Duplicate trade guard ──────────────────────────────────────────
         now      = time.monotonic()
         last_ts  = self._recently_traded.get(ticker, 0.0)
         elapsed  = now - last_ts
@@ -697,7 +729,6 @@ class FlywheelOrchestrator:
                 logger.error("Order failed %s: %s", ticker, e)
                 return
 
-        # Record cooldown timestamp only after a successful trade
         self._recently_traded[ticker]   = now
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
@@ -897,9 +928,6 @@ class FlywheelOrchestrator:
         self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
-
-        # Clear cooldowns on retrain so legitimate re-entries after overnight
-        # market structure changes aren't blocked by stale timestamps.
         self._recently_traded.clear()
 
         self._resolved_count_cache.clear()
@@ -911,7 +939,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v17 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v18 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
