@@ -1,31 +1,47 @@
 """
-shared/news_signal.py  (v3 — NewsData.io, smarter keyword filtering)
+shared/news_signal.py  (v4 — Perplexity primary signal engine)
 
-Changes vs v2:
-  1. Switched from NewsAPI to NewsData.io
-       - Free tier: 200 credits/day (vs 100 on NewsAPI)
-       - Commercial use allowed on free tier (NewsAPI blocks this)
-       - Native category filtering: business, politics, sports, technology, science
-       - No localhost restriction
-  2. Keyword cap reduced from 50 → 20 high-priority keywords
-       - 50 keywords × 10 batches = 10 requests per cycle was blowing through
-         the daily budget in 1-2 cycles. 20 keywords = 4 requests per cycle.
-       - At 5-minute poll interval: 4 req/cycle × 12 cycles/hr = 48 req/hr max
-       - Daily budget: 200 credits → safe headroom even with multiple scans
-  3. Sector-aware keyword prioritization
-       - Each sector maps to a NewsData.io category for better signal quality
-       - Keywords are scored by specificity — proper nouns and longer terms
-         kept over generic words
-  4. Category-level fallback
-       - If no keyword spike detected, falls back to category-level velocity
-         so the signal never goes completely dark
-  5. Daily budget guard
-       - Hard stops at 180 requests/day (90% of free tier) to prevent
-         accidental overruns from tight scan intervals
+Architecture change vs v3:
+  Switched from NewsData.io keyword-count polling → Perplexity sector intelligence.
+
+WHY:
+  - NewsData.io free tier: 12-hour delayed articles → stale signal, useless for
+    intraday prediction markets that price in news within minutes
+  - Perplexity Sonar: real-time web search + synthesis → asks "is there breaking
+    news affecting [sector] markets RIGHT NOW?" and reasons about market relevance
+  - Cost: ~$0.14/day vs $199.99/month for NewsData paid tier
+
+SIGNAL QUALITY COMPARISON:
+  Old approach:  Count articles mentioning "bitcoin" → velocity ratio
+                 Problem: counts press releases, opinion pieces, old news
+
+  New approach:  Ask Perplexity "Has breaking news in last 2hr moved Bitcoin
+                 prediction markets?" → returns scored signal + reasoning
+                 Advantage: filters for market-relevant events, real-time,
+                 understands context (Fed meeting vs random crypto article)
+
+USAGE PATTERN:
+  - One Perplexity query per sector per 30-minute interval
+  - 6 sectors × 2/hr = 12 queries/hr × 24hr = ~288 queries/day
+  - At $1/M tokens (sonar standard), ~500 tokens/query avg = ~$0.14/day
+  - Results cached 15 minutes — rapid scan cycles hit cache, not API
+  - Each sector gets a specialized prompt tuned for prediction market relevance
+
+INTEGRATION:
+  The public API is unchanged — get_velocity() and get_velocity_features()
+  still return the same float values, so no changes needed in base_bot.py
+  or the orchestrator. Drop-in replacement.
+
+ENV VARS:
+  PERPLEXITY_API_KEY  — your Perplexity API key (already set for Discord bot)
+  NEWSAPI_KEY         — no longer used, kept for backwards compatibility
+  NEWSDATA_KEY        — no longer used, kept for backwards compatibility
 """
 
+import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -34,39 +50,112 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-_MAX_KEYWORDS     = 20     # Hard cap — 20 keywords = 4 batches per cycle
-_BATCH_SIZE       = 5      # Keywords per NewsData.io request
-_MIN_KEYWORD_LEN  = 5      # Min chars to register a keyword
-_MIN_REQUEST_GAP  = 1.0    # Seconds between API requests
-_DAILY_BUDGET     = 180    # Max requests/day (90% of 200 free tier limit)
-_NEWSDATA_URL     = "https://newsdata.io/api/1/news"
+_CACHE_TTL_MINUTES   = 15     # Don't re-query same sector within this window
+_SECTOR_POLL_MINUTES = 30     # Full sector refresh interval
+_MIN_REQUEST_GAP     = 1.0    # Seconds between Perplexity requests
+_PERPLEXITY_URL      = "https://api.perplexity.ai/chat/completions"
+_MODEL               = "sonar"  # Standard sonar — real-time, ~$1/M tokens
+                                 # Upgrade to "sonar-pro" for deeper reasoning
 
-# ── Sector → NewsData.io category mapping ─────────────────────────────────────
-# Used for category-level fallback when no keyword spike is detected.
-_SECTOR_CATEGORY_MAP = {
-    "economics": "business",
-    "crypto":    "technology",
-    "politics":  "politics",
-    "weather":   "science",
-    "tech":      "technology",
-    "sports":    "sports",
+# ── Sector-specific Perplexity prompts ────────────────────────────────────────
+
+_SECTOR_PROMPTS = {
+    "economics": """Search for breaking financial and economic news from the last 2 hours.
+Focus on: Fed/central bank announcements, CPI/inflation data, jobs reports, GDP releases,
+recession signals, major market moves (S&P, Nasdaq, Dow), commodity price spikes,
+treasury yield moves, or any macro event that would affect prediction market probabilities.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=no news, 10=major market-moving event>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on the most market-relevant event, or 'No significant economic news'>",
+  "top_event": "<specific event name or null>",
+  "confidence": <0.0-1.0>
+}""",
+
+    "crypto": """Search for breaking cryptocurrency news from the last 2 hours.
+Focus on: Bitcoin/Ethereum price moves >3%, exchange hacks or outages, regulatory actions
+(SEC, CFTC, DOJ), ETF approvals or rejections, major protocol exploits, whale movements,
+stablecoin depegs, major DeFi events, or any news that would shift crypto prediction market odds.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=quiet, 10=major breaking event>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on the most market-relevant crypto event, or 'Crypto markets quiet'>",
+  "top_event": "<specific event name or null>",
+  "confidence": <0.0-1.0>
+}""",
+
+    "politics": """Search for breaking political news from the last 2 hours.
+Focus on: US political developments, election news, major legislation votes, executive orders,
+Supreme Court decisions, international geopolitical events (NATO, UN, major conflicts),
+government shutdown risks, major political figure announcements, or polling shifts
+that would affect prediction market probabilities.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=routine news, 10=major breaking political event>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on most politically significant event, or 'No major political developments'>",
+  "top_event": "<specific event name or null>",
+  "confidence": <0.0-1.0>
+}""",
+
+    "weather": """Search for breaking severe weather news and forecasts from the last 2 hours.
+Focus on: hurricane/tropical storm formations or landfalls, tornado outbreaks, major blizzard
+or winter storm warnings, extreme heat events, flooding, NOAA alerts for major US cities,
+or any severe weather event that would affect temperature/precipitation prediction markets.
+Include specific cities affected if relevant.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=normal weather, 10=major severe weather event in progress>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on most significant weather event, or 'No severe weather alerts'>",
+  "top_event": "<specific event or location or null>",
+  "confidence": <0.0-1.0>
+}""",
+
+    "tech": """Search for breaking technology and earnings news from the last 2 hours.
+Focus on: major tech earnings beats/misses (Apple, Nvidia, Microsoft, Google, Meta),
+AI model releases or major announcements, semiconductor news, major product launches,
+antitrust actions against tech companies, major outages (cloud providers, social platforms),
+M&A announcements, or any tech event that would shift prediction market probabilities.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=routine tech news, 10=major market-moving event>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on most significant tech event, or 'No major tech news'>",
+  "top_event": "<specific event name or null>",
+  "confidence": <0.0-1.0>
+}""",
+
+    "sports": """Search for breaking sports news from the last 2 hours.
+Focus on: major injury announcements for star players (NBA, NFL, MLB, NHL), game
+postponements or cancellations, coaching changes, trades or signings, suspension
+announcements, or any news that would significantly shift win probability or player
+prop prediction markets. Include specific player names and teams.
+
+Return JSON only:
+{
+  "velocity_score": <1-10, where 1=no impactful news, 10=major injury or trade announcement>,
+  "is_spiking": <true if score >= 7>,
+  "summary": "<one sentence on most market-relevant sports development, or 'No major sports news'>",
+  "top_event": "<specific player/team/event or null>",
+  "confidence": <0.0-1.0>
+}""",
 }
 
-# ── Stop words — filtered out before keyword registration ─────────────────────
-_STOP_WORDS = {
-    "will", "the", "a", "an", "be", "to", "in", "on", "at", "by",
-    "or", "and", "of", "for", "is", "are", "was", "were", "has",
-    "have", "had", "do", "does", "did", "not", "no", "yes", "this",
-    "that", "with", "from", "up", "above", "below", "over", "under",
-    "than", "more", "less", "reach", "hit", "end", "day", "week",
-    "month", "year", "percent", "before", "after", "during", "next",
-    "last", "first", "second", "third", "between", "within",
-    # Generic sport/market words — not useful for news signal
-    "wins", "runs", "points", "goals", "score", "game", "match",
-    "team", "play", "player", "total", "home", "away", "season",
-    "loses", "beats", "versus", "against", "record", "high", "low",
-    "close", "open", "price", "rate", "index", "market", "trade",
-}
+_SYSTEM_PROMPT = (
+    "You are a real-time news intelligence system for a prediction market trading bot. "
+    "Your job is to assess news velocity — how much breaking news is moving prediction "
+    "market probabilities right now. Search the web for events from the last 2 hours only. "
+    "Ignore older news. Return ONLY valid JSON matching the exact structure requested. "
+    "No preamble, no explanation, no markdown."
+)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -122,149 +211,140 @@ def init_news_tables() -> None:
     """)
 
 
-# ── Keyword extraction ────────────────────────────────────────────────────────
+# ── Sector inference ──────────────────────────────────────────────────────────
 
-def _keyword_score(word: str) -> int:
-    """
-    Score a keyword by specificity. Higher = more worth tracking.
-    Proper nouns (capitalized in original) score highest.
-    Longer words score higher than shorter ones.
-    """
-    score = len(word)
-    # Bonus for words that look like proper nouns (names, cities, tickers)
-    if word[0].isupper():
-        score += 5
-    return score
+_SECTOR_KEYWORDS = {
+    "economics": ["cpi", "fed", "fomc", "gdp", "inflation", "rate", "treasury",
+                  "recession", "jobs", "payroll", "copper", "gold", "oil", "sp500",
+                  "dow", "nasdaq", "yield", "tariff"],
+    "crypto":    ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "xrp",
+                  "defi", "nft", "blockchain", "coinbase", "binance"],
+    "politics":  ["election", "president", "congress", "senate", "supreme", "vote",
+                  "democrat", "republican", "ukraine", "nato", "trump", "harris"],
+    "weather":   ["temperature", "hurricane", "tornado", "flood", "snow", "rain",
+                  "storm", "weather", "fahrenheit", "celsius", "blizzard"],
+    "tech":      ["apple", "nvidia", "microsoft", "google", "amazon", "meta",
+                  "tesla", "earnings", "ai", "semiconductor", "iphone"],
+    "sports":    ["nba", "nfl", "mlb", "nhl", "basketball", "football", "baseball",
+                  "points", "touchdown", "player", "team", "game"],
+}
 
 
-def extract_keywords(title: str, max_keywords: int = 3) -> list[str]:
-    """
-    Pull the most specific meaningful words from a market title.
-    Prioritizes proper nouns and longer terms over generic words.
-    Only returns keywords >= _MIN_KEYWORD_LEN chars.
-    """
-    import re
-
-    # Extract words, preserving case for scoring
-    raw_words = re.findall(r"[a-zA-Z]{3,}", title)
-
-    # Filter stop words and short words
-    candidates = [
-        w for w in raw_words
-        if w.lower() not in _STOP_WORDS and len(w) >= _MIN_KEYWORD_LEN
-    ]
-
-    # Deduplicate (case-insensitive)
-    seen, unique = set(), []
-    for w in candidates:
-        if w.lower() not in seen:
-            seen.add(w.lower())
-            unique.append(w)
-
-    # Sort by specificity score — keeps proper nouns and longer terms
-    unique.sort(key=_keyword_score, reverse=True)
-
-    # Return lowercase for consistent cache keys
-    return [w.lower() for w in unique[:max_keywords]]
+def _infer_sector(market_title: str) -> str:
+    title_lower = market_title.lower()
+    scores = {sector: 0 for sector in _SECTOR_KEYWORDS}
+    for sector, keywords in _SECTOR_KEYWORDS.items():
+        for kw in keywords:
+            if kw in title_lower:
+                scores[sector] += 1
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "economics"
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class NewsSignal:
     """
-    Background news velocity tracker using NewsData.io.
+    Real-time news velocity signal using Perplexity Sonar.
 
-    v3 key improvements:
-    - NewsData.io: 200 req/day free, commercial OK, category filtering
-    - 20 keyword cap (was 50) — 4 batches/cycle instead of 10
-    - Sector-aware category fallback for broader signal coverage
-    - Daily budget hard stop at 180 requests
-    - Proper noun prioritization in keyword extraction
+    v4 key changes:
+    - Perplexity sector queries instead of keyword article polling
+    - Real-time web search (not 12hr delayed like NewsData.io free tier)
+    - Synthesized market-relevant signal instead of raw article counts
+    - ~$0.14/day at current scan rates
+    - 15-minute cache per sector prevents API hammering
+    - Public API unchanged — drop-in replacement for v2/v3
     """
 
     def __init__(
         self,
         api_key:                  Optional[str] = None,
-        poll_interval_sec:        int   = 300,
+        poll_interval_sec:        int   = 1800,  # 30 min sector refresh
         velocity_window_min:      int   = 30,
         velocity_spike_threshold: float = 2.0,
     ):
-        self.api_key                  = api_key or os.getenv("NEWSDATA_KEY", "") or os.getenv("NEWSAPI_KEY", "")
+        self.api_key = (
+            api_key
+            or os.getenv("PERPLEXITY_API_KEY", "")
+            or os.getenv("PERPLEXITY_KEY", "")
+        )
         self.poll_interval_sec        = poll_interval_sec
         self.velocity_window_min      = velocity_window_min
         self.velocity_spike_threshold = velocity_spike_threshold
 
-        self._cache: dict[str, dict]    = {}
-        self._lock                      = threading.Lock()
-        self._active_keywords: set[str] = set()
-        self._daily_request_count       = 0
-        self._daily_reset_date: str     = ""
-        self._last_request_ts           = 0.0
+        self._sector_cache: dict[str, dict] = {}
+        self._lock              = threading.Lock()
+        self._last_request_ts   = 0.0
+        self._daily_query_count = 0
+        self._daily_reset_date  = ""
 
         init_news_tables()
 
         if not self.api_key:
             logger.warning(
-                "NewsSignal: NEWSDATA_KEY not set — velocity signals disabled. "
-                "Get a free key at newsdata.io (200 req/day, commercial OK)"
+                "NewsSignal: PERPLEXITY_API_KEY not set — velocity signals disabled."
             )
         else:
             logger.info(
-                "NewsSignal ready | provider=newsdata.io interval=%ds "
-                "batch_size=%d max_keywords=%d daily_budget=%d",
-                poll_interval_sec, _BATCH_SIZE, _MAX_KEYWORDS, _DAILY_BUDGET,
+                "NewsSignal v4 ready | provider=perplexity model=%s "
+                "poll_interval=%ds cache_ttl=%dmin",
+                _MODEL, poll_interval_sec, _CACHE_TTL_MINUTES,
             )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def register_market(self, market_title: str) -> None:
         """
-        Register high-value keywords from a market title for velocity tracking.
-        Evicts lowest-score keywords when cap is reached.
+        v4: sector-level tracking, no per-keyword registration needed.
+        Kept for API compatibility — no-op.
         """
-        keywords = extract_keywords(market_title)
-        if not keywords:
-            return
-
-        with self._lock:
-            for kw in keywords:
-                if kw in self._active_keywords:
-                    continue
-                if len(self._active_keywords) >= _MAX_KEYWORDS:
-                    # Evict shortest keyword to make room for more specific one
-                    shortest = min(self._active_keywords, key=len)
-                    if len(kw) <= len(shortest):
-                        continue  # New keyword is no better — skip it
-                    self._active_keywords.discard(shortest)
-                    logger.debug(
-                        "NewsSignal: evicted '%s' (len=%d) for '%s' (len=%d)",
-                        shortest, len(shortest), kw, len(kw),
-                    )
-                self._active_keywords.add(kw)
+        pass
 
     def get_velocity(self, market_title: str) -> float:
-        """Return max velocity score for any keyword in the market title."""
+        """
+        Return velocity score for a market based on its sector's news signal.
+        Normalizes 1-10 sector score to ratio format for feature vector compat.
+        """
         if not self.api_key:
             return 0.0
-        keywords = extract_keywords(market_title)
-        if not keywords:
-            return 0.0
-        max_velocity = 0.0
+
+        sector = _infer_sector(market_title)
+
         with self._lock:
-            for kw in keywords:
-                entry = self._cache.get(kw)
-                if entry:
-                    max_velocity = max(max_velocity, entry.get("velocity", 0.0))
-        return max_velocity
+            cached = self._sector_cache.get(sector)
+
+        if cached:
+            # Normalize 1-10 → ratio (1.0 = baseline, 5.0 = major spike)
+            return cached.get("score", 1.0) / 2.0
+
+        # No cache — trigger async refresh and return neutral baseline
+        self._trigger_sector_refresh(sector)
+        return 1.0
 
     def get_velocity_features(self, market_title: str) -> tuple[float, float]:
         """Return (velocity_score, is_spiking) for feature vector injection."""
-        velocity   = self.get_velocity(market_title)
-        is_spiking = 1.0 if velocity >= self.velocity_spike_threshold else 0.0
-        return velocity, is_spiking
+        sector = _infer_sector(market_title)
+
+        with self._lock:
+            cached = self._sector_cache.get(sector)
+
+        if cached:
+            velocity   = cached.get("score", 1.0) / 2.0
+            is_spiking = 1.0 if cached.get("is_spiking", False) else 0.0
+            return velocity, is_spiking
+
+        return 1.0, 0.0
+
+    def get_sector_summary(self, sector: str) -> str:
+        """
+        Return the latest news summary for a sector.
+        Can be used by orchestrator for enhanced logging/context.
+        """
+        with self._lock:
+            cached = self._sector_cache.get(sector)
+        return cached.get("summary", "No recent data") if cached else "No recent data"
 
     def start_background_poller(self) -> None:
-        """Launch background polling thread. Call once on startup."""
         if not self.api_key:
             return
         t = threading.Thread(
@@ -274,8 +354,8 @@ class NewsSignal:
         )
         t.start()
         logger.info(
-            "NewsSignal background poller started (interval=%ds)",
-            self.poll_interval_sec,
+            "NewsSignal background poller started (interval=%ds, sectors=%d)",
+            self.poll_interval_sec, len(_SECTOR_PROMPTS),
         )
 
     # ── Background poller ──────────────────────────────────────────────────────
@@ -283,161 +363,148 @@ class NewsSignal:
     def _poll_loop(self) -> None:
         while True:
             try:
-                self._refresh_all()
+                self._refresh_all_sectors()
             except Exception as e:
                 logger.error("NewsSignal poll error: %s", e)
             time.sleep(self.poll_interval_sec)
 
-    def _reset_daily_counter_if_needed(self) -> None:
-        """Reset daily request counter at midnight UTC."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today != self._daily_reset_date:
-            if self._daily_request_count > 0:
-                logger.info(
-                    "NewsSignal: daily reset — used %d/%d requests yesterday",
-                    self._daily_request_count, _DAILY_BUDGET,
-                )
-            self._daily_request_count = 0
-            self._daily_reset_date    = today
-
-    def _refresh_all(self) -> None:
-        """
-        Poll NewsData.io for all active keywords in batches of _BATCH_SIZE.
-        Hard stops when daily budget is reached.
-        """
+    def _refresh_all_sectors(self) -> None:
         self._reset_daily_counter_if_needed()
 
-        if self._daily_request_count >= _DAILY_BUDGET:
-            logger.warning(
-                "NewsSignal: daily budget reached (%d/%d) — skipping refresh",
-                self._daily_request_count, _DAILY_BUDGET,
-            )
-            return
-
-        with self._lock:
-            keywords = list(self._active_keywords)
-
-        if not keywords:
-            return
-
-        batches = [
-            keywords[i:i + _BATCH_SIZE]
-            for i in range(0, len(keywords), _BATCH_SIZE)
-        ]
-
         logger.info(
-            "NewsSignal refresh: %d keywords → %d batches (daily_requests=%d/%d)",
-            len(keywords), len(batches),
-            self._daily_request_count, _DAILY_BUDGET,
+            "NewsSignal: refreshing sectors (daily_queries=%d)",
+            self._daily_query_count,
         )
 
-        for batch in batches:
-            # Check budget before each request
-            if self._daily_request_count >= _DAILY_BUDGET:
-                logger.warning("NewsSignal: budget hit mid-refresh — stopping")
-                break
+        for sector in _SECTOR_PROMPTS:
+            with self._lock:
+                cached = self._sector_cache.get(sector)
 
-            try:
-                # Rate limit — minimum gap between requests
-                elapsed = time.time() - self._last_request_ts
-                if elapsed < _MIN_REQUEST_GAP:
-                    time.sleep(_MIN_REQUEST_GAP - elapsed)
+            if cached:
+                age_min = (
+                    datetime.now(timezone.utc) - cached["ts"]
+                ).total_seconds() / 60
+                if age_min < _CACHE_TTL_MINUTES:
+                    logger.debug("NewsSignal: %s cache fresh (%.1fmin)", sector, age_min)
+                    continue
 
-                counts = self._fetch_batch_counts(batch)
-                self._last_request_ts      = time.time()
-                self._daily_request_count += 1
+            self._query_sector(sector)
+            time.sleep(_MIN_REQUEST_GAP)
 
-                for kw, count in counts.items():
-                    velocity = self._compute_velocity(kw, count)
-
-                    with self._lock:
-                        self._cache[kw] = {
-                            "count":    count,
-                            "velocity": velocity,
-                            "ts":       datetime.now(timezone.utc),
-                        }
-
-                    if velocity >= self.velocity_spike_threshold:
-                        logger.info(
-                            "[NEWS SPIKE] keyword='%s' velocity=%.2f count=%d",
-                            kw, velocity, count,
-                        )
-
-                    self._persist(kw, count, velocity)
-
-            except Exception as e:
-                logger.warning("NewsSignal batch failed %s: %s", batch, e)
-
-        logger.info(
-            "NewsSignal refresh complete | daily_requests=%d/%d",
-            self._daily_request_count, _DAILY_BUDGET,
+    def _trigger_sector_refresh(self, sector: str) -> None:
+        """Non-blocking single sector refresh."""
+        t = threading.Thread(
+            target=self._query_sector,
+            args=(sector,),
+            daemon=True,
+            name=f"news-refresh-{sector}",
         )
+        t.start()
 
-    def _fetch_batch_counts(self, keywords: list[str]) -> dict[str, int]:
-        """
-        Fetch article counts for a batch of keywords using NewsData.io.
-        Uses OR-joined query string across all keywords in the batch.
-        Returns dict of keyword → estimated count (evenly split from total).
-        """
+    def _query_sector(self, sector: str) -> None:
+        """Query Perplexity for news velocity in one sector."""
+        if not self.api_key:
+            return
+
+        prompt = _SECTOR_PROMPTS.get(sector)
+        if not prompt:
+            return
+
+        try:
+            elapsed = time.time() - self._last_request_ts
+            if elapsed < _MIN_REQUEST_GAP:
+                time.sleep(_MIN_REQUEST_GAP - elapsed)
+
+            raw = self._call_perplexity(prompt)
+            self._last_request_ts    = time.time()
+            self._daily_query_count += 1
+
+            if not raw:
+                return
+
+            parsed = self._parse_response(raw)
+            if not parsed:
+                return
+
+            score      = float(parsed.get("velocity_score", 1))
+            is_spiking = bool(parsed.get("is_spiking", False))
+            summary    = str(parsed.get("summary", ""))
+            top_event  = parsed.get("top_event")
+            confidence = float(parsed.get("confidence", 0.5))
+
+            with self._lock:
+                self._sector_cache[sector] = {
+                    "score":      score,
+                    "is_spiking": is_spiking,
+                    "summary":    summary,
+                    "top_event":  top_event,
+                    "confidence": confidence,
+                    "ts":         datetime.now(timezone.utc),
+                }
+
+            if is_spiking:
+                logger.info(
+                    "[NEWS SPIKE] sector=%s score=%.1f/10 event=%s | %s",
+                    sector, score, top_event or "unknown", summary,
+                )
+            else:
+                logger.debug(
+                    "NewsSignal: %s score=%.1f/10 | %s", sector, score, summary,
+                )
+
+            self._persist_sector(sector, score)
+
+        except Exception as e:
+            logger.warning("NewsSignal query failed sector=%s: %s", sector, e)
+
+    def _call_perplexity(self, user_prompt: str) -> Optional[str]:
+        """Make a Perplexity Sonar API call."""
         import urllib.request
-        import urllib.parse
-        import json
 
-        query = " OR ".join(keywords)
-
-        params = {
-            "apikey":   self.api_key,
-            "q":        query,
-            "language": "en",
-            "size":     1,   # We only need the totalResults count
-        }
-
-        url = f"{_NEWSDATA_URL}?{urllib.parse.urlencode(params)}"
+        payload = json.dumps({
+            "model":    _MODEL,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "max_tokens":       300,
+            "temperature":      0.1,
+            "return_citations": False,
+        }).encode("utf-8")
 
         req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "kalshi-flywheel/3.0"},
+            _PERPLEXITY_URL,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type":  "application/json",
+                "User-Agent":    "kalshi-flywheel/4.0",
+            },
+            method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data  = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
 
-        if data.get("status") != "success":
-            raise ValueError(f"NewsData.io error: {data.get('results', {})}")
+        return data["choices"][0]["message"]["content"].strip()
 
-        total = int(data.get("totalResults", 0))
+    def _parse_response(self, raw: str) -> Optional[dict]:
+        """Parse JSON response, handling markdown code fences."""
+        try:
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            return json.loads(clean)
+        except json.JSONDecodeError:
+            match = re.search(r'\{[^{}]+\}', raw, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except Exception:
+                    pass
+            logger.warning("NewsSignal: could not parse response: %s", raw[:200])
+            return None
 
-        # Distribute count evenly across keywords in the batch
-        per_kw = total // len(keywords) if keywords else 0
-        return {kw: per_kw for kw in keywords}
-
-    def _compute_velocity(self, keyword: str, current_count: int) -> float:
-        """
-        Compute velocity as ratio of current count vs recent baseline.
-        Returns 1.0 if no historical data (neutral signal).
-        """
-        p    = _ph()
-        rows = _db_execute(
-            f"""
-            SELECT article_count FROM news_velocity
-            WHERE keyword = {p}
-            ORDER BY recorded_at DESC
-            LIMIT 6
-            """,
-            (keyword,),
-            fetch=True,
-        )
-
-        if not rows:
-            return 1.0
-
-        baseline = sum(r["article_count"] for r in rows) / len(rows)
-        if baseline <= 0:
-            return 1.0
-
-        return round(current_count / baseline, 4)
-
-    def _persist(self, keyword: str, count: int, velocity: float) -> None:
+    def _persist_sector(self, sector: str, score: float) -> None:
+        """Persist to DB for audit trail and weekly analysis."""
         p   = _ph()
         now = datetime.now(timezone.utc)
         _db_execute(
@@ -448,8 +515,19 @@ class NewsSignal:
             VALUES ({p}, {p}, {p}, {p}, {p}, {p})
             """,
             (
-                keyword, count, velocity,
+                f"sector:{sector}", 0, score,
                 now - timedelta(minutes=self.velocity_window_min),
                 now, now,
             ),
         )
+
+    def _reset_daily_counter_if_needed(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._daily_reset_date:
+            if self._daily_query_count > 0:
+                logger.info(
+                    "NewsSignal: daily reset — %d Perplexity queries yesterday",
+                    self._daily_query_count,
+                )
+            self._daily_query_count = 0
+            self._daily_reset_date  = today
