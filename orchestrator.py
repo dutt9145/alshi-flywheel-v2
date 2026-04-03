@@ -1,11 +1,14 @@
 """
-orchestrator.py  (v19.1 — fix created_at → logged_at in outcomes query)
+orchestrator.py  (v19.2 — block uncalibrated structural markets in corr + restime)
 
-Changes vs v19:
-  1. _ingest_resolved_markets: outcomes incremental query used "created_at"
-     which does not exist — corrected to "logged_at" matching the actual
-     schema. Was causing every ingestion run to fall back to a full table
-     scan of all outcomes instead of the incremental min_ts filter.
+Changes vs v19.1:
+  1. _execute_correlations: added _STRUCTURAL_MARKET_BLOCKLIST check so
+     KXMVECROSS* and KXMVESPORTSMULTIGAME* markets cannot be traded via
+     the correlation engine, bypassing the SportsBot.is_relevant() guard.
+  2. _execute_resolution_timing: same blocklist applied so ResolutionTimer
+     cannot leg into these markets either.
+  3. _STRUCTURAL_MARKET_BLOCKLIST defined at module level so both methods
+     share the same source of truth as SportsBot._SINGLE_GAME_BLOCKLIST.
 """
 
 import logging
@@ -84,6 +87,27 @@ def _has_sports_prefix(market: dict) -> bool:
         et.startswith(p) or tk.startswith(p) or tk_norm.startswith(p)
         for p in _SPORTS_PREFIXES
     )
+
+
+# ── Structural market blocklist ────────────────────────────────────────────────
+# Mirrors SportsBot._SINGLE_GAME_BLOCKLIST. Applied in _execute_correlations
+# and _execute_resolution_timing which bypass SportsBot.is_relevant().
+# Remove entries here AND in SportsBot._SINGLE_GAME_BLOCKLIST together when
+# re-enabling a market type after Brier ≤ 0.10 on single-game sports.
+_STRUCTURAL_MARKET_BLOCKLIST = (
+    "kxmvecrosscategory",
+    "kxmvecrosscat",
+    "kxmvecross",
+    "kxmvesportsmultigameextended",
+    "kxmvesportsmultigame",
+    "kxmvesportsmulti",
+)
+
+
+def _is_blocked_structural_market(ticker: str) -> bool:
+    """Return True if ticker matches an uncalibrated structural market type."""
+    tk = _UUID_SUFFIX_RE.sub('', ticker.lower())
+    return any(tk.startswith(p) for p in _STRUCTURAL_MARKET_BLOCKLIST)
 
 
 # ── Scan page rate-limit guard ─────────────────────────────────────────────────
@@ -420,19 +444,11 @@ class FlywheelOrchestrator:
                 for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
             }
 
-        # FIX 2: Track tickers processed during THIS ingestion run.
-        # If log_outcome fails (e.g. DB error), the ticker is still recorded
-        # here so the same market isn't re-resolved on the next loop iteration,
-        # which was causing phantom P&L accumulation in the $200K+ range.
         processed_this_run: set[str] = set()
 
         recorded = 0
 
         for market in resolved_markets:
-            # FIX 3: Stop processing further resolutions if the circuit breaker
-            # has already tripped. Without this check, record_pnl() calls kept
-            # accumulating the same losses on each re-resolution tick even after
-            # the daily limit was breached, inflating the reported loss figure.
             if self.circuit_breaker.is_halted():
                 logger.warning(
                     "Circuit breaker active — stopping ingestion early to prevent "
@@ -475,8 +491,6 @@ class FlywheelOrchestrator:
                     )
 
             if not sig_rows:
-                # FIX 2: Still mark as processed even with no signal rows, so
-                # we don't loop over this market again in the same ingestion run.
                 processed_this_run.add(ticker)
                 continue
 
@@ -488,9 +502,6 @@ class FlywheelOrchestrator:
                 (direction == "NO"  and not resolved_yes)
             )
 
-            # FIX 1: _calculate_pnl now returns (pnl, list[int]) instead of
-            # (pnl, comma-joined-string). Pass trade_ids[0] as the primary key
-            # to log_outcome so it can safely call int() on it.
             pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
             primary_trade_id   = trade_ids[0] if trade_ids else None
 
@@ -515,9 +526,6 @@ class FlywheelOrchestrator:
                     ticker, result.upper(),
                 )
 
-            # FIX 2: Mark ticker as processed BEFORE calling log_outcome.
-            # If log_outcome raises, the ticker is already in processed_this_run
-            # so it won't be re-processed in the same ingestion pass.
             processed_this_run.add(ticker)
 
             try:
@@ -525,7 +533,7 @@ class FlywheelOrchestrator:
                     ticker   = ticker,
                     resolved = result.upper(),
                     pnl_usd  = pnl_usd,
-                    trade_id = primary_trade_id,   # FIX 1: int, not comma-string
+                    trade_id = primary_trade_id,
                     our_prob = our_prob,
                     correct  = direction_correct,
                 )
@@ -832,9 +840,17 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
-            # FIX: Infer sector from the event group ticker instead of
-            # hardcoding "economics" — KXMVE sports markets were being booked
-            # under economics, corrupting per-sector Brier scores and loss caps.
+            # ── Block uncalibrated structural market types ─────────────────
+            # CorrelationEngine bypasses SportsBot.is_relevant(), so we must
+            # enforce the same blocklist here. Remove entries from
+            # _STRUCTURAL_MARKET_BLOCKLIST when re-enabling a market type.
+            if _is_blocked_structural_market(sig.event_group):
+                logger.info(
+                    "CORR BLOCKED (uncalibrated structural market): %s",
+                    sig.event_group,
+                )
+                continue
+
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
 
             logger.info(
@@ -884,6 +900,16 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
+            # ── Block uncalibrated structural market types ─────────────────
+            # ResolutionTimer bypasses SportsBot.is_relevant(), so we must
+            # enforce the same blocklist here.
+            if _is_blocked_structural_market(sig.ticker):
+                logger.info(
+                    "RESTIME BLOCKED (uncalibrated structural market): %s",
+                    sig.ticker,
+                )
+                continue
+
             from shared.consensus_engine import ConsensusResult
             mock_consensus = ConsensusResult(
                 ticker         = sig.ticker,
@@ -920,8 +946,6 @@ class FlywheelOrchestrator:
                 page_sleep_sec=SCAN_PAGE_SLEEP_SEC,
             )
         except TypeError:
-            # Older kalshi_client that doesn't accept page_sleep_sec yet —
-            # fall back gracefully; add the param when you update kalshi_client.
             try:
                 markets = self.client.get_all_open_markets()
             except Exception as e:
@@ -985,7 +1009,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.1 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.2 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
