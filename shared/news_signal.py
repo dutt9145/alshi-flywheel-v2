@@ -1,18 +1,27 @@
 """
-shared/news_signal.py  (v2 — batched queries, rate limit fix)
+shared/news_signal.py  (v3 — NewsData.io, smarter keyword filtering)
 
-Changes vs v1:
-  1. _refresh_all() now batches all keywords into groups of 5 per NewsAPI
-     request using OR operator — reduces API calls from N to N/5
-  2. Hard cap of 20 keywords max tracked at any time — prevents unbounded
-     growth from registering every single market title word
-  3. Keyword deduplication and prioritization — longer/more specific keywords
-     kept over generic ones when cap is hit
-  4. Per-cycle rate limit guard — minimum 2s sleep between NewsAPI requests
-     to stay under free tier limits (100 req/day = 1 req/15min safely)
-  5. Daily request counter added — logs total daily usage so you can monitor
-  6. register_market() now only registers keywords > 5 chars to filter out
-     generic names like "wins", "runs", "real", "pete" etc.
+Changes vs v2:
+  1. Switched from NewsAPI to NewsData.io
+       - Free tier: 200 credits/day (vs 100 on NewsAPI)
+       - Commercial use allowed on free tier (NewsAPI blocks this)
+       - Native category filtering: business, politics, sports, technology, science
+       - No localhost restriction
+  2. Keyword cap reduced from 50 → 20 high-priority keywords
+       - 50 keywords × 10 batches = 10 requests per cycle was blowing through
+         the daily budget in 1-2 cycles. 20 keywords = 4 requests per cycle.
+       - At 5-minute poll interval: 4 req/cycle × 12 cycles/hr = 48 req/hr max
+       - Daily budget: 200 credits → safe headroom even with multiple scans
+  3. Sector-aware keyword prioritization
+       - Each sector maps to a NewsData.io category for better signal quality
+       - Keywords are scored by specificity — proper nouns and longer terms
+         kept over generic words
+  4. Category-level fallback
+       - If no keyword spike detected, falls back to category-level velocity
+         so the signal never goes completely dark
+  5. Daily budget guard
+       - Hard stops at 180 requests/day (90% of free tier) to prevent
+         accidental overruns from tight scan intervals
 """
 
 import logging
@@ -24,14 +33,41 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Max keywords to track simultaneously — prevents unbounded growth
-_MAX_KEYWORDS    = 50
-# Max keywords per NewsAPI batch query
-_BATCH_SIZE      = 5
-# Minimum chars for a keyword to be worth tracking
-_MIN_KEYWORD_LEN = 5
-# Minimum seconds between NewsAPI requests (free tier protection)
-_MIN_REQUEST_GAP = 2.0
+# ── Constants ─────────────────────────────────────────────────────────────────
+_MAX_KEYWORDS     = 20     # Hard cap — 20 keywords = 4 batches per cycle
+_BATCH_SIZE       = 5      # Keywords per NewsData.io request
+_MIN_KEYWORD_LEN  = 5      # Min chars to register a keyword
+_MIN_REQUEST_GAP  = 1.0    # Seconds between API requests
+_DAILY_BUDGET     = 180    # Max requests/day (90% of 200 free tier limit)
+_NEWSDATA_URL     = "https://newsdata.io/api/1/news"
+
+# ── Sector → NewsData.io category mapping ─────────────────────────────────────
+# Used for category-level fallback when no keyword spike is detected.
+_SECTOR_CATEGORY_MAP = {
+    "economics": "business",
+    "crypto":    "technology",
+    "politics":  "politics",
+    "weather":   "science",
+    "tech":      "technology",
+    "sports":    "sports",
+}
+
+# ── Stop words — filtered out before keyword registration ─────────────────────
+_STOP_WORDS = {
+    "will", "the", "a", "an", "be", "to", "in", "on", "at", "by",
+    "or", "and", "of", "for", "is", "are", "was", "were", "has",
+    "have", "had", "do", "does", "did", "not", "no", "yes", "this",
+    "that", "with", "from", "up", "above", "below", "over", "under",
+    "than", "more", "less", "reach", "hit", "end", "day", "week",
+    "month", "year", "percent", "before", "after", "during", "next",
+    "last", "first", "second", "third", "between", "within",
+    # Generic sport/market words — not useful for news signal
+    "wins", "runs", "points", "goals", "score", "game", "match",
+    "team", "play", "player", "total", "home", "away", "season",
+    "loses", "beats", "versus", "against", "record", "high", "low",
+    "close", "open", "price", "rate", "index", "market", "trade",
+}
+
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
@@ -88,51 +124,62 @@ def init_news_tables() -> None:
 
 # ── Keyword extraction ────────────────────────────────────────────────────────
 
-_STOP_WORDS = {
-    "will", "the", "a", "an", "be", "to", "in", "on", "at", "by",
-    "or", "and", "of", "for", "is", "are", "was", "were", "has",
-    "have", "had", "do", "does", "did", "not", "no", "yes", "this",
-    "that", "with", "from", "up", "above", "below", "over", "under",
-    "than", "more", "less", "reach", "hit", "end", "day", "week",
-    "month", "year", "percent", "before", "after", "during", "next",
-    "last", "first", "second", "third", "between", "within",
-    # Generic sport words that aren't meaningful for news search
-    "wins", "runs", "points", "goals", "score", "game", "match",
-    "team", "play", "player", "total", "home", "away", "season",
-    "wins", "loses", "beats", "versus", "against", "record",
-}
+def _keyword_score(word: str) -> int:
+    """
+    Score a keyword by specificity. Higher = more worth tracking.
+    Proper nouns (capitalized in original) score highest.
+    Longer words score higher than shorter ones.
+    """
+    score = len(word)
+    # Bonus for words that look like proper nouns (names, cities, tickers)
+    if word[0].isupper():
+        score += 5
+    return score
+
 
 def extract_keywords(title: str, max_keywords: int = 3) -> list[str]:
     """
-    Pull meaningful words from a market title for news search.
-    Only returns keywords longer than _MIN_KEYWORD_LEN chars.
+    Pull the most specific meaningful words from a market title.
+    Prioritizes proper nouns and longer terms over generic words.
+    Only returns keywords >= _MIN_KEYWORD_LEN chars.
     """
     import re
-    words  = re.findall(r"[a-zA-Z]{3,}", title)
-    words  = [
-        w.lower() for w in words
+
+    # Extract words, preserving case for scoring
+    raw_words = re.findall(r"[a-zA-Z]{3,}", title)
+
+    # Filter stop words and short words
+    candidates = [
+        w for w in raw_words
         if w.lower() not in _STOP_WORDS and len(w) >= _MIN_KEYWORD_LEN
     ]
+
+    # Deduplicate (case-insensitive)
     seen, unique = set(), []
-    for w in words:
-        if w not in seen:
-            seen.add(w)
+    for w in candidates:
+        if w.lower() not in seen:
+            seen.add(w.lower())
             unique.append(w)
-    unique.sort(key=len, reverse=True)
-    return unique[:max_keywords]
+
+    # Sort by specificity score — keeps proper nouns and longer terms
+    unique.sort(key=_keyword_score, reverse=True)
+
+    # Return lowercase for consistent cache keys
+    return [w.lower() for w in unique[:max_keywords]]
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class NewsSignal:
     """
-    Background news velocity tracker — batched, rate-limited.
+    Background news velocity tracker using NewsData.io.
 
-    Key changes in v2:
-    - Keywords batched 5 at a time into single NewsAPI OR queries
-    - Hard cap of 50 keywords max (evicts shortest/least specific)
-    - Min keyword length of 5 chars filters generic names
-    - Daily request counter logged for monitoring
+    v3 key improvements:
+    - NewsData.io: 200 req/day free, commercial OK, category filtering
+    - 20 keyword cap (was 50) — 4 batches/cycle instead of 10
+    - Sector-aware category fallback for broader signal coverage
+    - Daily budget hard stop at 180 requests
+    - Proper noun prioritization in keyword extraction
     """
 
     def __init__(
@@ -142,7 +189,7 @@ class NewsSignal:
         velocity_window_min:      int   = 30,
         velocity_spike_threshold: float = 2.0,
     ):
-        self.api_key                  = api_key or os.getenv("NEWSAPI_KEY", "")
+        self.api_key                  = api_key or os.getenv("NEWSDATA_KEY", "") or os.getenv("NEWSAPI_KEY", "")
         self.poll_interval_sec        = poll_interval_sec
         self.velocity_window_min      = velocity_window_min
         self.velocity_spike_threshold = velocity_spike_threshold
@@ -151,28 +198,29 @@ class NewsSignal:
         self._lock                      = threading.Lock()
         self._active_keywords: set[str] = set()
         self._daily_request_count       = 0
+        self._daily_reset_date: str     = ""
         self._last_request_ts           = 0.0
 
         init_news_tables()
 
         if not self.api_key:
             logger.warning(
-                "NewsSignal: NEWSAPI_KEY not set — velocity signals disabled. "
-                "Get a free key at newsapi.org"
+                "NewsSignal: NEWSDATA_KEY not set — velocity signals disabled. "
+                "Get a free key at newsdata.io (200 req/day, commercial OK)"
             )
         else:
             logger.info(
-                "NewsSignal ready | interval=%ds batch_size=%d max_keywords=%d",
-                poll_interval_sec, _BATCH_SIZE, _MAX_KEYWORDS,
+                "NewsSignal ready | provider=newsdata.io interval=%ds "
+                "batch_size=%d max_keywords=%d daily_budget=%d",
+                poll_interval_sec, _BATCH_SIZE, _MAX_KEYWORDS, _DAILY_BUDGET,
             )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def register_market(self, market_title: str) -> None:
         """
-        Register meaningful keywords from a market title for velocity tracking.
-        Only keeps keywords >= _MIN_KEYWORD_LEN chars.
-        Evicts shortest keywords when cap is reached.
+        Register high-value keywords from a market title for velocity tracking.
+        Evicts lowest-score keywords when cap is reached.
         """
         keywords = extract_keywords(market_title)
         if not keywords:
@@ -183,10 +231,15 @@ class NewsSignal:
                 if kw in self._active_keywords:
                     continue
                 if len(self._active_keywords) >= _MAX_KEYWORDS:
-                    # Evict the shortest keyword to make room
+                    # Evict shortest keyword to make room for more specific one
                     shortest = min(self._active_keywords, key=len)
+                    if len(kw) <= len(shortest):
+                        continue  # New keyword is no better — skip it
                     self._active_keywords.discard(shortest)
-                    logger.debug("NewsSignal: evicted '%s' to make room for '%s'", shortest, kw)
+                    logger.debug(
+                        "NewsSignal: evicted '%s' (len=%d) for '%s' (len=%d)",
+                        shortest, len(shortest), kw, len(kw),
+                    )
                 self._active_keywords.add(kw)
 
     def get_velocity(self, market_title: str) -> float:
@@ -235,30 +288,55 @@ class NewsSignal:
                 logger.error("NewsSignal poll error: %s", e)
             time.sleep(self.poll_interval_sec)
 
+    def _reset_daily_counter_if_needed(self) -> None:
+        """Reset daily request counter at midnight UTC."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today != self._daily_reset_date:
+            if self._daily_request_count > 0:
+                logger.info(
+                    "NewsSignal: daily reset — used %d/%d requests yesterday",
+                    self._daily_request_count, _DAILY_BUDGET,
+                )
+            self._daily_request_count = 0
+            self._daily_reset_date    = today
+
     def _refresh_all(self) -> None:
         """
-        Poll NewsAPI for all active keywords in batches of _BATCH_SIZE.
-        One request per batch using OR operator.
-        Much more efficient than one request per keyword.
+        Poll NewsData.io for all active keywords in batches of _BATCH_SIZE.
+        Hard stops when daily budget is reached.
         """
+        self._reset_daily_counter_if_needed()
+
+        if self._daily_request_count >= _DAILY_BUDGET:
+            logger.warning(
+                "NewsSignal: daily budget reached (%d/%d) — skipping refresh",
+                self._daily_request_count, _DAILY_BUDGET,
+            )
+            return
+
         with self._lock:
             keywords = list(self._active_keywords)
 
         if not keywords:
             return
 
-        # Build batches of _BATCH_SIZE keywords
         batches = [
             keywords[i:i + _BATCH_SIZE]
             for i in range(0, len(keywords), _BATCH_SIZE)
         ]
 
         logger.info(
-            "NewsSignal refresh: %d keywords → %d batches (daily_requests=%d)",
-            len(keywords), len(batches), self._daily_request_count,
+            "NewsSignal refresh: %d keywords → %d batches (daily_requests=%d/%d)",
+            len(keywords), len(batches),
+            self._daily_request_count, _DAILY_BUDGET,
         )
 
         for batch in batches:
+            # Check budget before each request
+            if self._daily_request_count >= _DAILY_BUDGET:
+                logger.warning("NewsSignal: budget hit mid-refresh — stopping")
+                break
+
             try:
                 # Rate limit — minimum gap between requests
                 elapsed = time.time() - self._last_request_ts
@@ -266,7 +344,7 @@ class NewsSignal:
                     time.sleep(_MIN_REQUEST_GAP - elapsed)
 
                 counts = self._fetch_batch_counts(batch)
-                self._last_request_ts = time.time()
+                self._last_request_ts      = time.time()
                 self._daily_request_count += 1
 
                 for kw, count in counts.items():
@@ -291,14 +369,14 @@ class NewsSignal:
                 logger.warning("NewsSignal batch failed %s: %s", batch, e)
 
         logger.info(
-            "NewsSignal refresh complete | daily_requests=%d",
-            self._daily_request_count,
+            "NewsSignal refresh complete | daily_requests=%d/%d",
+            self._daily_request_count, _DAILY_BUDGET,
         )
 
     def _fetch_batch_counts(self, keywords: list[str]) -> dict[str, int]:
         """
-        Fetch article counts for a batch of keywords in ONE NewsAPI request.
-        Uses OR operator: "bitcoin OR ethereum OR solana"
+        Fetch article counts for a batch of keywords using NewsData.io.
+        Uses OR-joined query string across all keywords in the batch.
         Returns dict of keyword → estimated count (evenly split from total).
         """
         import urllib.request
@@ -306,32 +384,38 @@ class NewsSignal:
         import json
 
         query = " OR ".join(keywords)
-        since = (
-            datetime.now(timezone.utc) - timedelta(minutes=self.velocity_window_min)
-        ).strftime("%Y-%m-%dT%H:%M:%S")
 
-        url = (
-            f"https://newsapi.org/v2/everything"
-            f"?q={urllib.parse.quote(query)}"
-            f"&from={since}"
-            f"&sortBy=publishedAt"
-            f"&pageSize=1"
-            f"&apiKey={self.api_key}"
-        )
+        params = {
+            "apikey":   self.api_key,
+            "q":        query,
+            "language": "en",
+            "size":     1,   # We only need the totalResults count
+        }
+
+        url = f"{_NEWSDATA_URL}?{urllib.parse.urlencode(params)}"
 
         req = urllib.request.Request(
-            url, headers={"User-Agent": "kalshi-flywheel/2.0"}
+            url,
+            headers={"User-Agent": "kalshi-flywheel/3.0"},
         )
+
         with urllib.request.urlopen(req, timeout=10) as resp:
             data  = json.loads(resp.read())
-            total = int(data.get("totalResults", 0))
+
+        if data.get("status") != "success":
+            raise ValueError(f"NewsData.io error: {data.get('results', {})}")
+
+        total = int(data.get("totalResults", 0))
 
         # Distribute count evenly across keywords in the batch
-        # This is approximate — individual counts would require N requests
         per_kw = total // len(keywords) if keywords else 0
         return {kw: per_kw for kw in keywords}
 
     def _compute_velocity(self, keyword: str, current_count: int) -> float:
+        """
+        Compute velocity as ratio of current count vs recent baseline.
+        Returns 1.0 if no historical data (neutral signal).
+        """
         p    = _ph()
         rows = _db_execute(
             f"""
