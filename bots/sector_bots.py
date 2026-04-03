@@ -1,36 +1,15 @@
 """
-bots/sector_bots.py  (v11 — worldwide keyword expansion)
+bots/sector_bots.py  (v11.1 — block cross-category + multi-game extended in SportsBot)
 
-Changes vs v10:
-  WeatherBot:
-    - 200+ worldwide cities added across all continents
-    - Expanded weather phenomena: monsoon, cyclone, typhoon, derecho,
-      polar vortex, nor'easter, dust storm, wildfire smoke, ice storm
-    - Regional weather terms added
-  EconomicsBot:
-    - Global central banks: ECB, BOJ, BOE, RBA, PBOC, SNB, Riksbank
-    - International economic terms: PMI, ISM, Eurozone, G7, G20,
-      IMF, World Bank, OPEC, WTO
-    - Commodity markets: oil, gold, silver, copper, wheat, corn
-  CryptoBot:
-    - 30+ additional coins and tokens
-    - DeFi protocols: Uniswap, Aave, Compound, Curve, MakerDAO
-    - Layer 2s: Arbitrum, Optimism, Polygon, Base
-    - NFT platforms, crypto exchanges
-  PoliticsBot:
-    - International politics: UN, NATO, EU, G7, BRICS
-    - World leaders and elections globally
-    - Geopolitical terms: sanctions, treaty, referendum, coup
-  TechBot:
-    - More companies: Samsung, TSMC, Intel, AMD, Qualcomm, Arm
-    - AI models: GPT, Gemini, Claude, Llama, Grok
-    - Tech events: WWDC, CES, earnings seasons by company
+Changes vs v11:
   SportsBot:
-    - International leagues: Premier League, La Liga, Serie A,
-      Bundesliga, Champions League, Copa America, World Cup
-    - Esports: League of Legends, Valorant, CS2
-    - Combat sports: boxing, wrestling, bjj
-    - Olympic sports, cricket, rugby
+    - Added _SINGLE_GAME_BLOCKLIST to is_relevant(): KXMVECROSS* and
+      KXMVESPORTSMULTIGAME* prefixes are now rejected until Sports Brier
+      score on single-game markets reaches ≤ 0.10 with sufficient samples.
+    - Removed the blocked prefixes from KEYWORDS so _search_fields()
+      cannot re-admit them via keyword match after the prefix guard fires.
+    - "kxmvesports" (base, single-game) and "kxmvecbchampionship" are
+      intentionally kept — they are not structural multi-leg markets.
 """
 
 import asyncio
@@ -753,18 +732,37 @@ class TechBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  6. SPORTS BOT  (v11 — international leagues + esports + combat sports)
+#  6. SPORTS BOT  (v11.1 — block cross-category + multi-game extended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SportsBot(BaseBot):
     """
     US + international sports, esports, combat sports, Olympic events.
+
+    v11.1: KXMVECROSS* and KXMVESPORTSMULTIGAME* market types are blocked
+    from is_relevant() until the Sports Brier score on single-game markets
+    reaches ≤ 0.10. These structural multi-leg markets have zero calibration
+    data and were driving the $-5,548 simulated drawdown. Re-enable by
+    removing prefixes from _SINGLE_GAME_BLOCKLIST when ready.
     """
+
+    # ── Structural market blocklist ────────────────────────────────────────────
+    # Remove entries here (not from KEYWORDS) when you want to re-enable a type.
+    _SINGLE_GAME_BLOCKLIST = (
+        "kxmvecrosscategory",
+        "kxmvecrosscat",
+        "kxmvecross",
+        "kxmvesportsmultigameextended",
+        "kxmvesportsmultigame",
+        "kxmvesportsmulti",
+    )
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
-        "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
-        "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
+        # NOTE: kxmvecross*, kxmvesportsmulti* intentionally removed —
+        # blocked via _SINGLE_GAME_BLOCKLIST until Brier ≤ 0.10 on singles.
+        # kxmvecbchampionship and kxmvesports (base) are kept.
+        "kxmvesports",
         "kxmvecbchampionship",
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
@@ -844,8 +842,7 @@ class SportsBot(BaseBot):
         "kxnba":  "NBA", "kxnfl":  "NFL", "kxmlb": "MLB",
         "kxnhl":  "NHL", "kxmls":  "MLS", "kxufc": "UFC",
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
-        "kxmvesports": "NBA", "kxmvecross": "NBA",
-        "kxmvecbchampionship": "NCAAB",
+        "kxmvesports": "NBA", "kxmvecbchampionship": "NCAAB",
         "kxepl": "EPL", "kxsoccer": "MLS",
         "kxtennis": "ATP", "kxf1": "F1",
         "kxboxing": "BOXING", "kxgolf": "PGA",
@@ -856,6 +853,15 @@ class SportsBot(BaseBot):
         return "sports"
 
     def is_relevant(self, market: dict) -> bool:
+        et = market.get("event_ticker", "").lower()
+        tk = market.get("ticker", "").lower()
+
+        # ── Block uncalibrated structural market types ─────────────────────
+        # These fire with high fake confidence but have no training data.
+        # Re-enable by removing prefixes from _SINGLE_GAME_BLOCKLIST above.
+        if any(et.startswith(p) or tk.startswith(p) for p in self._SINGLE_GAME_BLOCKLIST):
+            return False
+
         return _search_fields(market, self.KEYWORDS)
 
     def _extract_teams_and_league(self, market: dict) -> tuple[str, str, str]:
