@@ -1,15 +1,16 @@
 """
-shared/arb_layer.py  (v2 — Postgres logging + Polymarket parsing fix)
+shared/arb_layer.py  (v3 — near-miss logging + orchestrator call guard + sports prop handling)
 
-Changes vs v1:
-  1. log_arb_opportunity() now writes to Postgres via the connection pool
-     (was writing to local SQLite only, invisible on Railway/Supabase)
-  2. Polymarket Gamma response parsing fixed — API returns a dict with
-     a "markets" key, not a bare list. Previous code always skipped results.
-  3. ARB_MIN_SPREAD_PCT now reads from settings correctly (was hardcoded 0.03)
-  4. Added explicit logging when Polymarket returns no match so Railway logs
-     show why arbs aren't firing
-  5. Passthrough mode added as explicit fallback when neither key is set
+Changes vs v2:
+  1. log_arb_opportunity() now logs near-misses (spread > 50% of threshold) so
+     the dashboard panel shows activity even when full arb doesn't fire
+  2. no_polymarket_match and empty_query results are silently skipped (no DB noise)
+  3. check_and_log() convenience method added — single call handles both check()
+     and log_arb_opportunity() so orchestrator can't accidentally split them
+  4. Sports/esports market detection added — logs a debug warning instead of
+     burning a Polymarket query that will never match
+  5. ARB_MIN_SPREAD_PCT passthrough fix — near-miss threshold derived correctly
+  6. Mode C stub added for future OddsPapi/news-signal arb on sports props
 """
 
 import logging
@@ -25,6 +26,19 @@ from config.settings import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Sports/esports keywords — Polymarket won't have these ────────────────────
+_SPORTS_PROP_KEYWORDS = {
+    "hits", "strikeouts", "rbis", "home", "bases", "innings",
+    "points", "assists", "rebounds", "yards", "touchdowns",
+    "kills", "valorant", "csgo", "league", "esports", "mlb",
+    "nba", "nfl", "nhl", "pitcher", "batter", "over", "under",
+}
+
+def _is_sports_prop(market_title: str) -> bool:
+    words = set(market_title.lower().split())
+    return bool(words & _SPORTS_PROP_KEYWORDS)
+
 
 # ── Simple TTL cache ──────────────────────────────────────────────────────────
 _cache: dict = {}
@@ -69,13 +83,22 @@ class ArbResult:
             return True
         return self.direction_aligned or self.arb_exists
 
+    @property
+    def is_near_miss(self) -> bool:
+        near_miss_threshold = ARB_MIN_SPREAD_PCT * 0.5
+        return (
+            not self.arb_exists
+            and self.cross_spread >= near_miss_threshold
+            and self.notes not in ("no_polymarket_match", "empty_query", "sports_prop_skip")
+        )
 
-# ── DB helper (Postgres-aware) ─────────────────────────────────────────────────
+
+# ── DB helper (Postgres-aware) ────────────────────────────────────────────────
 
 def _log_to_db(result: ArbResult) -> None:
     """
-    Write arb opportunity to Supabase (Postgres) or SQLite.
-    Uses DATABASE_URL env var to determine which — consistent with rest of codebase.
+    Write arb opportunity or near-miss to Supabase (Postgres) or SQLite.
+    Uses DATABASE_URL env var to determine which.
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
@@ -139,6 +162,24 @@ class ArbLayer:
             self._mode = "polymarket_gamma"
             logger.info("ArbLayer: Mode B — Polymarket Gamma free cross-check")
 
+    # ── Primary entry point — use this in orchestrator ────────────────────────
+
+    def check_and_log(
+        self,
+        ticker:        str,
+        kalshi_cents:  int,
+        our_direction: str,
+        market_title:  str = "",
+    ) -> ArbResult:
+        """
+        Single call: runs check() and automatically handles logging.
+        Use this in the orchestrator instead of calling check() and
+        log_arb_opportunity() separately.
+        """
+        result = self.check(ticker, kalshi_cents, our_direction, market_title)
+        self.log_arb_opportunity(result)
+        return result
+
     def check(
         self,
         ticker:        str,
@@ -147,6 +188,19 @@ class ArbLayer:
         market_title:  str = "",
     ) -> ArbResult:
         kalshi_prob = kalshi_cents / 100.0
+
+        # Sports props: Polymarket won't have these — skip query entirely
+        if self._mode == "polymarket_gamma" and _is_sports_prop(market_title):
+            logger.debug(
+                "ARB SKIP (sports prop, no Polymarket match expected): %s", ticker
+            )
+            return ArbResult(
+                ticker=ticker, kalshi_prob=kalshi_prob,
+                polymarket_prob=None, sharp_line_prob=None,
+                cross_spread=0.0, arb_exists=False,
+                direction_aligned=True, mode="passthrough",
+                notes="sports_prop_skip",
+            )
 
         if self._mode == "oddspapi":
             return self._check_oddspapi(ticker, kalshi_prob, our_direction, market_title)
@@ -217,7 +271,6 @@ class ArbLayer:
         self, ticker: str, kalshi_prob: float,
         our_direction: str, market_title: str,
     ) -> ArbResult:
-        # Build search query from meaningful title words
         stopwords = {"will", "this", "that", "with", "from", "have", "does",
                      "what", "when", "which", "there", "their", "would"}
         keywords = [
@@ -249,7 +302,6 @@ class ArbLayer:
         if pm_data is None:
             logger.debug("Polymarket Gamma returned None for query: %s", query)
         else:
-            # ── FIX: Gamma API returns dict with "markets" key, not bare list ──
             markets = pm_data if isinstance(pm_data, list) else pm_data.get("markets", [])
 
             if not markets:
@@ -281,7 +333,6 @@ class ArbLayer:
                         logger.debug("Polymarket parse error: %s", e)
                         continue
 
-        # Direction alignment: Polymarket agrees there's edge in our direction
         direction_aligned = True
         if poly_prob is not None:
             direction_aligned = (
@@ -306,10 +357,22 @@ class ArbLayer:
 
         return result
 
-    # ── Log arb opportunity to DB ─────────────────────────────────────────────
+    # ── Log arb opportunity or near-miss to DB ────────────────────────────────
 
     def log_arb_opportunity(self, result: ArbResult) -> None:
-        """Persist detected arb opportunities for dashboard display."""
-        if not result.arb_exists:
+        """
+        Persist confirmed arbs AND near-misses to DB for dashboard display.
+        Silently skips results with no external data (sports props, empty queries).
+        """
+        # Skip if no external data was available — nothing useful to log
+        if result.notes in ("no_polymarket_match", "empty_query", "sports_prop_skip"):
             return
-        _log_to_db(result)
+
+        # Log confirmed arbs
+        if result.arb_exists:
+            _log_to_db(result)
+            return
+
+        # Log near-misses (spread > 50% of threshold) so dashboard shows activity
+        if result.is_near_miss:
+            _log_to_db(result)

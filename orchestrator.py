@@ -1,24 +1,20 @@
 """
-orchestrator.py  (v19.3 — fix double-Kelly penalty on exploration sectors)
+orchestrator.py  (v19.4 — arb check_and_log consolidation + near-miss logging)
 
-Changes vs v19.2:
-  1. _execute_trade: removed the `* kf / 0.25` baked into drawdown_factor.
-     Previously, sector_kelly_fraction() returned KELLY_FRACTION *
-     EXPLORATION_KELLY_FRACTION (= 0.0625), and dividing by 0.25 then
-     passing that into kelly_stake() caused kelly_stake() to multiply by
-     KELLY_FRACTION a second time — producing 6.25% effective Kelly instead
-     of the intended 25%. On a ~$650 live demo bankroll, this collapsed
-     sports stakes below the $1 floor → every sports trade sized to zero →
-     no sports trades executed → no resolved trades → Brier score never
-     populated for sports.
+Changes vs v19.3:
+  1. _evaluate_market: replaced split arb.check() + arb.log_arb_opportunity()
+     calls with single arb.check_and_log(). Previously, log_arb_opportunity()
+     was only called when arb_exists=True — near-misses and direction-aligned
+     signals were silently dropped, leaving the dashboard arb panel permanently
+     empty. check_and_log() handles both confirmed arbs and near-misses in one
+     call per arb_layer v3 logic.
 
-  2. Exploration scaling is now applied POST-sizing as a clean multiplier
-     on the already-computed Kelly stake, so KELLY_FRACTION is only applied
-     once (inside kelly_sizer.py, where it belongs).
+  2. NewsSignal 401 guard: news.start_background_poller() is now wrapped in a
+     try/except so a bad API key doesn't crash startup. NewsSignal failures are
+     logged as WARNING, not ERROR, and the orchestrator continues without news.
 
-  3. Rationale logging improved: "Sizing zero" now includes the sizer's
-     rationale string so root cause is visible in Railway logs without
-     adding a separate debug log line.
+  3. No logic changes to Kelly sizing, circuit breaker, or resolution ingestion
+     from v19.3.
 """
 
 import logging
@@ -101,10 +97,6 @@ def _has_sports_prefix(market: dict) -> bool:
 
 
 # ── Structural market blocklist ────────────────────────────────────────────────
-# Mirrors SportsBot._SINGLE_GAME_BLOCKLIST. Applied in _execute_correlations
-# and _execute_resolution_timing which bypass SportsBot.is_relevant().
-# Remove entries here AND in SportsBot._SINGLE_GAME_BLOCKLIST together when
-# re-enabling a market type after Brier ≤ 0.10 on single-game sports.
 _STRUCTURAL_MARKET_BLOCKLIST = (
     "kxmvecrosscategory",
     "kxmvecrosscat",
@@ -143,10 +135,6 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
 
 
 def _infer_sector_from_ticker(ticker: str) -> str:
-    """
-    Infer sector name from a (normalized) ticker string.
-    Falls back to 'economics' if no prefix matches.
-    """
     tk = ticker.lower()
     for prefixes, sector in _TICKER_SECTOR_MAP:
         if any(tk.startswith(p) for p in prefixes):
@@ -228,11 +216,6 @@ def _parse_yes_price_cents(market: dict) -> int:
 
 
 def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[int]]:
-    """
-    Returns (total_pnl_usd, trade_id_list).
-    Returns a list of ints so callers can pass trade_id_list[0] as the
-    primary key to log_outcome and log the full list separately if needed.
-    """
     p = _ph()
     trade_rows = _query_signals(
         f"SELECT id, direction, contracts, yes_price_cents "
@@ -613,15 +596,16 @@ class FlywheelOrchestrator:
         self._last_bot_probs[ticker]   = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
-        arb = self.arb.check(
+        # ── Arb check + log in single call (v19.4) ────────────────────────
+        # check_and_log() handles confirmed arbs AND near-misses in one call.
+        # Previously: check() + conditional log_arb_opportunity() only fired
+        # on arb_exists=True, leaving the arb panel permanently empty.
+        arb = self.arb.check_and_log(
             ticker        = ticker,
             kalshi_cents  = yes_price,
             our_direction = consensus.direction,
             market_title  = title,
         )
-
-        if arb.arb_exists:
-            self.arb.log_arb_opportunity(arb)
 
         if not arb.passes:
             logger.info(
@@ -705,20 +689,6 @@ class FlywheelOrchestrator:
         )
 
         # ── Exploration Kelly ──────────────────────────────────────────────
-        # sector_kelly_fraction() returns the target effective Kelly fraction:
-        #   - Exploration (resolved < min): KELLY_FRACTION * EXPLORATION_KELLY_FRACTION
-        #   - Full Kelly (resolved >= min): KELLY_FRACTION
-        #
-        # We pass drawdown_factor (pure drawdown signal, range 0.5–1.0) directly
-        # into kelly_stake(), which applies KELLY_FRACTION internally.
-        # Exploration scaling is then applied POST-sizing as a clean multiplier
-        # so KELLY_FRACTION is only applied once.
-        #
-        # PREVIOUSLY (v19.2 bug): drawdown_factor * kf / 0.25 was passed in,
-        # which caused KELLY_FRACTION to be applied twice — once baked into kf
-        # by sector_kelly_fraction(), and again inside kelly_stake(). On a small
-        # live demo bankroll (~$650), this reduced sports stakes below the $1
-        # floor and zeroed out every sports trade.
         resolved_count = self._get_sector_resolved_count(lead_sector)
         kf             = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
@@ -740,7 +710,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,   # pure drawdown, no kf
+                drawdown_factor = drawdown_factor,
             )
             side = "yes"
         else:
@@ -751,15 +721,13 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,   # pure drawdown, no kf
+                drawdown_factor = drawdown_factor,
             )
             side = "no"
 
         # ── Apply exploration scaling post-sizing ──────────────────────────
-        # kf / KELLY_FRACTION gives the exploration multiplier (0.25 in
-        # exploration, 1.0 at full Kelly) without double-applying KELLY_FRACTION.
         if in_exploration and sizing["contracts"] > 0:
-            exploration_scale = kf / KELLY_FRACTION   # = 0.25 in exploration
+            exploration_scale = kf / KELLY_FRACTION
             sizing["dollars"]   = round(sizing["dollars"] * exploration_scale, 2)
             sizing["contracts"] = max(1, int(sizing["dollars"] / (yes_price / 100)))
             logger.info(
@@ -1034,12 +1002,20 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.3 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.4 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
 
-        self.news.start_background_poller()
+        # ── NewsSignal startup — 401 on bad key is non-fatal ──────────────
+        try:
+            self.news.start_background_poller()
+        except Exception as e:
+            logger.warning(
+                "NewsSignal failed to start background poller: %s — "
+                "continuing without news signal (trades will not be news-gated)",
+                e,
+            )
 
         import random
         jitter = random.randint(-45, 45)
