@@ -1,14 +1,21 @@
 """
-kalshi-flywheel / config/settings.py  (v3 — per-sector daily loss caps)
+kalshi-flywheel / config/settings.py  (v4 — fix sector_kelly_fraction docstring)
 
-Changes vs v2:
-  1. SECTOR_MAX_DAILY_LOSS added — per-sector hard stop in dollars
-  2. SECTOR_MIN_RESOLVED added — minimum resolved trades before a sector
-     is allowed to size at full Kelly. Below this threshold, sizing is
-     reduced to 25% of normal Kelly (exploration mode).
-  3. DEMO_MODE default changed to "true" — explicit opt-in for live trading.
-     You must set DEMO_MODE=false in Railway to place real orders.
-  4. Everything else unchanged from v2
+Changes vs v3:
+  1. sector_kelly_fraction() docstring corrected. The previous docstring
+     showed a usage example in kelly_sizer.py that was never implemented —
+     the function is used in orchestrator._execute_trade() as a POST-SIZING
+     multiplier, not as an input to the Kelly formula itself.
+
+  2. Clarified that sector_kelly_fraction() returns the TARGET effective
+     Kelly fraction (already including KELLY_FRACTION). Callers should
+     apply it as a multiplier AFTER kelly_stake() computes the base stake,
+     using: exploration_scale = kf / KELLY_FRACTION.
+
+  3. EXPLORATION_KELLY_FRACTION comment updated to match actual behavior:
+     exploration trades size at 25% of full Kelly (not 6.25%). The previous
+     comment said "0.25 * 0.25 = 6.25%" which described the (now-fixed)
+     double-penalty bug, not the intended behavior.
 
 API TIERS
 ---------
@@ -83,11 +90,10 @@ SECTOR_MAX_DAILY_LOSS: dict[str, float] = {
 }
 
 # ── Per-sector minimum resolved trades before full Kelly sizing ────────────────
-# Below this threshold the bot trades at 25% of normal Kelly (exploration mode).
-# This prevents the model from betting aggressively before it has enough data
-# to trust its own edge estimates.
+# Below this threshold the bot trades at EXPLORATION_KELLY_FRACTION of normal
+# Kelly (25% of normal = cautious exploration while the model learns).
 #
-# Sports is set low (20) because it already has 30 resolved markets.
+# Sports is set low (20) because it already has existing resolved markets.
 # All others are set to 30 — raise to 50 after the model stabilizes.
 SECTOR_MIN_RESOLVED: dict[str, int] = {
     "sports":    int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",    "20")),
@@ -98,8 +104,10 @@ SECTOR_MIN_RESOLVED: dict[str, int] = {
     "tech":      int(os.getenv("SECTOR_MIN_RESOLVED_TECH",      "30")),
 }
 
-# Exploration Kelly fraction — used when resolved count is below SECTOR_MIN_RESOLVED.
-# 0.25 * 0.25 = 6.25% of normal Kelly. Very small bets while the model learns.
+# Exploration Kelly multiplier — applied POST-sizing when resolved count is
+# below SECTOR_MIN_RESOLVED. Trades at 25% of normal Kelly during exploration.
+# Example: normal Kelly produces $40 stake → exploration stake = $40 * 0.25 = $10.
+# Do NOT set below 0.1 — stakes will fall below the $1 floor and size to zero.
 EXPLORATION_KELLY_FRACTION = 0.25
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────
@@ -187,14 +195,33 @@ def max_bet_size() -> float:
 
 def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
     """
-    Returns the Kelly fraction for a given sector based on how many
-    resolved trades it has. Sectors below SECTOR_MIN_RESOLVED trade
-    at EXPLORATION_KELLY_FRACTION * KELLY_FRACTION (very small).
+    Returns the TARGET effective Kelly fraction for a given sector.
 
-    Usage in kelly_sizer.py:
-        from config.settings import sector_kelly_fraction
-        kf = sector_kelly_fraction(sector, resolved_count)
-        stake = kf * edge / (1 - yes_price_frac)
+    This value already encodes KELLY_FRACTION:
+      - Exploration (resolved < SECTOR_MIN_RESOLVED):
+            returns KELLY_FRACTION * EXPLORATION_KELLY_FRACTION
+            e.g. 0.25 * 0.25 = 0.0625
+      - Full Kelly (resolved >= SECTOR_MIN_RESOLVED):
+            returns KELLY_FRACTION
+            e.g. 0.25
+
+    IMPORTANT — how to use this in orchestrator._execute_trade():
+    ──────────────────────────────────────────────────────────────
+    Do NOT pass kf into kelly_stake() — that function applies KELLY_FRACTION
+    internally. Passing kf in would double-apply KELLY_FRACTION.
+
+    Instead, call kelly_stake() with the raw drawdown_factor, then apply
+    exploration scaling as a POST-SIZING multiplier:
+
+        sizing = kelly_stake(..., drawdown_factor=drawdown_factor)
+
+        if in_exploration and sizing["contracts"] > 0:
+            exploration_scale = kf / KELLY_FRACTION   # e.g. 0.0625 / 0.25 = 0.25
+            sizing["dollars"]   = sizing["dollars"] * exploration_scale
+            sizing["contracts"] = max(1, int(sizing["dollars"] / price_frac))
+
+    This ensures KELLY_FRACTION is applied exactly once (inside kelly_sizer),
+    and exploration scaling is a clean 0.25x multiplier on the already-sized stake.
     """
     min_resolved = SECTOR_MIN_RESOLVED.get(sector, 30)
     if resolved_count < min_resolved:
@@ -208,7 +235,6 @@ def sector_loss_cap(sector: str) -> float:
     Returns 0.0 if the sector is unknown (disables trading).
 
     Usage in orchestrator._execute_trade():
-        from config.settings import sector_loss_cap
         cap = sector_loss_cap(lead_sector)
         if sector_daily_loss > cap:
             return  # skip trade

@@ -1,14 +1,24 @@
 """
-orchestrator.py  (v19.2 — block uncalibrated structural markets in corr + restime)
+orchestrator.py  (v19.3 — fix double-Kelly penalty on exploration sectors)
 
-Changes vs v19.1:
-  1. _execute_correlations: added _STRUCTURAL_MARKET_BLOCKLIST check so
-     KXMVECROSS* and KXMVESPORTSMULTIGAME* markets cannot be traded via
-     the correlation engine, bypassing the SportsBot.is_relevant() guard.
-  2. _execute_resolution_timing: same blocklist applied so ResolutionTimer
-     cannot leg into these markets either.
-  3. _STRUCTURAL_MARKET_BLOCKLIST defined at module level so both methods
-     share the same source of truth as SportsBot._SINGLE_GAME_BLOCKLIST.
+Changes vs v19.2:
+  1. _execute_trade: removed the `* kf / 0.25` baked into drawdown_factor.
+     Previously, sector_kelly_fraction() returned KELLY_FRACTION *
+     EXPLORATION_KELLY_FRACTION (= 0.0625), and dividing by 0.25 then
+     passing that into kelly_stake() caused kelly_stake() to multiply by
+     KELLY_FRACTION a second time — producing 6.25% effective Kelly instead
+     of the intended 25%. On a ~$650 live demo bankroll, this collapsed
+     sports stakes below the $1 floor → every sports trade sized to zero →
+     no sports trades executed → no resolved trades → Brier score never
+     populated for sports.
+
+  2. Exploration scaling is now applied POST-sizing as a clean multiplier
+     on the already-computed Kelly stake, so KELLY_FRACTION is only applied
+     once (inside kelly_sizer.py, where it belongs).
+
+  3. Rationale logging improved: "Sizing zero" now includes the sizer's
+     rationale string so root cause is visible in Railway logs without
+     adding a separate debug log line.
 """
 
 import logging
@@ -32,6 +42,7 @@ from config.settings import (
     NEWS_POLL_INTERVAL_SEC, NEWS_VELOCITY_WINDOW_MIN, NEWS_VELOCITY_SPIKE_THRESHOLD,
     NEWSAPI_KEY,
     SECTOR_MAX_DAILY_LOSS, SECTOR_MIN_RESOLVED,
+    KELLY_FRACTION,
     sector_kelly_fraction, sector_loss_cap,
 )
 from shared.arb_layer import ArbLayer
@@ -111,15 +122,10 @@ def _is_blocked_structural_market(ticker: str) -> bool:
 
 
 # ── Scan page rate-limit guard ─────────────────────────────────────────────────
-# Sleep between market fetch pages to avoid 429s during full pagination.
 SCAN_PAGE_SLEEP_SEC = 0.25
 
 
 # ── Sector inference from ticker ───────────────────────────────────────────────
-# Maps ticker prefixes to canonical sector names used by sector bots.
-# Used by _execute_correlations and _execute_resolution_timing to avoid
-# hardcoding "economics" for all cross-market trades.
-
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
     (("kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
@@ -139,8 +145,7 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
 def _infer_sector_from_ticker(ticker: str) -> str:
     """
     Infer sector name from a (normalized) ticker string.
-    Falls back to 'economics' if no prefix matches — same default
-    as the previous hardcoded value in _execute_correlations.
+    Falls back to 'economics' if no prefix matches.
     """
     tk = ticker.lower()
     for prefixes, sector in _TICKER_SECTOR_MAP:
@@ -225,11 +230,7 @@ def _parse_yes_price_cents(market: dict) -> int:
 def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[int]]:
     """
     Returns (total_pnl_usd, trade_id_list).
-
-    FIX 1: Previously returned (pnl, ",".join(trade_ids)) — a comma-joined
-    string — which caused log_outcome to crash with:
-        ValueError: invalid literal for int() with base 10: '239,238,236,...'
-    Now returns a list of ints so callers can pass trade_id_list[0] as the
+    Returns a list of ints so callers can pass trade_id_list[0] as the
     primary key to log_outcome and log the full list separately if needed.
     """
     p = _ph()
@@ -445,7 +446,6 @@ class FlywheelOrchestrator:
             }
 
         processed_this_run: set[str] = set()
-
         recorded = 0
 
         for market in resolved_markets:
@@ -705,17 +705,33 @@ class FlywheelOrchestrator:
         )
 
         # ── Exploration Kelly ──────────────────────────────────────────────
+        # sector_kelly_fraction() returns the target effective Kelly fraction:
+        #   - Exploration (resolved < min): KELLY_FRACTION * EXPLORATION_KELLY_FRACTION
+        #   - Full Kelly (resolved >= min): KELLY_FRACTION
+        #
+        # We pass drawdown_factor (pure drawdown signal, range 0.5–1.0) directly
+        # into kelly_stake(), which applies KELLY_FRACTION internally.
+        # Exploration scaling is then applied POST-sizing as a clean multiplier
+        # so KELLY_FRACTION is only applied once.
+        #
+        # PREVIOUSLY (v19.2 bug): drawdown_factor * kf / 0.25 was passed in,
+        # which caused KELLY_FRACTION to be applied twice — once baked into kf
+        # by sector_kelly_fraction(), and again inside kelly_stake(). On a small
+        # live demo bankroll (~$650), this reduced sports stakes below the $1
+        # floor and zeroed out every sports trade.
         resolved_count = self._get_sector_resolved_count(lead_sector)
         kf             = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
+
         if in_exploration:
             logger.info(
-                "[EXPLORATION] %s resolved=%d — trading at %.0f%% Kelly",
-                lead_sector, resolved_count, kf * 100,
+                "[EXPLORATION] %s resolved=%d — will scale stake to %.0f%% of Kelly",
+                lead_sector, resolved_count, (kf / KELLY_FRACTION) * 100,
             )
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
+        # ── Kelly sizing — pass raw drawdown_factor, no kf baked in ────────
         if consensus.direction == "YES":
             sizing = kelly_stake(
                 prob            = consensus.avg_prob,
@@ -724,7 +740,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor * kf / 0.25,
+                drawdown_factor = drawdown_factor,   # pure drawdown, no kf
             )
             side = "yes"
         else:
@@ -735,12 +751,28 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor * kf / 0.25,
+                drawdown_factor = drawdown_factor,   # pure drawdown, no kf
             )
             side = "no"
 
+        # ── Apply exploration scaling post-sizing ──────────────────────────
+        # kf / KELLY_FRACTION gives the exploration multiplier (0.25 in
+        # exploration, 1.0 at full Kelly) without double-applying KELLY_FRACTION.
+        if in_exploration and sizing["contracts"] > 0:
+            exploration_scale = kf / KELLY_FRACTION   # = 0.25 in exploration
+            sizing["dollars"]   = round(sizing["dollars"] * exploration_scale, 2)
+            sizing["contracts"] = max(1, int(sizing["dollars"] / (yes_price / 100)))
+            logger.info(
+                "[EXPLORATION] %s scaled stake: $%.2f × %.2f → $%.2f (%d contracts)",
+                lead_sector, sizing["dollars"] / exploration_scale,
+                exploration_scale, sizing["dollars"], sizing["contracts"],
+            )
+
         if sizing["contracts"] <= 0:
-            logger.info("Sizing zero for %s — skip", ticker)
+            logger.info(
+                "Sizing zero for %s — rationale: %s",
+                ticker, sizing.get("rationale", "unknown"),
+            )
             return
 
         client_order_id = str(uuid.uuid4())
@@ -840,10 +872,6 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
-            # ── Block uncalibrated structural market types ─────────────────
-            # CorrelationEngine bypasses SportsBot.is_relevant(), so we must
-            # enforce the same blocklist here. Remove entries from
-            # _STRUCTURAL_MARKET_BLOCKLIST when re-enabling a market type.
             if _is_blocked_structural_market(sig.event_group):
                 logger.info(
                     "CORR BLOCKED (uncalibrated structural market): %s",
@@ -900,9 +928,6 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
-            # ── Block uncalibrated structural market types ─────────────────
-            # ResolutionTimer bypasses SportsBot.is_relevant(), so we must
-            # enforce the same blocklist here.
             if _is_blocked_structural_market(sig.ticker):
                 logger.info(
                     "RESTIME BLOCKED (uncalibrated structural market): %s",
@@ -1009,7 +1034,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.2 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.3 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
