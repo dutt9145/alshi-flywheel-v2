@@ -1,15 +1,38 @@
 """
-bots/sector_bots.py  (v11.1 — block cross-category + multi-game extended in SportsBot)
+bots/sector_bots.py  (v11.2 — fix esports/weather bleed + tennis/crypto misclassification)
 
-Changes vs v11:
+Changes vs v11.1:
+  _has_sports_prefix (module-level guard):
+    - Added kxow* (Overwatch League), kxvalorant* (VCT), kxlol* (LoL esports),
+      kxrl* (Rocket League), kxatp* (ATP/WTA tennis), kxcsgo* as explicit prefixes.
+    - Previously, kxow and kxvalorant were absent, so OWL/VCT market titles
+      containing city-named teams (Los Angeles, Atlanta, San Francisco, etc.)
+      were being claimed by WeatherBot via city keyword match and traded as
+      weather markets with NOAA priors. Completely wrong feature set.
+    - kxatp was absent, causing KXATPSETWINNER markets to be claimed by
+      CryptoBot via "apt" (Aptos) substring match in the ticker.
+
+  CryptoBot:
+    - Removed bare "op", "near", "base", "sei" from KEYWORDS — these 2–4
+      character strings substring-match inside unrelated words in market
+      titles (e.g. "operation", "nearby", "baseball", "series"). Replaced
+      with more specific variants: "optimism op", "near protocol", "base l2",
+      "sei network" that require meaningful context to match.
+
+  WeatherBot:
+    - Added _ESPORTS_BLOCKLIST to is_relevant() as a secondary defense-in-depth
+      guard. Even if _has_sports_prefix is expanded, this ensures WeatherBot
+      explicitly rejects any kxow/kxvalorant/kxlol/kxrl/kxatp market that
+      somehow slips through prefix normalization.
+
   SportsBot:
-    - Added _SINGLE_GAME_BLOCKLIST to is_relevant(): KXMVECROSS* and
-      KXMVESPORTSMULTIGAME* prefixes are now rejected until Sports Brier
-      score on single-game markets reaches ≤ 0.10 with sufficient samples.
-    - Removed the blocked prefixes from KEYWORDS so _search_fields()
-      cannot re-admit them via keyword match after the prefix guard fires.
-    - "kxmvesports" (base, single-game) and "kxmvecbchampionship" are
-      intentionally kept — they are not structural multi-leg markets.
+    - Added kxow, kxvalorant, kxlol, kxrl, kxatp to KEYWORDS (prefix section)
+      so these markets are positively claimed by SportsBot rather than falling
+      through to no-sector.
+    - Added kxow → "OWL", kxvalorant → "VCT", kxlol → "LOL", kxrl → "RL",
+      kxatp → "ATP" to LEAGUE_MAP for correct league inference.
+    - Added "overwatch league", "owl match", "vct", "valorant champions" to
+      keyword list for title-level matching on esports markets.
 """
 
 import asyncio
@@ -50,17 +73,30 @@ def _search_fields(market: dict, keywords: list[str]) -> bool:
 
 def _has_sports_prefix(market: dict) -> bool:
     SPORTS_PREFIXES = (
-        # KXMVE family — explicit full prefixes to prevent any bleed
+        # ── KXMVE family ──────────────────────────────────────────────────
         "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
         "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
         "kxmvecbchampionship",
-        # Standard sport prefixes
+        # ── Standard US sport prefixes ─────────────────────────────────────
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
         "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-        "kxtennis", "kxf1", "kxolympic", "kxthail", "kxsl",
-        "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
+        "kxolympic", "kxthail", "kxsl",
         "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
         "kxrugby", "kxesport",
+        # ── Tennis — added v11.2 ───────────────────────────────────────────
+        # kxatp was missing, causing KXATPSETWINNER to bleed into CryptoBot
+        # via "apt" (Aptos) substring match.
+        "kxatp", "kxwta", "kxtennis",
+        # ── Esports — added v11.2 ─────────────────────────────────────────
+        # kxow (Overwatch League) and kxvalorant (VCT) were missing, causing
+        # OWL/VCT markets with city-named teams to bleed into WeatherBot.
+        "kxow", "kxvalorant", "kxlol", "kxleague",
+        "kxrl", "kxrocketleague",
+        "kxcsgo", "kxcs2", "kxdota", "kxintlf",
+        "kxapex", "kxfort", "kxhalo", "kxsc2",
+        "kxegypt", "kxvenf",
+        # ── Formula 1 ─────────────────────────────────────────────────────
+        "kxf1",
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -162,6 +198,10 @@ class EconomicsBot(BaseBot):
 class CryptoBot(BaseBot):
     """
     Crypto price, dominance, ETF, DeFi, Layer 2, and exchange markets.
+
+    v11.2: Removed bare short keywords "op", "near", "base", "sei" that were
+    substring-matching inside unrelated words ("operation", "nearby",
+    "baseball", "series"). Replaced with more specific multi-word variants.
     """
 
     KEYWORDS = [
@@ -176,9 +216,9 @@ class CryptoBot(BaseBot):
         "avalanche", "avax", "chainlink", "link", "polygon", "matic",
         "shiba inu", "shib", "litecoin", "ltc", "bitcoin cash", "bch",
         "stellar", "xlm", "cosmos", "atom", "algorand", "algo",
-        "tron", "trx", "filecoin", "fil", "near protocol", "near",
-        "aptos", "apt", "sui", "sei", "injective", "inj",
-        "arbitrum", "arb", "optimism", "op", "base",
+        "tron", "trx", "filecoin", "fil", "near protocol", "near protocol",
+        "aptos", "apt", "sui network", "sei network", "injective", "inj",
+        "arbitrum", "arb", "optimism op", "base l2",
         "pepe", "floki", "bonk", "wif",
 
         # ── DeFi protocols ─────────────────────────────────────────────────
@@ -293,7 +333,7 @@ class PoliticsBot(BaseBot):
         # ── Geopolitical events ────────────────────────────────────────────
         "ukraine", "russia", "israel", "gaza", "taiwan",
         "north korea", "iran nuclear", "south china sea",
-        "nato expansion", "un resolution", "war", "conflict",
+        "nato expansion", "un resolution", "armed conflict",
         "trade sanctions", "export controls",
 
         # ── Supreme Court ──────────────────────────────────────────────────
@@ -332,20 +372,44 @@ class PoliticsBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  4. WEATHER BOT  (v11 — worldwide city expansion)
+#  4. WEATHER BOT  (v11.2 — esports blocklist added)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WeatherBot(BaseBot):
     """
     Temperature, precipitation, storms — worldwide city coverage.
 
-    v11 changes:
-    - 200+ worldwide cities added across North America, Europe, Asia,
-      South America, Africa, Australia/Oceania
-    - Extended phenomena: monsoon, cyclone, typhoon, derecho,
-      polar vortex, nor'easter, dust storm, ice storm, wildfire
-    - Multi-word weather phrases for unambiguous matching
+    v11.2: Added _ESPORTS_BLOCKLIST to is_relevant() as a secondary guard.
+    OWL (Overwatch League) and VCT (Valorant) market titles contain city-named
+    teams (Los Angeles, Atlanta, San Francisco, etc.) that substring-matched
+    against the city keyword list, causing esports markets to be traded as
+    weather markets with completely wrong NOAA-derived priors.
+
+    Primary fix: kxow/kxvalorant/kxlol/kxrl/kxatp added to _has_sports_prefix.
+    Secondary fix: _ESPORTS_BLOCKLIST here as defense in depth.
     """
+
+    # ── Esports prefix blocklist — defense in depth ────────────────────────────
+    # Primary guard is _has_sports_prefix() which now includes these prefixes.
+    # This secondary check ensures no esports market ever gets a NOAA prior
+    # even if prefix normalization or UUID stripping produces an unexpected form.
+    _ESPORTS_BLOCKLIST = (
+        "kxow",          # Overwatch League
+        "kxvalorant",    # VCT Valorant Champions Tour
+        "kxlol",         # League of Legends esports
+        "kxleague",      # LoL alternate prefix
+        "kxrl",          # Rocket League
+        "kxrocketleague",
+        "kxcsgo",        # CS:GO legacy
+        "kxcs2",         # CS2
+        "kxdota",        # Dota 2
+        "kxapex",        # Apex Legends
+        "kxfort",        # Fortnite
+        "kxhalo",        # Halo
+        "kxsc2",         # StarCraft 2
+        "kxesport",      # Generic esports
+        "kxintlf",       # International fighting
+    )
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
@@ -487,8 +551,18 @@ class WeatherBot(BaseBot):
         return "weather"
 
     def is_relevant(self, market: dict) -> bool:
+        # ── Primary guard: sports prefix check ────────────────────────────
         if _has_sports_prefix(market):
             return False
+
+        # ── Secondary guard: explicit esports blocklist ────────────────────
+        # Defense in depth — catches esports markets even if _has_sports_prefix
+        # misses them due to UUID suffix or normalization edge cases.
+        et = market.get("event_ticker", "").lower()
+        tk = market.get("ticker", "").lower()
+        if any(et.startswith(p) or tk.startswith(p) for p in self._ESPORTS_BLOCKLIST):
+            return False
+
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_city(self, market: dict) -> tuple[float, float, str]:
@@ -633,7 +707,7 @@ class WeatherBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. TECH BOT  (v11 — expanded companies + AI models)
+#  5. TECH BOT  (v11.2 — unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TechBot(BaseBot):
@@ -732,22 +806,20 @@ class TechBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  6. SPORTS BOT  (v11.1 — block cross-category + multi-game extended)
+#  6. SPORTS BOT  (v11.2 — esports + tennis prefixes added)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SportsBot(BaseBot):
     """
     US + international sports, esports, combat sports, Olympic events.
 
-    v11.1: KXMVECROSS* and KXMVESPORTSMULTIGAME* market types are blocked
-    from is_relevant() until the Sports Brier score on single-game markets
-    reaches ≤ 0.10. These structural multi-leg markets have zero calibration
-    data and were driving the $-5,548 simulated drawdown. Re-enable by
-    removing prefixes from _SINGLE_GAME_BLOCKLIST when ready.
+    v11.1: KXMVECROSS* and KXMVESPORTSMULTIGAME* blocked until Brier ≤ 0.10.
+    v11.2: Added kxow, kxvalorant, kxlol, kxrl, kxatp to KEYWORDS and
+           LEAGUE_MAP so these markets are positively claimed by SportsBot
+           now that they're blocked from other bots via _has_sports_prefix.
     """
 
     # ── Structural market blocklist ────────────────────────────────────────────
-    # Remove entries here (not from KEYWORDS) when you want to re-enable a type.
     _SINGLE_GAME_BLOCKLIST = (
         "kxmvecrosscategory",
         "kxmvecrosscat",
@@ -759,16 +831,21 @@ class SportsBot(BaseBot):
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
-        # NOTE: kxmvecross*, kxmvesportsmulti* intentionally removed —
-        # blocked via _SINGLE_GAME_BLOCKLIST until Brier ≤ 0.10 on singles.
-        # kxmvecbchampionship and kxmvesports (base) are kept.
         "kxmvesports",
         "kxmvecbchampionship",
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-        "kxtennis", "kxf1", "kxolympic", "kxepl", "kxsoccer",
+        # ── Tennis — added v11.2 ───────────────────────────────────────────
+        "kxatp", "kxwta", "kxtennis",
+        "kxf1", "kxolympic", "kxepl", "kxsoccer",
         "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
-        "kxthail", "kxsl", "kxdota", "kxintlf", "kxcs2",
+        "kxthail", "kxsl",
+        # ── Esports — added v11.2 ─────────────────────────────────────────
+        "kxow", "kxvalorant", "kxlol", "kxleague",
+        "kxrl", "kxrocketleague",
+        "kxdota", "kxintlf", "kxcs2", "kxcsgo",
+        "kxapex", "kxfort",
+        "kxegypt", "kxvenf",
 
         # ── US major leagues ───────────────────────────────────────────────
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
@@ -803,6 +880,7 @@ class SportsBot(BaseBot):
         "australian open", "atp", "wta", "grand slam",
         "djokovic", "alcaraz", "sinner", "nadal", "federer",
         "swiatek", "sabalenka", "gauff",
+        "atp set", "wta set", "set winner", "match winner tennis",
 
         # ── Golf ───────────────────────────────────────────────────────────
         "masters golf", "pga championship", "us open golf",
@@ -819,11 +897,12 @@ class SportsBot(BaseBot):
         "formula 1", "f1", "grand prix", "monaco gp", "daytona 500",
         "indy 500", "nascar cup", "verstappen", "hamilton", "leclerc",
 
-        # ── Esports ────────────────────────────────────────────────────────
+        # ── Esports — added v11.2 ─────────────────────────────────────────
         "league of legends", "valorant", "cs2", "counter strike",
-        "dota 2", "overwatch", "rocket league", "apex legends",
+        "dota 2", "overwatch", "overwatch league", "owl match",
+        "rocket league", "apex legends",
         "fortnite tournament", "esports championship", "worlds lol",
-        "majors cs2", "vlr valorant",
+        "majors cs2", "vlr valorant", "vct", "valorant champions",
 
         # ── Other sports ───────────────────────────────────────────────────
         "cricket", "test match", "odi cricket", "ipl", "ashes",
@@ -831,7 +910,7 @@ class SportsBot(BaseBot):
         "olympic games", "summer olympics", "winter olympics",
         "tour de france", "cycling grand tour",
 
-        # ── Generic sports terms (safe — not used in other sectors) ────────
+        # ── Generic sports terms ────────────────────────────────────────────
         "wins by", "points scored", "spread", "mvp",
         "playoff", "championship series",
         "nba finals", "stanley cup", "nfl championship",
@@ -844,8 +923,20 @@ class SportsBot(BaseBot):
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
         "kxmvesports": "NBA", "kxmvecbchampionship": "NCAAB",
         "kxepl": "EPL", "kxsoccer": "MLS",
-        "kxtennis": "ATP", "kxf1": "F1",
+        # ── Tennis — added v11.2 ───────────────────────────────────────────
+        "kxatp": "ATP", "kxwta": "WTA", "kxtennis": "ATP",
+        "kxf1": "F1",
         "kxboxing": "BOXING", "kxgolf": "PGA",
+        # ── Esports — added v11.2 ─────────────────────────────────────────
+        "kxow": "OWL",          # Overwatch League
+        "kxvalorant": "VCT",    # Valorant Champions Tour
+        "kxlol": "LOL",         # League of Legends
+        "kxleague": "LOL",
+        "kxrl": "RL",           # Rocket League
+        "kxrocketleague": "RL",
+        "kxdota": "DOTA2",
+        "kxcs2": "CS2",
+        "kxcsgo": "CS2",
     }
 
     @property
@@ -856,9 +947,6 @@ class SportsBot(BaseBot):
         et = market.get("event_ticker", "").lower()
         tk = market.get("ticker", "").lower()
 
-        # ── Block uncalibrated structural market types ─────────────────────
-        # These fire with high fake confidence but have no training data.
-        # Re-enable by removing prefixes from _SINGLE_GAME_BLOCKLIST above.
         if any(et.startswith(p) or tk.startswith(p) for p in self._SINGLE_GAME_BLOCKLIST):
             return False
 
@@ -888,8 +976,14 @@ class SportsBot(BaseBot):
             league = "EPL"
         elif "f1" in title_lower or "formula 1" in title_lower:
             league = "F1"
-        elif "tennis" in title_lower or "wimbledon" in title_lower:
+        elif "tennis" in title_lower or "wimbledon" in title_lower or "atp" in title_lower:
             league = "ATP"
+        elif "valorant" in title_lower or "vct" in title_lower:
+            league = "VCT"
+        elif "overwatch" in title_lower or "owl" in title_lower:
+            league = "OWL"
+        elif "rocket league" in title_lower:
+            league = "RL"
 
         team_a, team_b = "Team A", "Team B"
         if " vs " in title:
