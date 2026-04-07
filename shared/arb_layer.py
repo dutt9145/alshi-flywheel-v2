@@ -1,16 +1,17 @@
 """
-shared/arb_layer.py  (v3 — near-miss logging + orchestrator call guard + sports prop handling)
+shared/arb_layer.py  (v4 — Postgres table guard + sports prop filter fix)
 
-Changes vs v2:
-  1. log_arb_opportunity() now logs near-misses (spread > 50% of threshold) so
-     the dashboard panel shows activity even when full arb doesn't fire
-  2. no_polymarket_match and empty_query results are silently skipped (no DB noise)
-  3. check_and_log() convenience method added — single call handles both check()
-     and log_arb_opportunity() so orchestrator can't accidentally split them
-  4. Sports/esports market detection added — logs a debug warning instead of
-     burning a Polymarket query that will never match
-  5. ARB_MIN_SPREAD_PCT passthrough fix — near-miss threshold derived correctly
-  6. Mode C stub added for future OddsPapi/news-signal arb on sports props
+Changes vs v3:
+  1. _log_to_db Postgres path now runs CREATE TABLE IF NOT EXISTS before
+     every insert. Previously the table was assumed to exist — if it didn't,
+     every arb write silently failed with a warning log, leaving the dashboard
+     arb panel permanently empty.
+
+  2. _SPORTS_PROP_KEYWORDS tightened. v3 included generic words like "over",
+     "under", "league", "home" which matched economics, politics, and weather
+     markets, causing them to return sports_prop_skip and get silently dropped
+     instead of being checked against Polymarket. Removed all ambiguous terms,
+     kept only unambiguous sports-specific vocabulary.
 """
 
 import logging
@@ -28,11 +29,12 @@ from config.settings import (
 logger = logging.getLogger(__name__)
 
 # ── Sports/esports keywords — Polymarket won't have these ────────────────────
+# Keep this list tight — generic words like "over", "under", "league", "home"
+# match too many non-sports markets and cause false sports_prop_skip returns.
 _SPORTS_PROP_KEYWORDS = {
-    "hits", "strikeouts", "rbis", "home", "bases", "innings",
-    "points", "assists", "rebounds", "yards", "touchdowns",
-    "kills", "valorant", "csgo", "league", "esports", "mlb",
-    "nba", "nfl", "nhl", "pitcher", "batter", "over", "under",
+    "strikeouts", "rbis", "innings", "touchdowns",
+    "kills", "valorant", "csgo", "pitcher", "batter",
+    "nba", "nfl", "nhl", "mlb",
 }
 
 def _is_sports_prop(market_title: str) -> bool:
@@ -95,10 +97,40 @@ class ArbResult:
 
 # ── DB helper (Postgres-aware) ────────────────────────────────────────────────
 
+_POSTGRES_DDL = """
+    CREATE TABLE IF NOT EXISTS arb_opportunities (
+        id          SERIAL PRIMARY KEY,
+        detected_at TEXT,
+        ticker      TEXT,
+        kalshi_prob REAL,
+        poly_prob   REAL,
+        sharp_prob  REAL,
+        spread      REAL,
+        mode        TEXT,
+        notes       TEXT
+    )
+"""
+
+_SQLITE_DDL = """
+    CREATE TABLE IF NOT EXISTS arb_opportunities (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        detected_at TEXT,
+        ticker      TEXT,
+        kalshi_prob REAL,
+        poly_prob   REAL,
+        sharp_prob  REAL,
+        spread      REAL,
+        mode        TEXT,
+        notes       TEXT
+    )
+"""
+
+
 def _log_to_db(result: ArbResult) -> None:
     """
     Write arb opportunity or near-miss to Supabase (Postgres) or SQLite.
-    Uses DATABASE_URL env var to determine which.
+    Uses DATABASE_URL env var to determine which backend to use.
+    Table is created on first write if it doesn't exist.
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
@@ -110,6 +142,9 @@ def _log_to_db(result: ArbResult) -> None:
             import psycopg2
             conn = psycopg2.connect(database_url)
             cur  = conn.cursor()
+            # ── FIX: create table if not exists before every insert ────────
+            # Previously assumed the table existed — silent failures if not.
+            cur.execute(_POSTGRES_DDL)
             cur.execute("""
                 INSERT INTO arb_opportunities
                 (detected_at, ticker, kalshi_prob, poly_prob,
@@ -126,14 +161,7 @@ def _log_to_db(result: ArbResult) -> None:
             import sqlite3
             db_path = os.getenv("DB_PATH", "flywheel.db")
             conn = sqlite3.connect(db_path)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS arb_opportunities (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    detected_at TEXT, ticker TEXT,
-                    kalshi_prob REAL, poly_prob REAL, sharp_prob REAL,
-                    spread REAL, mode TEXT, notes TEXT
-                )
-            """)
+            conn.execute(_SQLITE_DDL)
             conn.execute("""
                 INSERT INTO arb_opportunities
                 (detected_at, ticker, kalshi_prob, poly_prob,
@@ -364,15 +392,12 @@ class ArbLayer:
         Persist confirmed arbs AND near-misses to DB for dashboard display.
         Silently skips results with no external data (sports props, empty queries).
         """
-        # Skip if no external data was available — nothing useful to log
         if result.notes in ("no_polymarket_match", "empty_query", "sports_prop_skip"):
             return
 
-        # Log confirmed arbs
         if result.arb_exists:
             _log_to_db(result)
             return
 
-        # Log near-misses (spread > 50% of threshold) so dashboard shows activity
         if result.is_near_miss:
             _log_to_db(result)
