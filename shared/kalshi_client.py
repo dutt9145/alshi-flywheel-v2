@@ -1,12 +1,24 @@
 """
-shared/kalshi_client.py  (v4 — page_sleep_sec param for rate-limit tuning)
+shared/kalshi_client.py  (v5 — incremental ingestion timestamp fix)
 
-Changes vs v3:
-  1. get_all_open_markets() now accepts page_sleep_sec (default 0.25s).
-     Orchestrator passes SCAN_PAGE_SLEEP_SEC (0.25s) to stay under Kalshi's
-     rate limit without relying solely on 429 backoff/retry. Previously
-     hardcoded to 0.5s; 0.25s is still safe and halves pagination time.
-  2. Everything else unchanged from v3.
+Changes vs v4:
+  1. get_latest_outcome_ts() now returns a timezone-aware datetime object
+     instead of a raw string. Previously returned psycopg2's default string
+     format ("2026-04-06 05:30:00+00:00" with space separator) which failed
+     string comparison against Kalshi's close_time format
+     ("2026-04-06T21:00:00Z" with T separator). Space (ASCII 32) < T (ASCII 84)
+     so the cutoff check never triggered and every ingestion cycle fetched
+     all 35,000 resolved markets from scratch.
+
+  2. get_resolved_markets() now parses close_time to datetime before comparing
+     against min_close_ts. Both sides normalized to UTC-aware datetime objects,
+     eliminating format-dependent string comparison entirely.
+
+  3. Lookback buffer reduced from 1 day to 2 hours. The 1-day buffer caused
+     ~2,400 already-processed markets to be re-fetched every 4-hour ingestion
+     cycle even when the timestamp format was correct.
+
+  4. Everything else unchanged from v4.
 """
 
 import base64
@@ -30,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_BACKOFF_SEC = 60
 _MAX_RETRIES = 3
+
+# How far back to look beyond the most recent logged outcome.
+# 2 hours catches any markets that resolved but weren't ingested in the last cycle.
+_INGESTION_LOOKBACK = timedelta(hours=2)
 
 
 def _load_private_key():
@@ -99,6 +115,25 @@ def _sign_request(method: str, path: str) -> dict:
         "KALSHI-ACCESS-TIMESTAMP": ts_ms,
         "KALSHI-ACCESS-SIGNATURE": sig_b64,
     }
+
+
+def _parse_kalshi_ts(ts_str: str) -> Optional[datetime]:
+    """
+    Parse a Kalshi timestamp string to a UTC-aware datetime.
+    Handles both 'Z' suffix and '+00:00' offset formats.
+    Returns None if parsing fails.
+    """
+    if not ts_str:
+        return None
+    try:
+        # Replace Z with +00:00 for fromisoformat compatibility
+        normalized = ts_str.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 class KalshiClient:
@@ -194,7 +229,7 @@ class KalshiClient:
     def get_resolved_markets(
         self,
         max_pages:    int = 350,
-        min_close_ts: Optional[str] = None,
+        min_close_ts: Optional[datetime] = None,
     ) -> list:
         """
         Fetch settled markets from Kalshi.
@@ -204,10 +239,10 @@ class KalshiClient:
         max_pages : int
             Maximum pages to fetch (100 markets each).
             Default 350 = up to 35,000 markets (for full first-run history).
-        min_close_ts : str, optional
-            ISO 8601 timestamp. Stop paginating once markets are older than
-            this value. Pass the most recent outcome timestamp to avoid
-            re-fetching full history every 4 hours.
+        min_close_ts : datetime, optional
+            UTC-aware datetime cutoff. Stop paginating once markets are older
+            than this value. Pass the result of get_latest_outcome_ts() for
+            incremental ingestion — avoids re-fetching full history every cycle.
         """
         markets, cursor, page = [], None, 0
 
@@ -232,12 +267,18 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
+            # ── FIX: parse both sides to datetime before comparing ─────────
+            # Previously compared raw strings — psycopg2 uses space separator
+            # ("2026-04-06 05:30:00+00:00") while Kalshi uses T separator
+            # ("2026-04-06T21:00:00Z"). Space (ASCII 32) < T (ASCII 84) so the
+            # cutoff never triggered and every cycle fetched all 35k markets.
             if min_close_ts and batch:
-                oldest_close = batch[-1].get("close_time", "")
-                if oldest_close and oldest_close < min_close_ts:
+                oldest_close_str = batch[-1].get("close_time", "")
+                oldest_close_dt  = _parse_kalshi_ts(oldest_close_str)
+                if oldest_close_dt and oldest_close_dt < min_close_ts:
                     logger.info(
-                        "Reached min_close_ts cutoff (%s) at page %d — stopping",
-                        min_close_ts, page,
+                        "Reached min_close_ts cutoff (%s) at page %d — stopping incremental ingestion",
+                        min_close_ts.isoformat(), page,
                     )
                     break
 
@@ -250,10 +291,14 @@ class KalshiClient:
         logger.info("get_resolved_markets complete — %d total clean results", len(markets))
         return markets
 
-    def get_latest_outcome_ts(self) -> Optional[str]:
+    def get_latest_outcome_ts(self) -> Optional[datetime]:
         """
-        Query outcomes table for most recent resolved_at timestamp.
-        Used to build min_close_ts for incremental resolved market fetching.
+        Query outcomes table for most recent logged_at timestamp.
+        Returns a UTC-aware datetime with a 2-hour lookback buffer,
+        or None if no outcomes exist yet (triggers full history fetch).
+
+        Used by orchestrator._ingest_resolved_markets() to build
+        min_close_ts for incremental resolved market fetching.
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
@@ -267,17 +312,24 @@ class KalshiClient:
                 conn.close()
                 if row and row[0]:
                     ts = row[0]
-                    if hasattr(ts, "isoformat"):
-                        buffered = ts - timedelta(days=1)
-                        return buffered.isoformat()
-                    return str(row[0])
+                    # psycopg2 returns a datetime object for timestamptz columns
+                    if isinstance(ts, datetime):
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        return ts - _INGESTION_LOOKBACK
+                    # Fallback: parse string representation
+                    parsed = _parse_kalshi_ts(str(ts))
+                    if parsed:
+                        return parsed - _INGESTION_LOOKBACK
             else:
                 import sqlite3
                 conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
                 row  = conn.execute("SELECT MAX(logged_at) FROM outcomes").fetchone()
                 conn.close()
                 if row and row[0]:
-                    return str(row[0])
+                    parsed = _parse_kalshi_ts(str(row[0]))
+                    if parsed:
+                        return parsed - _INGESTION_LOOKBACK
         except Exception as e:
             logger.warning("get_latest_outcome_ts failed: %s", e)
         return None
