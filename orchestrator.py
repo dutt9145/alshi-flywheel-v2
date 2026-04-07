@@ -1,24 +1,25 @@
 """
-orchestrator.py  (v19.5 — sector P&L race fix + provisional loss booking)
+orchestrator.py  (v19.6 — NO P&L formula fix + sports ticker corrections)
 
-Changes vs v19.4:
-  1. _sector_pnl_lock: New threading.Lock() added to __init__ that serializes
-     ALL reads and writes to _sector_daily_pnl. Eliminates the race condition
-     where _run_ingestion_thread() was writing mid-scan after _scan_summary
-     was already snapshotted, causing the daily_pnl / sector_pnl gap seen in
-     logs ($-702.96 total vs $-852.48 sports).
+Changes vs v19.5:
+  1. _calculate_pnl NO direction loss bug fixed: when a NO trade loses
+     (YES resolves), the loss was incorrectly calculated as -yes_price_frac
+     instead of -no_price_frac. On high yes_price markets (e.g. 74¢) this
+     massively inflated reported losses — e.g. 576 contracts @ 74¢ NO
+     booked -$426 loss instead of the correct -$150. This was the source
+     of the ~$1,200 phantom P&L drop on the dashboard.
 
-  2. Provisional loss booking: _execute_trade() now immediately deducts
-     sizing["dollars"] from _sector_daily_pnl at execution time (worst-case
-     open risk). Previously losses only registered on resolution ingestion,
-     meaning the sector cap was blind to in-flight trades and could be blown
-     entirely before the cap check ever fired. Provisional entries are
-     corrected to actual P&L on resolution via _ingest_resolved_markets().
+     Fix:
+       Before: contracts * (no_price_frac if not resolved_yes else (-yes_price_frac))
+       After:  contracts * (no_price_frac if not resolved_yes else (-no_price_frac))
 
-  3. All _sector_daily_pnl mutations now wrapped with _sector_pnl_lock.
+  2. kxeuroleague and kxcba added to _SPORTS_PREFIXES and _TICKER_SECTOR_MAP.
+     These were misclassifying EuroLeague basketball as politics and CBA
+     games as weather, causing wrong sector caps and wrong exploration Kelly
+     sizing ($37.50 instead of $150).
 
-  4. No logic changes to Kelly sizing, arb layer, circuit breaker, or
-     resolution ingestion from v19.4.
+  3. Carries forward all v19.5 changes: _sector_pnl_lock, provisional loss
+     booking, locked sector P&L snapshot in scan summary log.
 """
 
 import logging
@@ -87,6 +88,7 @@ _SPORTS_PREFIXES = (
     "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
     "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
     "kxrugby", "kxesport",
+    "kxeuroleague", "kxcba", "kxcbagame",
 )
 
 
@@ -127,7 +129,8 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
       "kxtennis", "kxf1", "kxolympic", "kxepl", "kxsoccer",
       "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
-      "kxdota", "kxintlf", "kxcs2"), "sports"),
+      "kxdota", "kxintlf", "kxcs2",
+      "kxeuroleague", "kxcba", "kxcbagame"), "sports"),
     (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi"), "crypto"),
     (("kxelect", "kxpres", "kxsen", "kxhouse", "kxgov",
       "kxpol", "kxvote", "kxapprove"), "politics"),
@@ -257,7 +260,12 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[
         if direction == "YES":
             pnl = contracts * ((1.0 - yes_price_frac) if resolved_yes else (-yes_price_frac))
         else:
-            pnl = contracts * (no_price_frac if not resolved_yes else (-yes_price_frac))
+            # NO contract costs no_price_frac, pays $1 if NO resolves.
+            # Win: +yes_price_frac per contract (the gain on a NO contract)
+            # Loss: -no_price_frac per contract (what was paid for NO)
+            # Bug in v19.5 and earlier used -yes_price_frac for the loss,
+            # massively inflating losses on high yes_price markets.
+            pnl = contracts * (no_price_frac if not resolved_yes else (-no_price_frac))
 
         total_pnl += pnl
 
@@ -1045,7 +1053,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.5 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.6 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
