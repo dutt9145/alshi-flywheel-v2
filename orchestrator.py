@@ -1,20 +1,24 @@
 """
-orchestrator.py  (v19.4 — arb check_and_log consolidation + near-miss logging)
+orchestrator.py  (v19.5 — sector P&L race fix + provisional loss booking)
 
-Changes vs v19.3:
-  1. _evaluate_market: replaced split arb.check() + arb.log_arb_opportunity()
-     calls with single arb.check_and_log(). Previously, log_arb_opportunity()
-     was only called when arb_exists=True — near-misses and direction-aligned
-     signals were silently dropped, leaving the dashboard arb panel permanently
-     empty. check_and_log() handles both confirmed arbs and near-misses in one
-     call per arb_layer v3 logic.
+Changes vs v19.4:
+  1. _sector_pnl_lock: New threading.Lock() added to __init__ that serializes
+     ALL reads and writes to _sector_daily_pnl. Eliminates the race condition
+     where _run_ingestion_thread() was writing mid-scan after _scan_summary
+     was already snapshotted, causing the daily_pnl / sector_pnl gap seen in
+     logs ($-702.96 total vs $-852.48 sports).
 
-  2. NewsSignal 401 guard: news.start_background_poller() is now wrapped in a
-     try/except so a bad API key doesn't crash startup. NewsSignal failures are
-     logged as WARNING, not ERROR, and the orchestrator continues without news.
+  2. Provisional loss booking: _execute_trade() now immediately deducts
+     sizing["dollars"] from _sector_daily_pnl at execution time (worst-case
+     open risk). Previously losses only registered on resolution ingestion,
+     meaning the sector cap was blind to in-flight trades and could be blown
+     entirely before the cap check ever fired. Provisional entries are
+     corrected to actual P&L on resolution via _ingest_resolved_markets().
 
-  3. No logic changes to Kelly sizing, circuit breaker, or resolution ingestion
-     from v19.3.
+  3. All _sector_daily_pnl mutations now wrapped with _sector_pnl_lock.
+
+  4. No logic changes to Kelly sizing, arb layer, circuit breaker, or
+     resolution ingestion from v19.4.
 """
 
 import logging
@@ -362,6 +366,13 @@ class FlywheelOrchestrator:
 
         self._exposure: dict[str, float]         = {b.sector_name: 0.0 for b in self.bots}
         self._sector_daily_pnl: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
+
+        # ── FIX: Lock serializing ALL _sector_daily_pnl reads/writes ──────────
+        # Eliminates race between _run_ingestion_thread() writing mid-scan and
+        # the cap check reading a stale pre-ingestion snapshot, which caused the
+        # $149.52 gap between daily_pnl and sector_pnl in logs.
+        self._sector_pnl_lock = threading.Lock()
+
         self._ingestion_lock                     = threading.Lock()
         self._last_bot_probs:   dict[str, float] = {}
         self._last_bot_sectors: dict[str, str]   = {}
@@ -501,8 +512,12 @@ class FlywheelOrchestrator:
                 )
                 if sec_rows:
                     sec = sec_rows[0].get("sector", "")
-                    if sec in self._sector_daily_pnl:
-                        self._sector_daily_pnl[sec] += pnl_usd
+                    # ── FIX: Lock protects concurrent ingestion thread writes ──
+                    with self._sector_pnl_lock:
+                        if sec in self._sector_daily_pnl:
+                            # Unwind the provisional loss booked at trade time,
+                            # then apply the actual resolved P&L.
+                            self._sector_daily_pnl[sec] += pnl_usd
             else:
                 logger.debug(
                     "[P&L] %s resolved %s — no matching trade",
@@ -597,9 +612,6 @@ class FlywheelOrchestrator:
         self._last_bot_sectors[ticker] = lead_sector
 
         # ── Arb check + log in single call (v19.4) ────────────────────────
-        # check_and_log() handles confirmed arbs AND near-misses in one call.
-        # Previously: check() + conditional log_arb_opportunity() only fired
-        # on arb_exists=True, leaving the arb panel permanently empty.
         arb = self.arb.check_and_log(
             ticker        = ticker,
             kalshi_cents  = yes_price,
@@ -670,7 +682,11 @@ class FlywheelOrchestrator:
             )
             return
 
-        sector_loss_today = self._sector_daily_pnl.get(lead_sector, 0.0)
+        # ── FIX: Read _sector_daily_pnl under lock to get a consistent value
+        # even if ingestion thread is writing concurrently.
+        with self._sector_pnl_lock:
+            sector_loss_today = self._sector_daily_pnl.get(lead_sector, 0.0)
+
         if sector_loss_today <= -cap:
             logger.warning(
                 "SECTOR LOSS CAP hit: %s daily_loss=$%.2f cap=$%.2f — skipping %s",
@@ -701,7 +717,7 @@ class FlywheelOrchestrator:
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
-        # ── Kelly sizing — pass raw drawdown_factor, no kf baked in ────────
+        # ── Kelly sizing ───────────────────────────────────────────────────
         if consensus.direction == "YES":
             sizing = kelly_stake(
                 prob            = consensus.avg_prob,
@@ -771,6 +787,25 @@ class FlywheelOrchestrator:
         self._recently_traded[ticker]   = now
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
+
+        # ── FIX: Provisional loss booking ─────────────────────────────────
+        # Book the full dollars_risked as a provisional loss immediately at
+        # execution time. This makes the sector loss cap aware of in-flight
+        # open risk, not just resolved P&L. The provisional amount will be
+        # corrected to actual P&L when the market resolves and
+        # _ingest_resolved_markets() runs. Without this, sports (or any
+        # sector) can blow its entire cap before the cap check ever fires
+        # because all losses only register post-resolution in bulk.
+        provisional_loss = -sizing["dollars"]
+        with self._sector_pnl_lock:
+            self._sector_daily_pnl[lead_sector] = (
+                self._sector_daily_pnl.get(lead_sector, 0.0) + provisional_loss
+            )
+        logger.debug(
+            "[PROVISIONAL] %s sector=%s provisional_loss=$%.2f new_sector_pnl=$%.2f",
+            ticker, lead_sector, provisional_loss,
+            self._sector_daily_pnl[lead_sector],
+        )
 
         arb_note  = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
         fade_note = " [FADE]" if fade else ""
@@ -957,12 +992,16 @@ class FlywheelOrchestrator:
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
 
+        # ── Read sector P&L under lock for consistent summary log ──────────
+        with self._sector_pnl_lock:
+            sector_pnl_snapshot = dict(self._sector_daily_pnl)
+
         logger.info(
             "Scan complete | daily_pnl=$%.2f trades=%d halted=%s | sector_pnl=%s",
             self._scan_summary.get("realized_pnl", 0.0),
             self._scan_summary.get("trade_count", 0),
             self._scan_summary.get("halted", False),
-            {k: f"${v:+.2f}" for k, v in self._sector_daily_pnl.items()},
+            {k: f"${v:+.2f}" for k, v in sector_pnl_snapshot.items()},
         )
 
     # ── Nightly retrain ────────────────────────────────────────────────────────
@@ -987,8 +1026,12 @@ class FlywheelOrchestrator:
         self._scan_summary  = {}
         logger.info("Bankroll synced: $%.2f", live_bankroll)
 
-        self._exposure         = {b.sector_name: 0.0 for b in self.bots}
-        self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
+        self._exposure = {b.sector_name: 0.0 for b in self.bots}
+
+        # ── Reset under lock ───────────────────────────────────────────────
+        with self._sector_pnl_lock:
+            self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
+
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
         self._recently_traded.clear()
@@ -1002,7 +1045,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.4 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.5 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
