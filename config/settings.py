@@ -29,7 +29,7 @@ load_dotenv()
 # Default is the main trading API — NOT the deprecated elections subdomain.
 # The elections subdomain (api.elections.kalshi.com) does not expose
 # /portfolio/balance, causing 401s on every bankroll sync.
-KALSHI_API_BASE    = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
+KALSHI_API_BASE    = os.getenv("KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2")
 KALSHI_KEY_ID      = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
 
