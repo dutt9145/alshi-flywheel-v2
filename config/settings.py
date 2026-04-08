@@ -1,21 +1,16 @@
 """
-kalshi-flywheel / config/settings.py  (v4 — fix sector_kelly_fraction docstring)
+kalshi-flywheel / config/settings.py  (v5 — KALSHI_API_BASE env var fix)
 
-Changes vs v3:
-  1. sector_kelly_fraction() docstring corrected. The previous docstring
-     showed a usage example in kelly_sizer.py that was never implemented —
-     the function is used in orchestrator._execute_trade() as a POST-SIZING
-     multiplier, not as an input to the Kelly formula itself.
+Changes vs v4:
+  1. KALSHI_API_BASE is now read from environment variable instead of being
+     hardcoded to the deprecated elections subdomain. Previously hardcoded as:
+       "https://api.elections.kalshi.com/trade-api/v2"
+     This meant the 401 bankroll sync error could NOT be fixed via Railway env
+     vars — load_dotenv() never overrides a hardcoded value. Now reads from
+     KALSHI_API_BASE env var with the correct trading API as default:
+       os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
 
-  2. Clarified that sector_kelly_fraction() returns the TARGET effective
-     Kelly fraction (already including KELLY_FRACTION). Callers should
-     apply it as a multiplier AFTER kelly_stake() computes the base stake,
-     using: exploration_scale = kf / KELLY_FRACTION.
-
-  3. EXPLORATION_KELLY_FRACTION comment updated to match actual behavior:
-     exploration trades size at 25% of full Kelly (not 6.25%). The previous
-     comment said "0.25 * 0.25 = 6.25%" which described the (now-fixed)
-     double-penalty bug, not the intended behavior.
+  2. Everything else unchanged from v4.
 
 API TIERS
 ---------
@@ -30,7 +25,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Kalshi ─────────────────────────────────────────────────────────────────────
-KALSHI_API_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
+# KALSHI_API_BASE: set in Railway env vars to override.
+# Default is the main trading API — NOT the deprecated elections subdomain.
+# The elections subdomain (api.elections.kalshi.com) does not expose
+# /portfolio/balance, causing 401s on every bankroll sync.
+KALSHI_API_BASE    = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
 KALSHI_KEY_ID      = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
 
@@ -152,7 +151,7 @@ NEWSAPI_KEY     = os.getenv("NEWSAPI_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 # ── TIER 2: $9–$50/mo ─────────────────────────────────────────────────────────
-ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")
+ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")       # the-odds-api.com — highest ROI add
 ODDSPAPI_KEY      = os.getenv("ODDSPAPI_KEY", "")
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
 MYSPORTSFEEDS_KEY = os.getenv("MYSPORTSFEEDS_KEY", "")
