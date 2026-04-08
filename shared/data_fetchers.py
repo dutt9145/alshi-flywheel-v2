@@ -1,5 +1,5 @@
 """
-shared/data_fetchers.py  (v6 — odds API TTL fix)
+shared/data_fetchers.py  (v7 — fix KeyError on odds API outcome parsing)
 
 Changes vs v5:
   1. fetch_sports_features() odds API TTL changed from 300s to 3600s.
@@ -531,7 +531,7 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
                       # 3600s = ~48 calls/day = ~1,440/month, fits $30 tier.
         if odds:
             for game in odds:
-                teams = [o["key"] for bm in game.get("bookmakers", [])
+                teams = [o.get("key", "") for bm in game.get("bookmakers", [])
                          for m in bm.get("markets", []) for o in m.get("outcomes", [])]
                 if any(team_a.lower() in t.lower() for t in teams):
                     for bm in game.get("bookmakers", []):
