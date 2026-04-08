@@ -1,25 +1,26 @@
 """
-orchestrator.py  (v19.6 — NO P&L formula fix + sports ticker corrections)
+orchestrator.py  (v19.7 — provisional loss unwind fix)
 
-Changes vs v19.5:
-  1. _calculate_pnl NO direction loss bug fixed: when a NO trade loses
-     (YES resolves), the loss was incorrectly calculated as -yes_price_frac
-     instead of -no_price_frac. On high yes_price markets (e.g. 74¢) this
-     massively inflated reported losses — e.g. 576 contracts @ 74¢ NO
-     booked -$426 loss instead of the correct -$150. This was the source
-     of the ~$1,200 phantom P&L drop on the dashboard.
+Changes vs v19.6:
+  1. Provisional loss double-count bug fixed.
+     Previously, _ingest_resolved_markets() did:
+       self._sector_daily_pnl[sec] += pnl_usd
+     on top of an already-booked provisional loss. On a losing trade this
+     meant: -$300 (provisional at execution) + -$300 (actual at resolution)
+     = -$600 sector_pnl instead of the correct -$300.
 
-     Fix:
-       Before: contracts * (no_price_frac if not resolved_yes else (-yes_price_frac))
-       After:  contracts * (no_price_frac if not resolved_yes else (-no_price_frac))
+     Fix: unwind the provisional first, then apply actual P&L:
+       provisional = self._open_provisionals.pop(ticker, 0.0)
+       self._sector_daily_pnl[sec] = sector_pnl - provisional + pnl_usd
 
-  2. kxeuroleague and kxcba added to _SPORTS_PREFIXES and _TICKER_SECTOR_MAP.
-     These were misclassifying EuroLeague basketball as politics and CBA
-     games as weather, causing wrong sector caps and wrong exploration Kelly
-     sizing ($37.50 instead of $150).
+     On a win:  -$300 provisional + $200 actual  → correct net -$100
+     On a loss: -$300 provisional + -$300 actual → correct net -$300
+                (was -$600 before this fix)
 
-  3. Carries forward all v19.5 changes: _sector_pnl_lock, provisional loss
-     booking, locked sector P&L snapshot in scan summary log.
+  2. _open_provisionals cleared in retrain_models() nightly reset.
+
+  3. Carries forward all v19.6 changes: NO P&L formula fix, sports ticker
+     corrections, _sector_pnl_lock, provisional loss booking.
 """
 
 import logging
@@ -393,6 +394,14 @@ class FlywheelOrchestrator:
 
         self._recently_traded: dict[str, float] = {}
 
+        # ── Provisional loss tracker ───────────────────────────────────────
+        # Keyed by ticker. Stores the provisional loss booked at execution
+        # time so _ingest_resolved_markets() can unwind it precisely before
+        # applying the actual resolved P&L. Prevents the double-count bug
+        # where a losing trade would register -$300 at execution AND -$300
+        # again at resolution, producing -$600 sector_pnl.
+        self._open_provisionals: dict[str, float] = {}
+
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
     def _get_sector_resolved_count(self, sector: str) -> int:
@@ -520,12 +529,24 @@ class FlywheelOrchestrator:
                 )
                 if sec_rows:
                     sec = sec_rows[0].get("sector", "")
-                    # ── FIX: Lock protects concurrent ingestion thread writes ──
                     with self._sector_pnl_lock:
                         if sec in self._sector_daily_pnl:
-                            # Unwind the provisional loss booked at trade time,
-                            # then apply the actual resolved P&L.
-                            self._sector_daily_pnl[sec] += pnl_usd
+                            # ── FIX: Unwind provisional before applying actual P&L ──
+                            # v19.6 and earlier did += pnl_usd on top of the
+                            # provisional, double-counting losses:
+                            #   -$300 provisional + -$300 actual = -$600 (wrong)
+                            # Now we pop the provisional and replace it cleanly:
+                            #   -$300 provisional unwound, +actual applied = correct
+                            provisional = self._open_provisionals.pop(ticker, 0.0)
+                            self._sector_daily_pnl[sec] = (
+                                self._sector_daily_pnl[sec] - provisional + pnl_usd
+                            )
+                            logger.debug(
+                                "[PROVISIONAL UNWIND] %s sector=%s "
+                                "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
+                                ticker, sec, provisional, pnl_usd,
+                                self._sector_daily_pnl[sec],
+                            )
             else:
                 logger.debug(
                     "[P&L] %s resolved %s — no matching trade",
@@ -796,19 +817,18 @@ class FlywheelOrchestrator:
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
 
-        # ── FIX: Provisional loss booking ─────────────────────────────────
+        # ── Provisional loss booking ───────────────────────────────────────
         # Book the full dollars_risked as a provisional loss immediately at
-        # execution time. This makes the sector loss cap aware of in-flight
-        # open risk, not just resolved P&L. The provisional amount will be
-        # corrected to actual P&L when the market resolves and
-        # _ingest_resolved_markets() runs. Without this, sports (or any
-        # sector) can blow its entire cap before the cap check ever fires
-        # because all losses only register post-resolution in bulk.
+        # execution time. Makes the sector loss cap aware of in-flight open
+        # risk, not just resolved P&L. Stored in _open_provisionals so
+        # _ingest_resolved_markets() can unwind it precisely on resolution
+        # rather than stacking it with the actual P&L (the v19.6 bug).
         provisional_loss = -sizing["dollars"]
         with self._sector_pnl_lock:
             self._sector_daily_pnl[lead_sector] = (
                 self._sector_daily_pnl.get(lead_sector, 0.0) + provisional_loss
             )
+            self._open_provisionals[ticker] = provisional_loss
         logger.debug(
             "[PROVISIONAL] %s sector=%s provisional_loss=$%.2f new_sector_pnl=$%.2f",
             ticker, lead_sector, provisional_loss,
@@ -1038,7 +1058,8 @@ class FlywheelOrchestrator:
 
         # ── Reset under lock ───────────────────────────────────────────────
         with self._sector_pnl_lock:
-            self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
+            self._sector_daily_pnl   = {b.sector_name: 0.0 for b in self.bots}
+            self._open_provisionals  = {}
 
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
@@ -1053,7 +1074,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.6 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.7 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
