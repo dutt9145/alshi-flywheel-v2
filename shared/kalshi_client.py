@@ -1,24 +1,27 @@
 """
-shared/kalshi_client.py  (v5 — incremental ingestion timestamp fix)
+shared/kalshi_client.py  (v6 — server-side min_close_ts filtering)
 
-Changes vs v4:
-  1. get_latest_outcome_ts() now returns a timezone-aware datetime object
-     instead of a raw string. Previously returned psycopg2's default string
-     format ("2026-04-06 05:30:00+00:00" with space separator) which failed
-     string comparison against Kalshi's close_time format
-     ("2026-04-06T21:00:00Z" with T separator). Space (ASCII 32) < T (ASCII 84)
-     so the cutoff check never triggered and every ingestion cycle fetched
-     all 35,000 resolved markets from scratch.
+Changes vs v5:
+  1. get_resolved_markets() now passes min_close_ts as a Unix timestamp
+     query parameter to the Kalshi API. Previously the cutoff was only
+     checked client-side against batch[-1].close_time, which silently
+     failed because Kalshi does NOT return settled markets sorted by
+     close_time — they're in arbitrary order. This meant the client-side
+     cutoff never triggered and every 4-hour ingestion cycle fetched all
+     35,000 resolved markets from scratch, causing:
+       - ~4 minutes of API calls per cycle
+       - 429 rate limit collisions with the concurrent scan thread
+       - Supabase disk IO exhaustion from processing 35k markets repeatedly
 
-  2. get_resolved_markets() now parses close_time to datetime before comparing
-     against min_close_ts. Both sides normalized to UTC-aware datetime objects,
-     eliminating format-dependent string comparison entirely.
+     Fix: pass min_close_ts as int Unix timestamp in the API params dict.
+     Kalshi filters server-side, returning only recently settled markets.
+     With a 2-hour lookback buffer, typical cycle now fetches 1-3 pages
+     instead of 350.
 
-  3. Lookback buffer reduced from 1 day to 2 hours. The 1-day buffer caused
-     ~2,400 already-processed markets to be re-fetched every 4-hour ingestion
-     cycle even when the timestamp format was correct.
+  2. Client-side per-batch cutoff check retained as belt-and-suspenders.
+     Now checks both batch[0] AND batch[-1] since sort order is undefined.
 
-  4. Everything else unchanged from v4.
+  3. Everything else unchanged from v5.
 """
 
 import base64
@@ -126,7 +129,6 @@ def _parse_kalshi_ts(ts_str: str) -> Optional[datetime]:
     if not ts_str:
         return None
     try:
-        # Replace Z with +00:00 for fromisoformat compatibility
         normalized = ts_str.replace("Z", "+00:00")
         dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
@@ -240,14 +242,28 @@ class KalshiClient:
             Maximum pages to fetch (100 markets each).
             Default 350 = up to 35,000 markets (for full first-run history).
         min_close_ts : datetime, optional
-            UTC-aware datetime cutoff. Stop paginating once markets are older
-            than this value. Pass the result of get_latest_outcome_ts() for
-            incremental ingestion — avoids re-fetching full history every cycle.
+            UTC-aware datetime cutoff. Pass the result of get_latest_outcome_ts()
+            for incremental ingestion.
+
+            FIX v6: now passed as a Unix timestamp query parameter to the Kalshi
+            API so filtering happens server-side. Previously only checked
+            client-side against batch[-1].close_time, which failed silently
+            because Kalshi does not sort settled markets by close_time — they're
+            in arbitrary order, so the cutoff never triggered and every cycle
+            fetched all 35,000 markets.
+
+            With server-side filtering a typical incremental cycle fetches
+            1-3 pages (100-300 markets) instead of 350 pages (35,000 markets).
         """
         markets, cursor, page = [], None, 0
 
         while page < max_pages:
+            # ── FIX v6: pass min_close_ts as server-side filter ────────────────
+            # Kalshi API accepts min_close_ts as a Unix timestamp (integer seconds).
+            # This eliminates the 35k-market full pull every 4 hours.
             params = {"status": "settled", "limit": 100}
+            if min_close_ts:
+                params["min_close_ts"] = int(min_close_ts.timestamp())
             if cursor:
                 params["cursor"] = cursor
 
@@ -267,20 +283,27 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
-            # ── FIX: parse both sides to datetime before comparing ─────────
-            # Previously compared raw strings — psycopg2 uses space separator
-            # ("2026-04-06 05:30:00+00:00") while Kalshi uses T separator
-            # ("2026-04-06T21:00:00Z"). Space (ASCII 32) < T (ASCII 84) so the
-            # cutoff never triggered and every cycle fetched all 35k markets.
+            # ── Belt-and-suspenders client-side cutoff check ───────────────────
+            # Checks both ends of the batch since Kalshi sort order is undefined.
+            # Primary filtering is now server-side via the min_close_ts param.
             if min_close_ts and batch:
-                oldest_close_str = batch[-1].get("close_time", "")
-                oldest_close_dt  = _parse_kalshi_ts(oldest_close_str)
-                if oldest_close_dt and oldest_close_dt < min_close_ts:
-                    logger.info(
-                        "Reached min_close_ts cutoff (%s) at page %d — stopping incremental ingestion",
-                        min_close_ts.isoformat(), page,
-                    )
-                    break
+                for check_market in [batch[0], batch[-1]]:
+                    close_str = check_market.get("close_time", "")
+                    close_dt  = _parse_kalshi_ts(close_str)
+                    if close_dt and close_dt < min_close_ts:
+                        logger.info(
+                            "Client-side cutoff reached at page %d — "
+                            "stopping incremental ingestion",
+                            page,
+                        )
+                        break
+                else:
+                    cursor = resp.get("cursor")
+                    if not cursor or len(batch) < 100:
+                        break
+                    time.sleep(1.0)
+                    continue
+                break
 
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
@@ -312,12 +335,10 @@ class KalshiClient:
                 conn.close()
                 if row and row[0]:
                     ts = row[0]
-                    # psycopg2 returns a datetime object for timestamptz columns
                     if isinstance(ts, datetime):
                         if ts.tzinfo is None:
                             ts = ts.replace(tzinfo=timezone.utc)
                         return ts - _INGESTION_LOOKBACK
-                    # Fallback: parse string representation
                     parsed = _parse_kalshi_ts(str(ts))
                     if parsed:
                         return parsed - _INGESTION_LOOKBACK
