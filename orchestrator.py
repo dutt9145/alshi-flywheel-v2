@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.7 — provisional loss unwind fix)
+orchestrator.py  (v19.8 — cap incremental ingestion at 10 pages)
 
 Changes vs v19.6:
   1. Provisional loss double-count bug fixed.
@@ -430,7 +430,10 @@ class FlywheelOrchestrator:
             min_ts = self.client.get_latest_outcome_ts()
             if min_ts:
                 logger.info("Incremental ingestion — fetching markets after %s", min_ts)
-            resolved_markets = self.client.get_resolved_markets(min_close_ts=min_ts)
+            resolved_markets = self.client.get_resolved_markets(
+                min_close_ts = min_ts,
+                max_pages    = 10 if min_ts else 350,  # cap incremental at 1k markets, full pull on first run
+            )
         except Exception as e:
             logger.error("Failed to fetch resolved markets: %s", e)
             return 0
@@ -1074,7 +1077,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.7 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.8 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
