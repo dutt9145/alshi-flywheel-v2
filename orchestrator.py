@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.8 — cap incremental ingestion at 10 pages)
+orchestrator.py  (v19.9 — per-event Bayesian deduplication)
 
 Changes vs v19.6:
   1. Provisional loss double-count bug fixed.
@@ -462,6 +462,15 @@ class FlywheelOrchestrator:
         processed_this_run: set[str] = set()
         recorded = 0
 
+        # ── Per-event Bayesian deduplication ──────────────────────────────────
+        # Kalshi runs ladder markets — series of 50+ correlated threshold markets
+        # from a single underlying event (e.g. KXSOLE-26APR0803-B59 through B43,
+        # all from one SOL 15-minute candle). Without deduplication, each ladder
+        # step feeds a separate record_outcome() call, inflating obs count by 50x
+        # and teaching the model "SOL closed at ~$83" as a generalizable fact.
+        # Fix: only allow ONE Bayesian update per event_ticker per ingestion cycle.
+        bayesian_updated_events: set[str] = set()
+
         for market in resolved_markets:
             if self.circuit_breaker.is_halted():
                 logger.warning(
@@ -486,8 +495,22 @@ class FlywheelOrchestrator:
                 (ticker,),
             )
 
+            # Deduplicate Bayesian updates by event_ticker within this cycle.
+            # Use normalized event_ticker if available, otherwise fall back to
+            # the ticker prefix (strip the threshold suffix after the last dash).
+            event_key = _normalize_ticker(
+                market.get("event_ticker", "") or ticker.rsplit("-", 1)[0]
+            )
+            allow_bayesian_update = event_key not in bayesian_updated_events
+
             for bot in self.bots:
                 if not bot.is_relevant(market):
+                    continue
+                if not allow_bayesian_update:
+                    logger.debug(
+                        "[%s] Skipping duplicate Bayesian update for event %s (ticker=%s)",
+                        bot.sector_name, event_key, ticker,
+                    )
                     continue
                 try:
                     features, _ = bot.fetch_features(market, skip_noaa=True)
@@ -503,6 +526,9 @@ class FlywheelOrchestrator:
                         "[%s] record_outcome failed for %s: %s",
                         bot.sector_name, ticker, e,
                     )
+
+            if allow_bayesian_update:
+                bayesian_updated_events.add(event_key)
 
             if not sig_rows:
                 processed_this_run.add(ticker)
@@ -1077,7 +1103,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.8 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.9 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
