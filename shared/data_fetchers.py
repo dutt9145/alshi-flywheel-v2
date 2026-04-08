@@ -1,13 +1,14 @@
 """
-shared/data_fetchers.py  (v5 — ESPN record unpack fix)
+shared/data_fetchers.py  (v6 — odds API TTL fix)
 
-Fixes vs v4:
-  1. ESPN record split: "5-3-1" (NHL) was crashing wins, losses = record.split("-")
-     Now safely unpacks any W-L or W-L-OT format
-  2. Metaculus removed — returns 403, defaulting to 0.5 neutral
-  3. FRED hardcoded fallbacks retained from v4
-  4. CoinGecko batched call + rate limit lock retained from v3
-  5. Exponential backoff on 429/500/502/503 retained from v3
+Changes vs v5:
+  1. fetch_sports_features() odds API TTL changed from 300s to 3600s.
+     At 300s (matching scan interval), the cache expired between every scan,
+     consuming ~576 credits/day and burning the 2,000/month paid tier in
+     under 4 days. Odds lines don't move meaningfully every 5 minutes —
+     1 hour is the right refresh cadence for pre-game lines.
+
+  2. Everything else unchanged from v5.
 
 Tier 1 (free)   : FRED, Open-Meteo, CoinGecko, Polymarket Gamma, NewsAPI, Finnhub, ESPN
 Tier 2 ($9-50)  : TheOddsAPI, OddsPapi, Polygon.io, MySportsFeeds, FMP
@@ -525,7 +526,9 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
         odds = _get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", {
             "apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h",
             "oddsFormat": "decimal", "bookmakers": "pinnacle",
-        }, ttl=300)
+        }, ttl=3600)  # FIX v6: was 300 — burned ~576 credits/day at scan interval.
+                      # Odds lines don't move meaningfully every 5 min.
+                      # 3600s = ~48 calls/day = ~1,440/month, fits $30 tier.
         if odds:
             for game in odds:
                 teams = [o["key"] for bm in game.get("bookmakers", [])
@@ -581,12 +584,11 @@ def fetch_sports_features(team_a: str = "Team A", team_b: str = "Team B",
                     rec    = c.get("records", [{}])
                     record = rec[0].get("summary", "0-0") if rec else "0-0"
 
-                    # ── FIX: safely unpack W-L or W-L-OT (NHL has 3 parts) ───
+                    # Safely unpack W-L or W-L-OT (NHL has 3 parts)
                     parts = record.split("-")
                     try:
                         wins   = int(parts[0]) if len(parts) > 0 else 0
                         losses = int(parts[1]) if len(parts) > 1 else 0
-                        # parts[2] is OT losses for NHL — ignored for win pct
                     except (ValueError, IndexError):
                         wins, losses = 0, 1
 
