@@ -1056,6 +1056,26 @@ class FlywheelOrchestrator:
 
         logger.info("Fetched %d open markets", len(markets))
 
+        # ── DIAGNOSTIC: price parsing audit (remove after debugging) ──
+        nonzero = 0
+        for m in markets[:100]:
+            if _parse_yes_price_cents(m) > 0:
+                nonzero += 1
+        if markets:
+            sample = markets[0]
+            logger.info(
+                "PRICE DIAG: %d/100 markets have nonzero price | "
+                "response_price_units=%s | tick_size=%s | "
+                "sample yes_bid=%r yes_ask=%r last=%r",
+                nonzero,
+                sample.get("response_price_units"),
+                sample.get("tick_size"),
+                sample.get("yes_bid_dollars"),
+                sample.get("yes_ask_dollars"),
+                sample.get("last_price_dollars"),
+            )
+        # ── END DIAGNOSTIC ──
+
         for market in markets:
             self._evaluate_market(market)
 
