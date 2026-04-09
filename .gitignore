@@ -2,3 +2,5 @@
 .env
 kalshi_key.pem
 kalshi_key.pem
+__pycache__/
+.vscode/
