@@ -1,17 +1,12 @@
 """
-shared/kalshi_client.py  (v9 — result field debug + broader result matching)
+shared/kalshi_client.py  (v10 — MVE parlay filter + all methods restored)
 
-Changes vs v6:
-  1. _get() and _post() now sign the full /trade-api/v2 path instead of
-     just the endpoint path. The trading API (trading-api.kalshi.com)
-     requires the complete path in the HMAC signature. The elections domain
-     was permissive about this; the trading domain is strict and returns
-     401 if the signed path doesn't match the full request path.
-
-     Before: _sign_request("GET", "/markets")
-     After:  _sign_request("GET", "/trade-api/v2/markets")
-
-  2. Everything else unchanged from v6.
+Changes vs v9:
+  1. get_all_open_markets() now filters out KXMVE parlay/multi-game markets
+     and paginates up to 80 pages to find single-game markets underneath.
+  2. All methods restored (get_resolved_markets, get_latest_outcome_ts,
+     get_balance, get_positions, place_order, cancel_order) — these were
+     accidentally dropped in the v9 paste.
 """
 
 import base64
@@ -141,8 +136,6 @@ class KalshiClient:
     # ── Core HTTP ──────────────────────────────────────────────────────────────
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
-        # FIX v7: sign the full path including /trade-api/v2 prefix.
-        # trading-api.kalshi.com validates the full path in the signature.
         sign_path = _API_PATH_PREFIX + path
         for attempt in range(_MAX_RETRIES):
             headers = _sign_request("GET", sign_path)
@@ -166,7 +159,6 @@ class KalshiClient:
         raise requests.HTTPError(f"429 rate limit not resolved after {_MAX_RETRIES} retries on {path}")
 
     def _post(self, path: str, body: dict) -> dict:
-        # FIX v7: sign the full path including /trade-api/v2 prefix.
         sign_path = _API_PATH_PREFIX + path
         body_str  = json.dumps(body)
         headers   = _sign_request("POST", sign_path)
@@ -197,10 +189,13 @@ class KalshiClient:
         Fetch all open markets with pagination.
         Skips KXMVE parlay/multi-game markets during fetch so the page cap
         fills with tradeable single-game markets instead of parlays.
+
+        FIX v10: Kalshi now returns thousands of MVE parlay markets that
+        bury the single-game markets. Filter them out and keep paginating
+        up to 80 pages to find real tradeable markets underneath.
         """
         markets, cursor, page = [], None, 0
-        max_pages = 80  # increased from 40 to dig past parlays
-        useful_pages = 0  # pages that had at least one non-MVE market
+        max_pages = 80
 
         while page < max_pages:
             try:
@@ -213,9 +208,6 @@ class KalshiClient:
             non_mve = [m for m in batch if not m.get("ticker", "").lower().startswith("kxmve")]
             markets.extend(non_mve)
             page += 1
-
-            if non_mve:
-                useful_pages += 1
 
             logger.info(
                 "Fetched page %d (%d non-MVE this page, %d total kept)",
@@ -237,3 +229,154 @@ class KalshiClient:
             page, len(markets),
         )
         return markets
+
+    def get_resolved_markets(
+        self,
+        max_pages:    int = 350,
+        min_close_ts: Optional[datetime] = None,
+    ) -> list:
+        """
+        Fetch settled markets from Kalshi.
+
+        Parameters
+        ----------
+        max_pages : int
+            Maximum pages to fetch (100 markets each).
+            Default 350 = up to 35,000 markets (for full first-run history).
+        min_close_ts : datetime, optional
+            UTC-aware datetime cutoff. Pass the result of get_latest_outcome_ts()
+            for incremental ingestion.
+        """
+        markets, cursor, page = [], None, 0
+
+        while page < max_pages:
+            params = {"status": "settled", "limit": 100}
+            if min_close_ts:
+                params["min_close_ts"] = int(min_close_ts.timestamp())
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                resp = self._get("/markets", params=params)
+            except Exception as e:
+                logger.error("get_resolved_markets page %d failed: %s", page + 1, e)
+                break
+
+            batch = resp.get("markets", [])
+
+            if page == 0 and batch:
+                sample_results = list({m.get("result") for m in batch[:20]})
+                logger.info("DEBUG resolved result values sample: %s", sample_results)
+
+            clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
+            markets.extend(clean)
+            page += 1
+
+            logger.info(
+                "Resolved markets — page %d: %d settled, %d with clean result (%d total)",
+                page, len(batch), len(clean), len(markets),
+            )
+
+            if min_close_ts and batch:
+                for check_market in [batch[0], batch[-1]]:
+                    close_str = check_market.get("close_time", "")
+                    close_dt  = _parse_kalshi_ts(close_str)
+                    if close_dt and close_dt < min_close_ts:
+                        logger.info(
+                            "Client-side cutoff reached at page %d — "
+                            "stopping incremental ingestion",
+                            page,
+                        )
+                        break
+                else:
+                    cursor = resp.get("cursor")
+                    if not cursor or len(batch) < 100:
+                        break
+                    time.sleep(1.0)
+                    continue
+                break
+
+            cursor = resp.get("cursor")
+            if not cursor or len(batch) < 100:
+                break
+
+            time.sleep(1.0)
+
+        logger.info("get_resolved_markets complete — %d total clean results", len(markets))
+        return markets
+
+    def get_latest_outcome_ts(self) -> Optional[datetime]:
+        """
+        Query outcomes table for most recent logged_at timestamp.
+        Returns a UTC-aware datetime with a 2-hour lookback buffer,
+        or None if no outcomes exist yet (triggers full history fetch).
+        """
+        import os
+        database_url = os.getenv("DATABASE_URL", "")
+        try:
+            if database_url:
+                import psycopg2
+                conn = psycopg2.connect(database_url)
+                cur  = conn.cursor()
+                cur.execute("SELECT MAX(logged_at) FROM outcomes")
+                row  = cur.fetchone()
+                conn.close()
+                if row and row[0]:
+                    ts = row[0]
+                    if isinstance(ts, datetime):
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        return ts - _INGESTION_LOOKBACK
+                    parsed = _parse_kalshi_ts(str(ts))
+                    if parsed:
+                        return parsed - _INGESTION_LOOKBACK
+            else:
+                import sqlite3
+                conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
+                row  = conn.execute("SELECT MAX(logged_at) FROM outcomes").fetchone()
+                conn.close()
+                if row and row[0]:
+                    parsed = _parse_kalshi_ts(str(row[0]))
+                    if parsed:
+                        return parsed - _INGESTION_LOOKBACK
+        except Exception as e:
+            logger.warning("get_latest_outcome_ts failed: %s", e)
+        return None
+
+    # ── Portfolio ──────────────────────────────────────────────────────────────
+
+    def get_balance(self) -> float:
+        resp = self._get("/portfolio/balance")
+        return resp.get("balance", 0) / 100
+
+    def get_positions(self) -> list:
+        return self._get("/portfolio/positions").get("market_positions", [])
+
+    # ── Orders ─────────────────────────────────────────────────────────────────
+
+    def place_order(
+        self,
+        ticker:          str,
+        side:            str,
+        count:           int,
+        yes_price:       int,
+        client_order_id: str,
+    ) -> dict:
+        if DEMO_MODE:
+            logger.info(
+                "[DEMO] Would place %s %s x%d @ %dc",
+                side.upper(), ticker, count, yes_price,
+            )
+            return {
+                "status": "demo", "ticker": ticker, "side": side,
+                "count": count, "yes_price": yes_price,
+            }
+        body = {
+            "action": "buy", "ticker": ticker, "type": "limit",
+            "side": side, "count": count, "yes_price": yes_price,
+            "client_order_id": client_order_id,
+        }
+        return self._post("/portfolio/orders", body)
+
+    def cancel_order(self, order_id: str) -> dict:
+        return self._post(f"/portfolio/orders/{order_id}/cancel", {})
