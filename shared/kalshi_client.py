@@ -1,12 +1,15 @@
 """
-shared/kalshi_client.py  (v10 — MVE parlay filter + all methods restored)
+shared/kalshi_client.py  (v11 — server-side MVE exclusion)
 
-Changes vs v9:
-  1. get_all_open_markets() now filters out KXMVE parlay/multi-game markets
-     and paginates up to 40 pages to find single-game markets underneath.
-  2. All methods restored (get_resolved_markets, get_latest_outcome_ts,
-     get_balance, get_positions, place_order, cancel_order) — these were
-     accidentally dropped in the v9 paste.
+Changes vs v10:
+  1. get_markets() now passes multivariate=exclude to the Kalshi API,
+     filtering out all MVE parlay/combo markets server-side. This is the
+     proper fix — Kalshi added this filter parameter specifically for this.
+     Previously the API returned 8,000+ MVE parlays that buried all
+     single-game markets, making the bot unable to find anything to trade.
+  2. get_all_open_markets() reverted to simple 40-page pagination since
+     MVE filtering now happens server-side. No client-side filtering needed.
+  3. All methods present and accounted for.
 """
 
 import base64
@@ -110,11 +113,6 @@ def _sign_request(method: str, path: str) -> dict:
 
 
 def _parse_kalshi_ts(ts_str: str) -> Optional[datetime]:
-    """
-    Parse a Kalshi timestamp string to a UTC-aware datetime.
-    Handles both 'Z' suffix and '+00:00' offset formats.
-    Returns None if parsing fails.
-    """
     if not ts_str:
         return None
     try:
@@ -178,21 +176,28 @@ class KalshiClient:
         status: str = "open",
         limit:  int = 100,
         cursor: Optional[str] = None,
+        exclude_mve: bool = True,
     ) -> dict:
+        """
+        Fetch markets from Kalshi API.
+
+        FIX v11: Added multivariate=exclude filter to skip MVE parlay/combo
+        markets server-side. Kalshi returns 8,000+ MVE parlays by default
+        that bury single-game markets. This filter ensures only single-leg
+        binary markets are returned.
+        """
         params = {"status": status, "limit": limit}
+        if exclude_mve:
+            params["multivariate"] = "exclude"
         if cursor:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
 
     def get_all_open_markets(self, page_sleep_sec: float = 0.25) -> list:
         """
-        Fetch all open markets with pagination.
-        Skips KXMVE parlay/multi-game markets during fetch so the page cap
-        fills with tradeable single-game markets instead of parlays.
-
-        FIX v10: Kalshi now returns thousands of MVE parlay markets that
-        bury the single-game markets. Filter them out and keep paginating
-        up to 40 pages to find real tradeable markets underneath.
+        Fetch all open single-game markets with pagination.
+        MVE parlays are excluded server-side via the multivariate=exclude
+        filter in get_markets().
         """
         markets, cursor, page = [], None, 0
         max_pages = 40
@@ -214,16 +219,8 @@ class KalshiClient:
             if not cursor or len(batch) < 100:
                 break
 
-            # Stop early if we've found enough tradeable markets
-            if len(markets) >= 2000:
-                break
-
             time.sleep(page_sleep_sec)
 
-        logger.info(
-            "Market fetch complete: %d pages, %d tradeable markets (skipped MVE parlays)",
-            page, len(markets),
-        )
         return markets
 
     def get_resolved_markets(
