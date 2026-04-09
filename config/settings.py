@@ -35,7 +35,7 @@ DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 # ── Bankroll & risk ────────────────────────────────────────────────────────────
 # FIX v6: use os.environ instead of os.getenv so Railway's value is never
 # shadowed by a local .env file picked up by load_dotenv().
-BANKROLL = float(os.environ.get("BANKROLL") or 0)
+BANKROLL = float(os.environ.get("BANKROLL") or os.getenv("BANKROLL") or 10000)
 
 # Kelly fraction: 0.25 = quarter-Kelly, standard for professional bettors.
 KELLY_FRACTION = 0.25
