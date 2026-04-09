@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.13 — SSL reconnect on _query_signals)
+orchestrator.py  (v19.14 — fix scan_markets bankroll overwrite)
 
 Changes vs v19.9:
   1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
@@ -1030,7 +1030,8 @@ class FlywheelOrchestrator:
     def scan_markets(self) -> None:
         logger.info("Scanning markets...")
 
-        self._scan_bankroll = self.circuit_breaker.sync_bankroll()
+        _synced = self.circuit_breaker.sync_bankroll()
+        self._scan_bankroll = _synced if _synced > 0 else BANKROLL
         self._scan_summary  = self.circuit_breaker.daily_summary()
         self.bankroll       = self._scan_bankroll
 
@@ -1084,7 +1085,8 @@ class FlywheelOrchestrator:
             logger.info("[%s] calibration: %s", bot.sector_name, stats)
             bot.save_model()
 
-        live_bankroll       = self.circuit_breaker.sync_bankroll()
+        _synced = self.circuit_breaker.sync_bankroll()
+        live_bankroll       = _synced if _synced > 0 else BANKROLL
         self.bankroll       = live_bankroll
         self._scan_bankroll = live_bankroll
         self._scan_summary  = {}
@@ -1109,7 +1111,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.13 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.14 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
