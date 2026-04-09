@@ -1096,17 +1096,20 @@ class FlywheelOrchestrator:
         # ── END DIAGNOSTIC ──
 
         # ── DIAGNOSTIC 2: sample tickers from priced markets ──
-        _samples = []
+        _mve_count = 0
+        _single_game = []
         for m in markets:
             yp = _parse_yes_price_cents(m)
-            if yp > 2 and yp < 98 and len(_samples) < 10:
-                _samples.append({
-                    "tk": m.get("ticker", "")[:50],
-                    "et": m.get("event_ticker", "")[:50],
-                    "yp": yp,
-                    "title": m.get("title", "")[:40],
-                })
-        logger.info("TICKER SAMPLES: %s", _samples)
+            if yp > 2 and yp < 98:
+                tk = m.get("ticker", "").lower()
+                if tk.startswith("kxmve"):
+                    _mve_count += 1
+                elif len(_single_game) < 10:
+                    _single_game.append(f"{m.get('ticker','')[:45]}@{yp}c")
+        logger.info(
+            "MARKET DIAG: priced=%d mve_blocked=%d single_game_samples=%s",
+            _diag_priced, _mve_count, _single_game,
+        )
         # ── END DIAGNOSTIC 2 ──
 
         self._execute_fades(markets)
