@@ -1,19 +1,12 @@
 """
-shared/calibration_logger.py  (v9 — connection pooling)
+shared/calibration_logger.py  (v10 — sector param on log_outcome)
 
-Changes vs v8:
-  1. _db() context manager replaced with a ThreadedConnectionPool.
-     Previously opened a brand-new psycopg2 connection on every call
-     (log_signal, log_trade, log_outcome, save_model_state, etc.).
-     Each fresh connection handshake adds latency and Supabase IO.
-     The pool reuses connections across calls — max 5 connections,
-     matching the orchestrator's own pool (combined ceiling = 10,
-     safely under Supabase's default 60).
-  2. _get_pool() is module-level with a threading.Lock guard, same
-     pattern as orchestrator.py.
-  3. _db() context manager retained as the public API — all callers
-     (log_signal, log_trade, etc.) are unchanged.
-  4. Version bump to v9.
+Changes vs v9:
+  1. log_outcome() now accepts an optional `sector` parameter and
+     writes it to the outcomes.sector column. Previously sector was
+     always NULL in outcomes, causing all P&L to appear in a NULL
+     bucket on the dashboard instead of per-sector breakdowns.
+  2. Version bump to v10.
 """
 
 import logging
@@ -30,10 +23,6 @@ DB_PATH      = os.getenv("DB_PATH", "flywheel.db")
 USE_POSTGRES = bool(DATABASE_URL)
 
 # ── Connection pool ────────────────────────────────────────────────────────────
-# Module-level pool — initialized once, shared across all calibration_logger
-# calls. Max 5 connections: combined with orchestrator's pool of 8 gives a
-# ceiling of 13, safely under Supabase's default limit of 60.
-
 _pg_pool      = None
 _pg_pool_lock = threading.Lock()
 
@@ -206,7 +195,6 @@ def init_db() -> None:
             for stmt in statements:
                 cur.execute(stmt)
 
-            # ── Migration guard ────────────────────────────────────────────
             migrations = [
                 "ALTER TABLE trades   ADD COLUMN IF NOT EXISTS sector TEXT",
                 "ALTER TABLE outcomes ADD COLUMN IF NOT EXISTS sector TEXT",
@@ -335,10 +323,12 @@ def log_outcome(
     trade_id: Optional[int] = None,
     our_prob: Optional[float] = None,
     correct: Optional[bool] = None,
+    sector: Optional[str] = None,
 ) -> None:
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(ticker),
+        str(sector) if sector is not None else None,
         str(resolved).upper(),
         float(pnl_usd)  if pnl_usd  is not None else None,
         int(trade_id)   if trade_id is not None else None,
@@ -347,8 +337,8 @@ def log_outcome(
     )
     sql = f"""
         INSERT INTO outcomes
-        (logged_at, ticker, resolved, pnl_usd, trade_id, our_prob, correct)
-        VALUES ({_ph(7)})
+        (logged_at, ticker, sector, resolved, pnl_usd, trade_id, our_prob, correct)
+        VALUES ({_ph(8)})
     """
     with _db() as conn:
         if USE_POSTGRES:
@@ -356,8 +346,10 @@ def log_outcome(
         else:
             conn.execute(sql, vals)
     logger.info(
-        "OUTCOME logged | %s resolved=%s our_prob=%s correct=%s P&L=%s",
-        ticker, resolved,
+        "OUTCOME logged | %s | sector=%s | resolved=%s our_prob=%s correct=%s P&L=%s",
+        ticker,
+        sector or "—",
+        resolved,
         f"{float(our_prob):.3f}" if our_prob is not None else "n/a",
         correct,
         f"${float(pnl_usd):.2f}" if pnl_usd is not None else "pending",

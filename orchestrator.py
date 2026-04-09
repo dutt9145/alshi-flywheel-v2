@@ -1,26 +1,23 @@
 """
-orchestrator.py  (v19.9 — per-event Bayesian deduplication)
+orchestrator.py  (v19.10 — sector propagation fix)
 
-Changes vs v19.6:
-  1. Provisional loss double-count bug fixed.
-     Previously, _ingest_resolved_markets() did:
-       self._sector_daily_pnl[sec] += pnl_usd
-     on top of an already-booked provisional loss. On a losing trade this
-     meant: -$300 (provisional at execution) + -$300 (actual at resolution)
-     = -$600 sector_pnl instead of the correct -$300.
+Changes vs v19.9:
+  1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
+     block so the same value is passed to both the provisional unwind
+     and log_outcome(). Previously sec_rows was only fetched inside
+     `if pnl_usd is not None`, leaving log_outcome() with no sector
+     argument — causing 669 NULL sector rows in the outcomes table and
+     all P&L appearing in a NULL bucket on the dashboard.
 
-     Fix: unwind the provisional first, then apply actual P&L:
-       provisional = self._open_provisionals.pop(ticker, 0.0)
-       self._sector_daily_pnl[sec] = sector_pnl - provisional + pnl_usd
+  2. Falls back to _infer_sector_from_ticker() when the signals lookup
+     returns no sector (e.g. tickers logged before sector was backfilled).
 
-     On a win:  -$300 provisional + $200 actual  → correct net -$100
-     On a loss: -$300 provisional + -$300 actual → correct net -$300
-                (was -$600 before this fix)
+  3. Passes sector= to log_outcome() so every new outcome row has a
+     sector value.
 
-  2. _open_provisionals cleared in retrain_models() nightly reset.
-
-  3. Carries forward all v19.6 changes: NO P&L formula fix, sports ticker
-     corrections, _sector_pnl_lock, provisional loss booking.
+  4. Carries forward all v19.9 changes: provisional loss double-count
+     fix, per-event Bayesian dedup, _sector_pnl_lock, NO P&L formula
+     fix, sports ticker corrections.
 """
 
 import logging
@@ -261,11 +258,6 @@ def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[
         if direction == "YES":
             pnl = contracts * ((1.0 - yes_price_frac) if resolved_yes else (-yes_price_frac))
         else:
-            # NO contract costs no_price_frac, pays $1 if NO resolves.
-            # Win: +yes_price_frac per contract (the gain on a NO contract)
-            # Loss: -no_price_frac per contract (what was paid for NO)
-            # Bug in v19.5 and earlier used -yes_price_frac for the loss,
-            # massively inflating losses on high yes_price markets.
             pnl = contracts * (no_price_frac if not resolved_yes else (-no_price_frac))
 
         total_pnl += pnl
@@ -376,15 +368,10 @@ class FlywheelOrchestrator:
         self._exposure: dict[str, float]         = {b.sector_name: 0.0 for b in self.bots}
         self._sector_daily_pnl: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
 
-        # ── FIX: Lock serializing ALL _sector_daily_pnl reads/writes ──────────
-        # Eliminates race between _run_ingestion_thread() writing mid-scan and
-        # the cap check reading a stale pre-ingestion snapshot, which caused the
-        # $149.52 gap between daily_pnl and sector_pnl in logs.
-        self._sector_pnl_lock = threading.Lock()
-
-        self._ingestion_lock                     = threading.Lock()
-        self._last_bot_probs:   dict[str, float] = {}
-        self._last_bot_sectors: dict[str, str]   = {}
+        self._sector_pnl_lock    = threading.Lock()
+        self._ingestion_lock     = threading.Lock()
+        self._last_bot_probs:    dict[str, float] = {}
+        self._last_bot_sectors:  dict[str, str]   = {}
 
         self._resolved_count_cache:    dict[str, int] = {}
         self._resolved_count_cache_ts: float          = 0.0
@@ -394,12 +381,6 @@ class FlywheelOrchestrator:
 
         self._recently_traded: dict[str, float] = {}
 
-        # ── Provisional loss tracker ───────────────────────────────────────
-        # Keyed by ticker. Stores the provisional loss booked at execution
-        # time so _ingest_resolved_markets() can unwind it precisely before
-        # applying the actual resolved P&L. Prevents the double-count bug
-        # where a losing trade would register -$300 at execution AND -$300
-        # again at resolution, producing -$600 sector_pnl.
         self._open_provisionals: dict[str, float] = {}
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
@@ -432,7 +413,7 @@ class FlywheelOrchestrator:
                 logger.info("Incremental ingestion — fetching markets after %s", min_ts)
             resolved_markets = self.client.get_resolved_markets(
                 min_close_ts = min_ts,
-                max_pages    = 10 if min_ts else 350,  # cap incremental at 1k markets, full pull on first run
+                max_pages    = 10 if min_ts else 350,
             )
         except Exception as e:
             logger.error("Failed to fetch resolved markets: %s", e)
@@ -462,13 +443,6 @@ class FlywheelOrchestrator:
         processed_this_run: set[str] = set()
         recorded = 0
 
-        # ── Per-event Bayesian deduplication ──────────────────────────────────
-        # Kalshi runs ladder markets — series of 50+ correlated threshold markets
-        # from a single underlying event (e.g. KXSOLE-26APR0803-B59 through B43,
-        # all from one SOL 15-minute candle). Without deduplication, each ladder
-        # step feeds a separate record_outcome() call, inflating obs count by 50x
-        # and teaching the model "SOL closed at ~$83" as a generalizable fact.
-        # Fix: only allow ONE Bayesian update per event_ticker per ingestion cycle.
         bayesian_updated_events: set[str] = set()
 
         for market in resolved_markets:
@@ -495,9 +469,6 @@ class FlywheelOrchestrator:
                 (ticker,),
             )
 
-            # Deduplicate Bayesian updates by event_ticker within this cycle.
-            # Use normalized event_ticker if available, otherwise fall back to
-            # the ticker prefix (strip the threshold suffix after the last dash).
             event_key = _normalize_ticker(
                 market.get("event_ticker", "") or ticker.rsplit("-", 1)[0]
             )
@@ -545,6 +516,18 @@ class FlywheelOrchestrator:
             pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
             primary_trade_id   = trade_ids[0] if trade_ids else None
 
+            # ── FIX v19.10: Resolve sector once, shared by P&L unwind AND
+            # log_outcome. Previously sec_rows was only fetched inside
+            # `if pnl_usd is not None`, so log_outcome always received
+            # sector=None, producing 669 NULL sector rows in outcomes. ────────
+            sec_rows = _query_signals(
+                f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
+                (ticker,),
+            )
+            sec = sec_rows[0].get("sector", "") if sec_rows else ""
+            if not sec:
+                sec = _infer_sector_from_ticker(ticker)
+
             if pnl_usd is not None:
                 logger.info(
                     "[P&L] %s resolved %s → $%+.2f (primary_trade_id=%s, all_ids=%s)",
@@ -552,30 +535,18 @@ class FlywheelOrchestrator:
                 )
                 self.circuit_breaker.record_pnl(pnl_usd)
 
-                sec_rows = _query_signals(
-                    f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
-                    (ticker,),
-                )
-                if sec_rows:
-                    sec = sec_rows[0].get("sector", "")
-                    with self._sector_pnl_lock:
-                        if sec in self._sector_daily_pnl:
-                            # ── FIX: Unwind provisional before applying actual P&L ──
-                            # v19.6 and earlier did += pnl_usd on top of the
-                            # provisional, double-counting losses:
-                            #   -$300 provisional + -$300 actual = -$600 (wrong)
-                            # Now we pop the provisional and replace it cleanly:
-                            #   -$300 provisional unwound, +actual applied = correct
-                            provisional = self._open_provisionals.pop(ticker, 0.0)
-                            self._sector_daily_pnl[sec] = (
-                                self._sector_daily_pnl[sec] - provisional + pnl_usd
-                            )
-                            logger.debug(
-                                "[PROVISIONAL UNWIND] %s sector=%s "
-                                "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
-                                ticker, sec, provisional, pnl_usd,
-                                self._sector_daily_pnl[sec],
-                            )
+                with self._sector_pnl_lock:
+                    if sec in self._sector_daily_pnl:
+                        provisional = self._open_provisionals.pop(ticker, 0.0)
+                        self._sector_daily_pnl[sec] = (
+                            self._sector_daily_pnl[sec] - provisional + pnl_usd
+                        )
+                        logger.debug(
+                            "[PROVISIONAL UNWIND] %s sector=%s "
+                            "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
+                            ticker, sec, provisional, pnl_usd,
+                            self._sector_daily_pnl[sec],
+                        )
             else:
                 logger.debug(
                     "[P&L] %s resolved %s — no matching trade",
@@ -592,6 +563,7 @@ class FlywheelOrchestrator:
                     trade_id = primary_trade_id,
                     our_prob = our_prob,
                     correct  = direction_correct,
+                    sector   = sec,
                 )
                 recorded += 1
             except Exception as e:
@@ -669,7 +641,6 @@ class FlywheelOrchestrator:
         self._last_bot_probs[ticker]   = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
-        # ── Arb check + log in single call (v19.4) ────────────────────────
         arb = self.arb.check_and_log(
             ticker        = ticker,
             kalshi_cents  = yes_price,
@@ -716,7 +687,6 @@ class FlywheelOrchestrator:
         arb,
         fade:        bool = False,
     ) -> None:
-        # ── Duplicate trade guard ──────────────────────────────────────────
         now      = time.monotonic()
         last_ts  = self._recently_traded.get(ticker, 0.0)
         elapsed  = now - last_ts
@@ -727,12 +697,10 @@ class FlywheelOrchestrator:
             )
             return
 
-        # ── Circuit breaker ────────────────────────────────────────────────
         if self.circuit_breaker.is_halted():
             logger.warning("CIRCUIT BREAKER HALT — skipping trade for %s", ticker)
             return
 
-        # ── Per-sector loss cap ────────────────────────────────────────────
         cap = sector_loss_cap(lead_sector)
         if cap == 0.0:
             logger.warning(
@@ -740,8 +708,6 @@ class FlywheelOrchestrator:
             )
             return
 
-        # ── FIX: Read _sector_daily_pnl under lock to get a consistent value
-        # even if ingestion thread is writing concurrently.
         with self._sector_pnl_lock:
             sector_loss_today = self._sector_daily_pnl.get(lead_sector, 0.0)
 
@@ -752,7 +718,6 @@ class FlywheelOrchestrator:
             )
             return
 
-        # ── Scan-cycle cached bankroll + summary ───────────────────────────
         live_bankroll   = self._scan_bankroll
         summary         = self._scan_summary
         daily_pnl       = float(summary.get("realized_pnl", 0.0))
@@ -762,7 +727,6 @@ class FlywheelOrchestrator:
             if daily_pnl < 0 and loss_limit > 0 else 1.0
         )
 
-        # ── Exploration Kelly ──────────────────────────────────────────────
         resolved_count = self._get_sector_resolved_count(lead_sector)
         kf             = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
@@ -775,7 +739,6 @@ class FlywheelOrchestrator:
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
-        # ── Kelly sizing ───────────────────────────────────────────────────
         if consensus.direction == "YES":
             sizing = kelly_stake(
                 prob            = consensus.avg_prob,
@@ -799,7 +762,6 @@ class FlywheelOrchestrator:
             )
             side = "no"
 
-        # ── Apply exploration scaling post-sizing ──────────────────────────
         if in_exploration and sizing["contracts"] > 0:
             exploration_scale = kf / KELLY_FRACTION
             sizing["dollars"]   = round(sizing["dollars"] * exploration_scale, 2)
@@ -846,12 +808,6 @@ class FlywheelOrchestrator:
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
 
-        # ── Provisional loss booking ───────────────────────────────────────
-        # Book the full dollars_risked as a provisional loss immediately at
-        # execution time. Makes the sector loss cap aware of in-flight open
-        # risk, not just resolved P&L. Stored in _open_provisionals so
-        # _ingest_resolved_markets() can unwind it precisely on resolution
-        # rather than stacking it with the actual P&L (the v19.6 bug).
         provisional_loss = -sizing["dollars"]
         with self._sector_pnl_lock:
             self._sector_daily_pnl[lead_sector] = (
@@ -1049,7 +1005,6 @@ class FlywheelOrchestrator:
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
 
-        # ── Read sector P&L under lock for consistent summary log ──────────
         with self._sector_pnl_lock:
             sector_pnl_snapshot = dict(self._sector_daily_pnl)
 
@@ -1085,7 +1040,6 @@ class FlywheelOrchestrator:
 
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
 
-        # ── Reset under lock ───────────────────────────────────────────────
         with self._sector_pnl_lock:
             self._sector_daily_pnl   = {b.sector_name: 0.0 for b in self.bots}
             self._open_provisionals  = {}
@@ -1103,12 +1057,11 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.9 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.10 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
 
-        # ── NewsSignal startup — 401 on bad key is non-fatal ──────────────
         try:
             self.news.start_background_poller()
         except Exception as e:
