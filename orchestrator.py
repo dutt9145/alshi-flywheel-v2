@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.11 — trade-gated outcome logging + expanded sports prefixes)
+orchestrator.py  (v19.12 — debug market fields + bankroll + result case fix)
 
 Changes vs v19.9:
   1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
@@ -333,7 +333,8 @@ class FlywheelOrchestrator:
             bankroll             = BANKROLL,
             daily_loss_limit_pct = CIRCUIT_BREAKER_PCT,
         )
-        self.bankroll = self.circuit_breaker.sync_bankroll()
+        _synced = self.circuit_breaker.sync_bankroll()
+        self.bankroll = _synced if _synced > 0 else BANKROLL
 
         self.sharp = SharpDetector(
             kalshi_client            = self.client,
@@ -459,6 +460,7 @@ class FlywheelOrchestrator:
             ticker = _normalize_ticker(market.get("ticker", ""))
             result = market.get("result", "")
 
+            result = result.lower() if result else ""
             if not ticker or result not in ("yes", "no"):
                 continue
             if ticker in already_recorded or ticker in processed_this_run:
@@ -615,6 +617,17 @@ class FlywheelOrchestrator:
         )
         title     = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
+
+        # DEBUG v19.12: log first market's raw fields to diagnose trading API format
+        if not hasattr(self, '_debug_logged'):
+            logger.info("DEBUG market keys: %s", list(market.keys()))
+            logger.info("DEBUG price fields: bid=%s ask=%s last=%s yes_ask=%s",
+                market.get("yes_bid"), market.get("yes_ask"),
+                market.get("last_price"), market.get("yes_ask_price"))
+            logger.info("DEBUG yes_bid_dollars=%s yes_ask_dollars=%s last_price_dollars=%s",
+                market.get("yes_bid_dollars"), market.get("yes_ask_dollars"),
+                market.get("last_price_dollars"))
+            self._debug_logged = True
 
         if yes_price == 0:
             return
@@ -1071,7 +1084,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.11 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.12 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
