@@ -3,7 +3,7 @@ shared/kalshi_client.py  (v10 — MVE parlay filter + all methods restored)
 
 Changes vs v9:
   1. get_all_open_markets() now filters out KXMVE parlay/multi-game markets
-     and paginates up to 80 pages to find single-game markets underneath.
+     and paginates up to 40 pages to find single-game markets underneath.
   2. All methods restored (get_resolved_markets, get_latest_outcome_ts,
      get_balance, get_positions, place_order, cancel_order) — these were
      accidentally dropped in the v9 paste.
@@ -192,10 +192,10 @@ class KalshiClient:
 
         FIX v10: Kalshi now returns thousands of MVE parlay markets that
         bury the single-game markets. Filter them out and keep paginating
-        up to 80 pages to find real tradeable markets underneath.
+        up to 40 pages to find real tradeable markets underneath.
         """
         markets, cursor, page = [], None, 0
-        max_pages = 80
+        max_pages = 40
 
         while page < max_pages:
             try:
@@ -205,14 +205,10 @@ class KalshiClient:
                 break
 
             batch = resp.get("markets", [])
-            non_mve = [m for m in batch if not m.get("ticker", "").lower().startswith("kxmve")]
-            markets.extend(non_mve)
+            markets.extend(batch)
             page += 1
 
-            logger.info(
-                "Fetched page %d (%d non-MVE this page, %d total kept)",
-                page, len(non_mve), len(markets),
-            )
+            logger.info("Fetched page %d (%d markets so far)", page, len(markets))
 
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
