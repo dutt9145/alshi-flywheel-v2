@@ -167,4 +167,4 @@ def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
 
 
 def sector_loss_cap(sector: str) -> float:
-    return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)
+    return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)# v6-bankroll-fix
