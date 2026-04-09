@@ -1076,8 +1076,24 @@ class FlywheelOrchestrator:
             )
         # ── END DIAGNOSTIC ──
 
+       # ── DIAGNOSTIC: bot signal audit (remove after debugging) ──
+        _diag_priced = 0
+        _diag_relevant = 0
         for market in markets:
+            yp = _parse_yes_price_cents(market)
+            if yp > 2 and yp < 98:
+                _diag_priced += 1
+                for bot in self.bots:
+                    if bot.is_relevant(market):
+                        _diag_relevant += 1
+                        break
             self._evaluate_market(market)
+        logger.info(
+            "SIGNAL DIAG: total=%d priced=%d relevant=%d",
+            len(markets), _diag_priced, _diag_relevant,
+        )
+        
+        # ── END DIAGNOSTIC ──
 
         self._execute_fades(markets)
         self._execute_correlations(markets)
