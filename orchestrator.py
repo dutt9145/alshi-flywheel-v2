@@ -1095,6 +1095,20 @@ class FlywheelOrchestrator:
         
         # ── END DIAGNOSTIC ──
 
+        # ── DIAGNOSTIC 2: sample tickers from priced markets ──
+        _samples = []
+        for m in markets:
+            yp = _parse_yes_price_cents(m)
+            if yp > 2 and yp < 98 and len(_samples) < 10:
+                _samples.append({
+                    "tk": m.get("ticker", "")[:50],
+                    "et": m.get("event_ticker", "")[:50],
+                    "yp": yp,
+                    "title": m.get("title", "")[:40],
+                })
+        logger.info("TICKER SAMPLES: %s", _samples)
+        # ── END DIAGNOSTIC 2 ──
+
         self._execute_fades(markets)
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
