@@ -188,7 +188,7 @@ class KalshiClient:
         """
         params = {"status": status, "limit": limit}
         if exclude_mve:
-            params["multivariate"] = "exclude"
+            params["mve_filter"] = "exclude"
         if cursor:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
