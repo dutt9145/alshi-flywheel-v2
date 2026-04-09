@@ -1,15 +1,18 @@
 """
-kalshi-flywheel / config/settings.py  (v6 — os.environ for BANKROLL)
+kalshi-flywheel / config/settings.py  (v7 — calibration audit filters)
 
-Changes vs v5:
-  1. BANKROLL now reads from os.environ instead of os.getenv.
-     os.getenv is backed by load_dotenv() which can be shadowed by a
-     committed .env file. os.environ reads directly from the process
-     environment, which Railway controls exclusively — ensuring the
-     Railway BANKROLL=10000 var is always picked up regardless of
-     any local .env file in the repo.
-
-  2. Everything else unchanged from v5.
+Changes vs v6:
+  1. MAX_EDGE_PCT added (0.25) — 30%+ edge trades went 0/4 (-$600).
+     The market was right every time. Edge ceiling kills these traps.
+  2. DIRECTION_FILTER added ("NO") — YES went 2/9 (22% WR), NO went
+     11/17 (65% WR). NO-only until YES recalibrates. Env-var override.
+  3. MIN_EDGE_PCT raised 0.02 → 0.05 — sub-5% edge trades went 0/2 (-$175).
+  4. CONSENSUS_EDGE_PCT raised 0.02 → 0.05 — keep in sync with MIN_EDGE_PCT.
+  5. CONSENSUS_CONFIDENCE raised 0.65 → 0.75 — 60-74% tier went 0/1. 
+     75-89% tier is the sweet spot (52% WR, +$2,356).
+  6. MAX_SINGLE_TRADE_USD lowered 150 → 30 — right-sized for $1,000 bankroll.
+  7. SECTOR_MAX_DAILY_LOSS sports lowered 200 → 50 — 5% of $1k bankroll.
+  8. CIRCUIT_BREAKER_PCT raised 0.05 → 0.20 — hard stop at -$200 on $1k.
 
 API TIERS
 ---------
@@ -33,25 +36,32 @@ KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 # ── Bankroll & risk ────────────────────────────────────────────────────────────
-# FIX v6: use os.environ instead of os.getenv so Railway's value is never
-# shadowed by a local .env file picked up by load_dotenv().
 BANKROLL = float(os.environ.get("BANKROLL") or os.getenv("BANKROLL") or 10000)
 
 # Kelly fraction: 0.25 = quarter-Kelly, standard for professional bettors.
 KELLY_FRACTION = 0.25
 
 # Minimum model edge required to place a trade.
-MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.02"))
+MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.05"))
+
+# Maximum model edge — edges above this are traps, not opportunities.
+# Calibration audit: 30%+ edge went 0/4 (-$600). Market was right.
+MAX_EDGE_PCT = float(os.getenv("MAX_EDGE_PCT", "0.25"))
 
 # Consensus thresholds
-CONSENSUS_EDGE_PCT   = 0.02
-CONSENSUS_CONFIDENCE = 0.65
+CONSENSUS_EDGE_PCT   = 0.05
+CONSENSUS_CONFIDENCE = 0.75
+
+# Direction filter: "NO" = only NO trades, "YES" = only YES, "BOTH" = no filter.
+# Calibration audit: YES 2/9 (22% WR), NO 11/17 (65% WR).
+# Override in Railway env var without redeploying.
+DIRECTION_FILTER = os.getenv("DIRECTION_FILTER", "NO")
 
 # Per-trade size cap as % of bankroll.
 MAX_SINGLE_TRADE_PCT = 0.04
 
 # Hard dollar cap per trade regardless of bankroll size.
-MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "150"))
+MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "30"))
 
 # Maximum exposure in one sector as % of bankroll.
 MAX_SECTOR_EXPOSURE = 0.15
@@ -61,7 +71,7 @@ MAX_MARKET_EXPOSURE = float(os.getenv("MAX_MARKET_EXPOSURE", "0.05"))
 
 # ── Per-sector daily loss caps ─────────────────────────────────────────────────
 SECTOR_MAX_DAILY_LOSS: dict[str, float] = {
-    "sports":    float(os.getenv("SECTOR_MAX_LOSS_SPORTS",    "200.0")),
+    "sports":    float(os.getenv("SECTOR_MAX_LOSS_SPORTS",    "50.0")),
     "politics":  float(os.getenv("SECTOR_MAX_LOSS_POLITICS",   "25.0")),
     "weather":   float(os.getenv("SECTOR_MAX_LOSS_WEATHER",    "30.0")),
     "economics": float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",  "40.0")),
@@ -83,7 +93,8 @@ SECTOR_MIN_RESOLVED: dict[str, int] = {
 EXPLORATION_KELLY_FRACTION = 0.25
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────
-CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.05"))
+# At $1k bankroll, 20% = $200 max drawdown before auto-pause.
+CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.20"))
 
 # ── Sharp detector ─────────────────────────────────────────────────────────────
 SHARP_SPREAD_THRESHOLD_PCT    = float(os.getenv("SHARP_SPREAD_THRESHOLD_PCT",    "0.04"))
@@ -167,4 +178,4 @@ def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
 
 
 def sector_loss_cap(sector: str) -> float:
-    return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)# v6-bankroll-fix
+    return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)
