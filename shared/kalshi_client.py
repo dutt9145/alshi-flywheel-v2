@@ -1,27 +1,17 @@
 """
-shared/kalshi_client.py  (v6 — server-side min_close_ts filtering)
+shared/kalshi_client.py  (v7 — full path signing for trading API)
 
-Changes vs v5:
-  1. get_resolved_markets() now passes min_close_ts as a Unix timestamp
-     query parameter to the Kalshi API. Previously the cutoff was only
-     checked client-side against batch[-1].close_time, which silently
-     failed because Kalshi does NOT return settled markets sorted by
-     close_time — they're in arbitrary order. This meant the client-side
-     cutoff never triggered and every 4-hour ingestion cycle fetched all
-     35,000 resolved markets from scratch, causing:
-       - ~4 minutes of API calls per cycle
-       - 429 rate limit collisions with the concurrent scan thread
-       - Supabase disk IO exhaustion from processing 35k markets repeatedly
+Changes vs v6:
+  1. _get() and _post() now sign the full /trade-api/v2 path instead of
+     just the endpoint path. The trading API (trading-api.kalshi.com)
+     requires the complete path in the HMAC signature. The elections domain
+     was permissive about this; the trading domain is strict and returns
+     401 if the signed path doesn't match the full request path.
 
-     Fix: pass min_close_ts as int Unix timestamp in the API params dict.
-     Kalshi filters server-side, returning only recently settled markets.
-     With a 2-hour lookback buffer, typical cycle now fetches 1-3 pages
-     instead of 350.
+     Before: _sign_request("GET", "/markets")
+     After:  _sign_request("GET", "/trade-api/v2/markets")
 
-  2. Client-side per-batch cutoff check retained as belt-and-suspenders.
-     Now checks both batch[0] AND batch[-1] since sort order is undefined.
-
-  3. Everything else unchanged from v5.
+  2. Everything else unchanged from v6.
 """
 
 import base64
@@ -49,6 +39,10 @@ _MAX_RETRIES = 3
 # How far back to look beyond the most recent logged outcome.
 # 2 hours catches any markets that resolved but weren't ingested in the last cycle.
 _INGESTION_LOOKBACK = timedelta(hours=2)
+
+# The path prefix expected by the trading API in signatures.
+# trading-api.kalshi.com requires the full path in the signature string.
+_API_PATH_PREFIX = "/trade-api/v2"
 
 
 def _load_private_key():
@@ -147,8 +141,11 @@ class KalshiClient:
     # ── Core HTTP ──────────────────────────────────────────────────────────────
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
+        # FIX v7: sign the full path including /trade-api/v2 prefix.
+        # trading-api.kalshi.com validates the full path in the signature.
+        sign_path = _API_PATH_PREFIX + path
         for attempt in range(_MAX_RETRIES):
-            headers = _sign_request("GET", path)
+            headers = _sign_request("GET", sign_path)
             r = self.session.get(
                 self.base + path,
                 headers=headers,
@@ -169,8 +166,10 @@ class KalshiClient:
         raise requests.HTTPError(f"429 rate limit not resolved after {_MAX_RETRIES} retries on {path}")
 
     def _post(self, path: str, body: dict) -> dict:
-        body_str = json.dumps(body)
-        headers  = _sign_request("POST", path)
+        # FIX v7: sign the full path including /trade-api/v2 prefix.
+        sign_path = _API_PATH_PREFIX + path
+        body_str  = json.dumps(body)
+        headers   = _sign_request("POST", sign_path)
         r = self.session.post(
             self.base + path,
             headers=headers,
@@ -248,19 +247,11 @@ class KalshiClient:
             FIX v6: now passed as a Unix timestamp query parameter to the Kalshi
             API so filtering happens server-side. Previously only checked
             client-side against batch[-1].close_time, which failed silently
-            because Kalshi does not sort settled markets by close_time — they're
-            in arbitrary order, so the cutoff never triggered and every cycle
-            fetched all 35,000 markets.
-
-            With server-side filtering a typical incremental cycle fetches
-            1-3 pages (100-300 markets) instead of 350 pages (35,000 markets).
+            because Kalshi does not sort settled markets by close_time.
         """
         markets, cursor, page = [], None, 0
 
         while page < max_pages:
-            # ── FIX v6: pass min_close_ts as server-side filter ────────────────
-            # Kalshi API accepts min_close_ts as a Unix timestamp (integer seconds).
-            # This eliminates the 35k-market full pull every 4 hours.
             params = {"status": "settled", "limit": 100}
             if min_close_ts:
                 params["min_close_ts"] = int(min_close_ts.timestamp())
@@ -283,9 +274,6 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
-            # ── Belt-and-suspenders client-side cutoff check ───────────────────
-            # Checks both ends of the batch since Kalshi sort order is undefined.
-            # Primary filtering is now server-side via the min_close_ts param.
             if min_close_ts and batch:
                 for check_market in [batch[0], batch[-1]]:
                     close_str = check_market.get("close_time", "")
@@ -319,9 +307,6 @@ class KalshiClient:
         Query outcomes table for most recent logged_at timestamp.
         Returns a UTC-aware datetime with a 2-hour lookback buffer,
         or None if no outcomes exist yet (triggers full history fetch).
-
-        Used by orchestrator._ingest_resolved_markets() to build
-        min_close_ts for incremental resolved market fetching.
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
