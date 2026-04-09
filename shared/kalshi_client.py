@@ -1,5 +1,5 @@
 """
-shared/kalshi_client.py  (v7 — full path signing for trading API)
+shared/kalshi_client.py  (v9 — result field debug + broader result matching)
 
 Changes vs v6:
   1. _get() and _post() now sign the full /trade-api/v2 path instead of
@@ -265,7 +265,15 @@ class KalshiClient:
                 break
 
             batch = resp.get("markets", [])
-            clean = [m for m in batch if m.get("result") in ("yes", "no")]
+
+            # DEBUG v9: log result values on first page to diagnose trading API format
+            if page == 0 and batch:
+                sample_results = list({m.get("result") for m in batch[:20]})
+                logger.info("DEBUG resolved result values sample: %s", sample_results)
+
+            # Trading API may use different result values — accept yes/no/YES/NO
+            # and also log any unrecognized values for diagnosis
+            clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
             markets.extend(clean)
             page += 1
 

@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.12 — debug market fields + bankroll + result case fix)
+orchestrator.py  (v19.13 — SSL reconnect on _query_signals)
 
 Changes vs v19.9:
   1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
@@ -177,7 +177,7 @@ def _ph() -> str:
     return "%s" if os.getenv("DATABASE_URL") else "?"
 
 
-def _query_signals(sql: str, params: tuple = ()) -> list:
+def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
     pool = _get_pool()
     try:
         if pool:
@@ -189,8 +189,33 @@ def _query_signals(sql: str, params: tuple = ()) -> list:
                 rows = [dict(zip(cols, r)) for r in cur.fetchall()]
                 conn.commit()
                 return rows
-            finally:
+            except Exception as e:
+                # SSL connection dropped — close the broken connection and retry
+                # with a fresh one rather than returning empty results.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
                 pool.putconn(conn)
+                if _retries > 0:
+                    logger.warning(
+                        "_query_signals SSL/connection error, retrying (%d left): %s",
+                        _retries, e,
+                    )
+                    # Force the pool to drop this connection
+                    global _pg_pool
+                    try:
+                        _pg_pool.closeall()
+                    except Exception:
+                        pass
+                    _pg_pool = None
+                    return _query_signals(sql, params, _retries=_retries - 1)
+                raise
+            finally:
+                try:
+                    pool.putconn(conn)
+                except Exception:
+                    pass
         else:
             import sqlite3
             db_path = os.getenv("DB_PATH", "flywheel.db")
@@ -1084,7 +1109,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.12 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.13 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
