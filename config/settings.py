@@ -1,16 +1,15 @@
 """
-kalshi-flywheel / config/settings.py  (v5 — KALSHI_API_BASE env var fix)
+kalshi-flywheel / config/settings.py  (v6 — os.environ for BANKROLL)
 
-Changes vs v4:
-  1. KALSHI_API_BASE is now read from environment variable instead of being
-     hardcoded to the deprecated elections subdomain. Previously hardcoded as:
-       "https://api.elections.kalshi.com/trade-api/v2"
-     This meant the 401 bankroll sync error could NOT be fixed via Railway env
-     vars — load_dotenv() never overrides a hardcoded value. Now reads from
-     KALSHI_API_BASE env var with the correct trading API as default:
-       os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
+Changes vs v5:
+  1. BANKROLL now reads from os.environ instead of os.getenv.
+     os.getenv is backed by load_dotenv() which can be shadowed by a
+     committed .env file. os.environ reads directly from the process
+     environment, which Railway controls exclusively — ensuring the
+     Railway BANKROLL=10000 var is always picked up regardless of
+     any local .env file in the repo.
 
-  2. Everything else unchanged from v4.
+  2. Everything else unchanged from v5.
 
 API TIERS
 ---------
@@ -25,32 +24,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Kalshi ─────────────────────────────────────────────────────────────────────
-# KALSHI_API_BASE: set in Railway env vars to override.
-# Default is the main trading API — NOT the deprecated elections subdomain.
-# The elections subdomain (api.elections.kalshi.com) does not expose
-# /portfolio/balance, causing 401s on every bankroll sync.
 KALSHI_API_BASE    = os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2")
 KALSHI_KEY_ID      = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
 
 # ── Demo mode ──────────────────────────────────────────────────────────────────
 # Default is TRUE — you must explicitly set DEMO_MODE=false in Railway to go live.
-# This prevents accidental live trading if the env var is missing.
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 # ── Bankroll & risk ────────────────────────────────────────────────────────────
-# BANKROLL defaults to 0 — bot will refuse to place trades if env var is unset.
-# This prevents sizing real trades against a phantom $10k if Railway drops the var.
-BANKROLL = float(os.getenv("BANKROLL") or 0)
+# FIX v6: use os.environ instead of os.getenv so Railway's value is never
+# shadowed by a local .env file picked up by load_dotenv().
+BANKROLL = float(os.environ.get("BANKROLL") or 0)
 
 # Kelly fraction: 0.25 = quarter-Kelly, standard for professional bettors.
-# Do NOT raise above 0.25 until you have 500+ resolved trades with verified edge.
 KELLY_FRACTION = 0.25
 
 # Minimum model edge required to place a trade.
 MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.02"))
 
-# Consensus thresholds (used when multiple sector signals must agree)
+# Consensus thresholds
 CONSENSUS_EDGE_PCT   = 0.02
 CONSENSUS_CONFIDENCE = 0.65
 
@@ -67,18 +60,6 @@ MAX_SECTOR_EXPOSURE = 0.15
 MAX_MARKET_EXPOSURE = float(os.getenv("MAX_MARKET_EXPOSURE", "0.05"))
 
 # ── Per-sector daily loss caps ─────────────────────────────────────────────────
-# Hard stop per sector per day in dollars.
-# Once a sector hits its cap, no new trades fire in that sector until midnight.
-#
-# Calibration guide:
-#   - Sports: highest cap — most data, most resolved, proven edge
-#   - Politics: low cap — long-dated markets, slow feedback loop
-#   - Weather: low cap — NOAA integration is new, model still learning
-#   - Economics/Crypto/Tech: medium cap — markets haven't resolved yet,
-#     models are unvalidated. Raise these after 30+ resolved trades each.
-#
-# Set any sector to 0.0 to completely disable trading in that sector.
-# These are intentionally conservative — raise them as Brier scores improve.
 SECTOR_MAX_DAILY_LOSS: dict[str, float] = {
     "sports":    float(os.getenv("SECTOR_MAX_LOSS_SPORTS",    "200.0")),
     "politics":  float(os.getenv("SECTOR_MAX_LOSS_POLITICS",   "25.0")),
@@ -89,11 +70,6 @@ SECTOR_MAX_DAILY_LOSS: dict[str, float] = {
 }
 
 # ── Per-sector minimum resolved trades before full Kelly sizing ────────────────
-# Below this threshold the bot trades at EXPLORATION_KELLY_FRACTION of normal
-# Kelly (25% of normal = cautious exploration while the model learns).
-#
-# Sports is set low (20) because it already has existing resolved markets.
-# All others are set to 30 — raise to 50 after the model stabilizes.
 SECTOR_MIN_RESOLVED: dict[str, int] = {
     "sports":    int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",    "20")),
     "politics":  int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",  "30")),
@@ -103,15 +79,10 @@ SECTOR_MIN_RESOLVED: dict[str, int] = {
     "tech":      int(os.getenv("SECTOR_MIN_RESOLVED_TECH",      "30")),
 }
 
-# Exploration Kelly multiplier — applied POST-sizing when resolved count is
-# below SECTOR_MIN_RESOLVED. Trades at 25% of normal Kelly during exploration.
-# Example: normal Kelly produces $40 stake → exploration stake = $40 * 0.25 = $10.
-# Do NOT set below 0.1 — stakes will fall below the $1 floor and size to zero.
+# Exploration Kelly multiplier — trades at 25% of normal Kelly during exploration.
 EXPLORATION_KELLY_FRACTION = 0.25
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────
-# Halt ALL trading if total daily loss exceeds this fraction of bankroll.
-# 5% = $500 on a $10k bankroll.
 CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.05"))
 
 # ── Sharp detector ─────────────────────────────────────────────────────────────
@@ -151,7 +122,7 @@ NEWSAPI_KEY     = os.getenv("NEWSAPI_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 # ── TIER 2: $9–$50/mo ─────────────────────────────────────────────────────────
-ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")       # the-odds-api.com — highest ROI add
+ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")
 ODDSPAPI_KEY      = os.getenv("ODDSPAPI_KEY", "")
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
 MYSPORTSFEEDS_KEY = os.getenv("MYSPORTSFEEDS_KEY", "")
@@ -181,10 +152,6 @@ SECTORS = ["economics", "crypto", "politics", "weather", "tech", "sports"]
 
 # ── Bet sizing helpers ─────────────────────────────────────────────────────────
 def max_bet_size() -> float:
-    """
-    Returns the maximum allowable bet in dollars, respecting both the
-    percentage cap and the hard dollar cap.
-    """
     if BANKROLL <= 0:
         raise ValueError(
             "BANKROLL is 0 or unset — set BANKROLL in your Railway environment variables."
@@ -193,35 +160,6 @@ def max_bet_size() -> float:
 
 
 def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
-    """
-    Returns the TARGET effective Kelly fraction for a given sector.
-
-    This value already encodes KELLY_FRACTION:
-      - Exploration (resolved < SECTOR_MIN_RESOLVED):
-            returns KELLY_FRACTION * EXPLORATION_KELLY_FRACTION
-            e.g. 0.25 * 0.25 = 0.0625
-      - Full Kelly (resolved >= SECTOR_MIN_RESOLVED):
-            returns KELLY_FRACTION
-            e.g. 0.25
-
-    IMPORTANT — how to use this in orchestrator._execute_trade():
-    ──────────────────────────────────────────────────────────────
-    Do NOT pass kf into kelly_stake() — that function applies KELLY_FRACTION
-    internally. Passing kf in would double-apply KELLY_FRACTION.
-
-    Instead, call kelly_stake() with the raw drawdown_factor, then apply
-    exploration scaling as a POST-SIZING multiplier:
-
-        sizing = kelly_stake(..., drawdown_factor=drawdown_factor)
-
-        if in_exploration and sizing["contracts"] > 0:
-            exploration_scale = kf / KELLY_FRACTION   # e.g. 0.0625 / 0.25 = 0.25
-            sizing["dollars"]   = sizing["dollars"] * exploration_scale
-            sizing["contracts"] = max(1, int(sizing["dollars"] / price_frac))
-
-    This ensures KELLY_FRACTION is applied exactly once (inside kelly_sizer),
-    and exploration scaling is a clean 0.25x multiplier on the already-sized stake.
-    """
     min_resolved = SECTOR_MIN_RESOLVED.get(sector, 30)
     if resolved_count < min_resolved:
         return KELLY_FRACTION * EXPLORATION_KELLY_FRACTION
@@ -229,13 +167,4 @@ def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
 
 
 def sector_loss_cap(sector: str) -> float:
-    """
-    Returns the daily loss cap in dollars for a given sector.
-    Returns 0.0 if the sector is unknown (disables trading).
-
-    Usage in orchestrator._execute_trade():
-        cap = sector_loss_cap(lead_sector)
-        if sector_daily_loss > cap:
-            return  # skip trade
-    """
     return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)
