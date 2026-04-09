@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.10 — sector propagation fix)
+orchestrator.py  (v19.11 — trade-gated outcome logging + expanded sports prefixes)
 
 Changes vs v19.9:
   1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
@@ -87,6 +87,7 @@ _SPORTS_PREFIXES = (
     "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
     "kxrugby", "kxesport",
     "kxeuroleague", "kxcba", "kxcbagame",
+    "kxacbgame", "kxaleaguegame", "kxaleague",  # v19.11: added missing prefixes
 )
 
 
@@ -128,7 +129,9 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxtennis", "kxf1", "kxolympic", "kxepl", "kxsoccer",
       "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
       "kxdota", "kxintlf", "kxcs2",
-      "kxeuroleague", "kxcba", "kxcbagame"), "sports"),
+      "kxeuroleague", "kxcba", "kxcbagame",
+      "kxacbgame", "kxaleaguegame", "kxaleague",  # v19.11
+      ), "sports"),
     (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi"), "crypto"),
     (("kxelect", "kxpres", "kxsen", "kxhouse", "kxgov",
       "kxpol", "kxvote", "kxapprove"), "politics"),
@@ -501,6 +504,9 @@ class FlywheelOrchestrator:
             if allow_bayesian_update:
                 bayesian_updated_events.add(event_key)
 
+            # Always update signal Brier regardless of whether we traded
+            _update_signal_brier(ticker, resolved_yes)
+
             if not sig_rows:
                 processed_this_run.add(ticker)
                 continue
@@ -516,10 +522,20 @@ class FlywheelOrchestrator:
             pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
             primary_trade_id   = trade_ids[0] if trade_ids else None
 
-            # ── FIX v19.10: Resolve sector once, shared by P&L unwind AND
-            # log_outcome. Previously sec_rows was only fetched inside
-            # `if pnl_usd is not None`, so log_outcome always received
-            # sector=None, producing 669 NULL sector rows in outcomes. ────────
+            # ── FIX v19.11: Gate outcome log on trade existence ────────────
+            # Skip outcomes table write entirely if we had a signal but never
+            # executed a trade. Eliminates NULL pnl_usd / NULL trade_id rows
+            # (88 economics, 447 weather) that polluted Brier scores.
+            # Bayesian model update and signal Brier update above still run.
+            if primary_trade_id is None:
+                logger.debug(
+                    "[OUTCOME SKIP] %s — signal exists but no trade, skipping outcome log",
+                    ticker,
+                )
+                processed_this_run.add(ticker)
+                continue
+
+            # ── Resolve sector once, shared by P&L unwind AND log_outcome ──
             sec_rows = _query_signals(
                 f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
                 (ticker,),
@@ -572,8 +588,6 @@ class FlywheelOrchestrator:
                     "outcome counted but not persisted; will retry next ingestion cycle",
                     ticker, primary_trade_id, e,
                 )
-
-            _update_signal_brier(ticker, resolved_yes)
 
         logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
@@ -1057,7 +1071,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.10 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.11 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
