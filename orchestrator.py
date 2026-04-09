@@ -1,5 +1,5 @@
 """
-orchestrator.py  (v19.14 — fix scan_markets bankroll overwrite)
+orchestrator.py  (v19.15 — fix price parsing for one-sided markets)
 
 Changes vs v19.9:
   1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
@@ -237,6 +237,11 @@ def _parse_yes_price_cents(market: dict) -> int:
         ask = float(market.get("yes_ask_dollars") or 0)
         if bid > 0 and ask > 0:
             return int(round((bid + ask) / 2 * 100))
+        # FIX v19.15: trading API sometimes returns only ask or only bid
+        if ask > 0:
+            return int(round(ask * 100))
+        if bid > 0:
+            return int(round(bid * 100))
     except (TypeError, ValueError):
         pass
     try:
@@ -1111,7 +1116,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.14 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.15 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
