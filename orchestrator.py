@@ -1097,18 +1097,21 @@ class FlywheelOrchestrator:
 
         # ── DIAGNOSTIC 2: sample tickers from priced markets ──
         _mve_count = 0
+        _extreme_single = 0
         _single_game = []
         for m in markets:
+            tk = m.get("ticker", "").lower()
             yp = _parse_yes_price_cents(m)
-            if yp > 2 and yp < 98:
-                tk = m.get("ticker", "").lower()
-                if tk.startswith("kxmve"):
-                    _mve_count += 1
-                elif len(_single_game) < 10:
+            if tk.startswith("kxmve"):
+                _mve_count += 1
+            else:
+                if yp > 2 and yp < 98 and len(_single_game) < 5:
                     _single_game.append(f"{m.get('ticker','')[:45]}@{yp}c")
+                elif yp <= 2 or yp >= 98:
+                    _extreme_single += 1
         logger.info(
-            "MARKET DIAG: priced=%d mve_blocked=%d single_game_samples=%s",
-            _diag_priced, _mve_count, _single_game,
+            "MARKET DIAG: total=%d mve=%d extreme_single=%d tradeable_single=%s",
+            len(markets), _mve_count, _extreme_single, _single_game,
         )
         # ── END DIAGNOSTIC 2 ──
 
