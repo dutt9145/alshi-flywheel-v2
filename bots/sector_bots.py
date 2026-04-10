@@ -1140,25 +1140,32 @@ class SportsBot(BaseBot):
     def _try_mlb_player_prop(self, market: dict):
         """Route MLB player prop markets through the new hit-rate model.
 
-        Returns a BotSignal if the market is an MLB player prop we can model,
-        otherwise None (caller falls back to the base class evaluate()).
+        Returns a tuple (handled, signal):
+          handled=False → couldn't process, caller should fall through to base class
+          handled=True, signal=None → processed successfully but edge too small, SKIP
+          handled=True, signal=BotSignal → processed successfully, emit signal
+
+        The critical invariant: once we successfully compute a prediction, we
+        NEVER fall through to the flat-prior base class path. A "no edge"
+        answer from a real model is still correct; substituting a flat prior
+        for it would corrupt the signal.
         """
         ticker = market.get("ticker", "")
         if not ticker.startswith("KXMLB"):
-            return None
+            return False, None
 
         # Game-level MLB markets (TOTAL, SPREAD, F5, futures) → base class path
         if is_mlb_non_player_prop_market(ticker):
-            return None
+            return False, None
 
         parsed = parse_mlb_ticker(ticker)
         if parsed is None:
-            return None
+            return False, None
 
         team_info = MLB_TEAMS.get(parsed.player_team_code)
         if not team_info:
             logger.debug("[sports/mlb] unknown team code %s", parsed.player_team_code)
-            return None
+            return False, None
         team_id = team_info[0]
 
         player = lookup_player(
@@ -1168,47 +1175,45 @@ class SportsBot(BaseBot):
             logger.debug("[sports/mlb] player not found: %s %s #%s on %s",
                          parsed.player_first, parsed.player_last,
                          parsed.player_jersey, parsed.player_team_code)
-            return None
+            return False, None
 
         # Fetch stats — different path for batters vs pitchers
         if parsed.prop_code == "KS":
             pitcher = fetch_pitcher_stats(player.player_id)
             if not pitcher or pitcher.innings <= 0:
-                return None
+                return False, None
             prediction = predict_mlb_prop(parsed, None, None, pitcher)
         else:
             season = fetch_batter_stats(player.player_id)
             if not season or season.plate_apps <= 0:
-                return None
+                return False, None
             rolling = fetch_batter_rolling(player.player_id, n_games=10)
             prediction = predict_mlb_prop(parsed, season, rolling, None)
 
         if not prediction:
-            return None
+            return False, None
 
-        # Extract market price the same way BaseBot does
+        # ── We have a valid model prediction — COMMIT to it ──────────────
         from bots.base_bot import _market_prob
         market_prob = _market_prob(market)
         our_prob    = prediction.prob_yes
         edge        = abs(our_prob - market_prob)
+        direction   = "YES" if our_prob > market_prob else "NO"
 
-        if edge < MIN_EDGE_PCT:
-            logger.debug(
-                "[sports/mlb] %s edge %.2f%% below threshold",
-                ticker, edge * 100,
-            )
-            return None
-
-        direction = "YES" if our_prob > market_prob else "NO"
-
+        # Log EVERY prediction so we can see the model running on every market,
+        # not just ones that cross the edge threshold.
         logger.info(
             "[sports/mlb] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
             ticker, player.full_name, our_prob, market_prob,
             our_prob - market_prob, direction, prediction.confidence,
         )
-        logger.debug("[sports/mlb] rationale: %s", prediction.rationale)
 
-        return BotSignal(
+        # Below edge threshold: return (handled, None) so we skip cleanly
+        # without falling through to the flat-prior path.
+        if edge < MIN_EDGE_PCT:
+            return True, None
+
+        return True, BotSignal(
             sector      = self.sector_name,
             prob        = our_prob,
             confidence  = prediction.confidence,
@@ -1217,10 +1222,14 @@ class SportsBot(BaseBot):
         )
 
     def evaluate(self, market, news_signal=None):
-        """Override BaseBot.evaluate() to try the MLB player prop path first."""
-        mlb_signal = self._try_mlb_player_prop(market)
-        if mlb_signal is not None:
-            return mlb_signal
+        """Override BaseBot.evaluate() to try the MLB player prop path first.
+
+        Commits to the new model whenever it can produce a prediction,
+        even if the signal is filtered out by the edge threshold.
+        """
+        handled, signal = self._try_mlb_player_prop(market)
+        if handled:
+            return signal
         return super().evaluate(market, news_signal=news_signal)
 
     # ─────────────────────────────────────────────────────────────────────
