@@ -114,6 +114,7 @@ MLB_PROPS = {
 MLB_NON_PLAYER_PROP_PREFIXES = (
     # ── Game-level markets ──────────────────────────────────────────
     "KXMLBTOTAL",      # game total runs (over/under)
+    "KXMLBTEAMTOTAL",  # team total runs (over/under, per-team)
     "KXMLBSPREAD",     # game run line
     "KXMLBF5TOTAL",    # first 5 innings total
     "KXMLBF5SPREAD",   # first 5 innings spread
