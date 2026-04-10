@@ -1,7 +1,19 @@
 """
-bots/sector_bots.py  (v11.3 — fix massive sector misclassification)
+bots/sector_bots.py  (v11.4 — MLB player prop integration)
 
-Changes vs v11.2:
+Changes vs v11.3:
+  SportsBot:
+    - Added evaluate() override that routes MLB player prop markets through
+      the new hit-rate model (shared/mlb_hit_model.py) instead of the broken
+      flat-prior BayesianPolyModel path.
+    - All non-MLB markets and non-player-prop MLB markets (TOTAL, SPREAD,
+      F5, futures) continue through the base class evaluate() unchanged.
+    - New _try_mlb_player_prop() helper handles the full pipeline:
+      parse ticker → lookup player → fetch stats → run model → return BotSignal.
+    - Requires shared/kalshi_ticker_parser.py, shared/mlb_stats_fetcher.py,
+      and shared/mlb_hit_model.py to be deployed alongside this file.
+
+Changes vs v11.2 (unchanged from v11.3):
   _has_sports_prefix:
     - Added ~35 missing international sports prefixes that were causing
       hundreds of signals to bleed into wrong sectors:
@@ -49,6 +61,22 @@ from shared.noaa_client import (
     parse_temp_threshold,
     classify_weather_market,
 )
+
+# ── v11.4: MLB player prop integration imports ──────────────────────────────
+from shared.kalshi_ticker_parser import (
+    parse_mlb_ticker,
+    is_mlb_non_player_prop_market,
+    MLB_TEAMS,
+)
+from shared.mlb_stats_fetcher import (
+    lookup_player,
+    fetch_batter_stats,
+    fetch_batter_rolling,
+    fetch_pitcher_stats,
+)
+from shared.mlb_hit_model import predict_mlb_prop
+from shared.consensus_engine import BotSignal
+from config.settings import MIN_EDGE_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -1104,6 +1132,98 @@ class SportsBot(BaseBot):
     @property
     def sector_name(self) -> str:
         return "sports"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # v11.4: MLB PLAYER PROP ROUTING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _try_mlb_player_prop(self, market: dict):
+        """Route MLB player prop markets through the new hit-rate model.
+
+        Returns a BotSignal if the market is an MLB player prop we can model,
+        otherwise None (caller falls back to the base class evaluate()).
+        """
+        ticker = market.get("ticker", "")
+        if not ticker.startswith("KXMLB"):
+            return None
+
+        # Game-level MLB markets (TOTAL, SPREAD, F5, futures) → base class path
+        if is_mlb_non_player_prop_market(ticker):
+            return None
+
+        parsed = parse_mlb_ticker(ticker)
+        if parsed is None:
+            return None
+
+        team_info = MLB_TEAMS.get(parsed.player_team_code)
+        if not team_info:
+            logger.debug("[sports/mlb] unknown team code %s", parsed.player_team_code)
+            return None
+        team_id = team_info[0]
+
+        player = lookup_player(
+            team_id, parsed.player_first, parsed.player_last, parsed.player_jersey,
+        )
+        if not player:
+            logger.debug("[sports/mlb] player not found: %s %s #%s on %s",
+                         parsed.player_first, parsed.player_last,
+                         parsed.player_jersey, parsed.player_team_code)
+            return None
+
+        # Fetch stats — different path for batters vs pitchers
+        if parsed.prop_code == "KS":
+            pitcher = fetch_pitcher_stats(player.player_id)
+            if not pitcher or pitcher.innings <= 0:
+                return None
+            prediction = predict_mlb_prop(parsed, None, None, pitcher)
+        else:
+            season = fetch_batter_stats(player.player_id)
+            if not season or season.plate_apps <= 0:
+                return None
+            rolling = fetch_batter_rolling(player.player_id, n_games=10)
+            prediction = predict_mlb_prop(parsed, season, rolling, None)
+
+        if not prediction:
+            return None
+
+        # Extract market price the same way BaseBot does
+        from bots.base_bot import _market_prob
+        market_prob = _market_prob(market)
+        our_prob    = prediction.prob_yes
+        edge        = abs(our_prob - market_prob)
+
+        if edge < MIN_EDGE_PCT:
+            logger.debug(
+                "[sports/mlb] %s edge %.2f%% below threshold",
+                ticker, edge * 100,
+            )
+            return None
+
+        direction = "YES" if our_prob > market_prob else "NO"
+
+        logger.info(
+            "[sports/mlb] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
+            ticker, player.full_name, our_prob, market_prob,
+            our_prob - market_prob, direction, prediction.confidence,
+        )
+        logger.debug("[sports/mlb] rationale: %s", prediction.rationale)
+
+        return BotSignal(
+            sector      = self.sector_name,
+            prob        = our_prob,
+            confidence  = prediction.confidence,
+            market_prob = market_prob,
+            brier_score = 0.10,
+        )
+
+    def evaluate(self, market, news_signal=None):
+        """Override BaseBot.evaluate() to try the MLB player prop path first."""
+        mlb_signal = self._try_mlb_player_prop(market)
+        if mlb_signal is not None:
+            return mlb_signal
+        return super().evaluate(market, news_signal=news_signal)
+
+    # ─────────────────────────────────────────────────────────────────────
 
     def is_relevant(self, market: dict) -> bool:
         et = market.get("event_ticker", "").lower()
