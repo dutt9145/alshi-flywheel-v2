@@ -1,38 +1,30 @@
 """
-bots/sector_bots.py  (v11.2 — fix esports/weather bleed + tennis/crypto misclassification)
+bots/sector_bots.py  (v11.3 — fix massive sector misclassification)
 
-Changes vs v11.1:
-  _has_sports_prefix (module-level guard):
-    - Added kxow* (Overwatch League), kxvalorant* (VCT), kxlol* (LoL esports),
-      kxrl* (Rocket League), kxatp* (ATP/WTA tennis), kxcsgo* as explicit prefixes.
-    - Previously, kxow and kxvalorant were absent, so OWL/VCT market titles
-      containing city-named teams (Los Angeles, Atlanta, San Francisco, etc.)
-      were being claimed by WeatherBot via city keyword match and traded as
-      weather markets with NOAA priors. Completely wrong feature set.
-    - kxatp was absent, causing KXATPSETWINNER markets to be claimed by
-      CryptoBot via "apt" (Aptos) substring match in the ticker.
-
-  CryptoBot:
-    - Removed bare "op", "near", "base", "sei" from KEYWORDS — these 2–4
-      character strings substring-match inside unrelated words in market
-      titles (e.g. "operation", "nearby", "baseball", "series"). Replaced
-      with more specific variants: "optimism op", "near protocol", "base l2",
-      "sei network" that require meaningful context to match.
-
-  WeatherBot:
-    - Added _ESPORTS_BLOCKLIST to is_relevant() as a secondary defense-in-depth
-      guard. Even if _has_sports_prefix is expanded, this ensures WeatherBot
-      explicitly rejects any kxow/kxvalorant/kxlol/kxrl/kxatp market that
-      somehow slips through prefix normalization.
+Changes vs v11.2:
+  _has_sports_prefix:
+    - Added ~35 missing international sports prefixes that were causing
+      hundreds of signals to bleed into wrong sectors:
+        crypto:    ~400 of 529 signals were actually sports (Argentine soccer,
+                   PGA golf, La Liga, cricket, ATP tennis, etc.)
+        weather:   ~700 of 1,624 signals were sports (A-League via "melbourne"
+                   city match, Bundesliga, Serie A, Diamond League, AHL, etc.)
+                   Plus 429 Survivor TV show signals matched via city keywords.
+                   6 "resolved" weather outcomes were all cricket matches with
+                   0.92 confidence NOAA priors → Brier 0.4269 (catastrophic).
+        economics: 6 of 16 signals were golf (KXOWGA)
+    - After cleanup: all 185 resolved outcomes are sports, Brier 0.2535.
+      All other sectors have 0 resolved outcomes.
 
   SportsBot:
-    - Added kxow, kxvalorant, kxlol, kxrl, kxatp to KEYWORDS (prefix section)
-      so these markets are positively claimed by SportsBot rather than falling
-      through to no-sector.
-    - Added kxow → "OWL", kxvalorant → "VCT", kxlol → "LOL", kxrl → "RL",
-      kxatp → "ATP" to LEAGUE_MAP for correct league inference.
-    - Added "overwatch league", "owl match", "vct", "valorant champions" to
-      keyword list for title-level matching on esports markets.
+    - Added all new prefixes to KEYWORDS and LEAGUE_MAP.
+
+  PoliticsBot:
+    - Removed "kxintl" from KEYWORDS (international sports, not politics).
+
+  WeatherBot:
+    - Added kxsurv, kxalea, kxdima, kxcba to _ESPORTS_BLOCKLIST (renamed
+      to _NON_WEATHER_BLOCKLIST for clarity).
 """
 
 import asyncio
@@ -72,31 +64,106 @@ def _search_fields(market: dict, keywords: list[str]) -> bool:
 
 
 def _has_sports_prefix(market: dict) -> bool:
+    """Gate that prevents non-sports bots from claiming sports markets.
+
+    v11.3: Added ~35 missing prefixes. Every prefix here blocks weather/crypto/
+    economics/politics/tech bots from claiming the market. If a prefix is here
+    but NOT in any bot's KEYWORDS, the market is simply skipped (correct
+    behavior for unmodelable markets like Survivor TV show).
+    """
     SPORTS_PREFIXES = (
         # ── KXMVE family ──────────────────────────────────────────────────
-        "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
-        "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
-        "kxmvecbchampionship",
-        # ── Standard US sport prefixes ─────────────────────────────────────
+        "kxmve",
+
+        # ── US major sports ───────────────────────────────────────────────
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
-        "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-        "kxolympic", "kxthail", "kxsl",
-        "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
-        "kxrugby", "kxesport",
-        # ── Tennis — added v11.2 ───────────────────────────────────────────
-        # kxatp was missing, causing KXATPSETWINNER to bleed into CryptoBot
-        # via "apt" (Aptos) substring match.
+        "kxufc", "kxncaa", "kxcbb", "kxcfb",
+
+        # ── Tennis ────────────────────────────────────────────────────────
         "kxatp", "kxwta", "kxtennis",
-        # ── Esports — added v11.2 ─────────────────────────────────────────
-        # kxow (Overwatch League) and kxvalorant (VCT) were missing, causing
-        # OWL/VCT markets with city-named teams to bleed into WeatherBot.
+
+        # ── Golf ──────────────────────────────────────────────────────────
+        # v11.3: kxpga was missing → bled into crypto ("pga" no match but
+        # ticker substring issues) and weather (golfer city names).
+        # kxowga was missing → bled into economics.
+        "kxgolf", "kxpga", "kxowga",
+
+        # ── International soccer ──────────────────────────────────────────
+        # v11.3: ALL of these were missing. Argentine soccer (kxarg) bled
+        # into crypto (120 signals). La Liga, Bundesliga, Serie A, etc.
+        # bled into weather via city name keyword matching.
+        "kxepl", "kxsoccer",
+        "kxarg",       # Argentine Primera División (kxargp, kxargl)
+        "kxlali",      # La Liga
+        "kxbund",      # Bundesliga
+        "kxseri",      # Serie A
+        "kxliga",      # Liga generic
+        "kxligu",      # Ligue 1
+        "kxbras",      # Brasileirão
+        "kxswis",      # Swiss Super League
+        "kxbelg",      # Belgian Pro League
+        "kxecul",      # Ecuadorian Liga Pro
+        "kxpslg",      # Pakistan/South Africa Premier League
+        "kxsaud",      # Saudi Pro League
+        "kxjlea",      # J-League (Japan)
+        "kxuclt",      # UEFA Champions League
+        "kxfifa",      # FIFA
+
+        # ── Cricket ───────────────────────────────────────────────────────
+        # v11.3: kxcba was missing → cricket bled into weather AND crypto.
+        # KXCBAGAME matched WeatherBot city keywords, got 0.92 NOAA priors
+        # applied to cricket matches. All 6 "resolved" weather outcomes
+        # were cricket → Brier 0.4269.
+        "kxcba", "kxcricket",
+
+        # ── International basketball ──────────────────────────────────────
+        # v11.3: all missing → bled into crypto and weather.
+        "kxfiba",      # FIBA
+        "kxacbg",      # ACB (Spanish basketball)
+        "kxvtbg",      # VTB League (Russian basketball)
+        "kxbalg",      # Baltic basketball league
+        "kxbbse",      # BBL / basketball
+        "kxnpbg",      # NBP / basketball
+
+        # ── Hockey ────────────────────────────────────────────────────────
+        # v11.3: kxahlg missing → AHL bled into weather.
+        "kxahlg",      # AHL (American Hockey League)
+
+        # ── Track & field ─────────────────────────────────────────────────
+        # v11.3: kxdima missing → Diamond League bled into weather and economics.
+        "kxdima",      # Diamond League
+
+        # ── A-League (Australian soccer) ──────────────────────────────────
+        # v11.3: kxalea missing → A-League bled into weather via "melbourne"
+        # city keyword match (Melbourne City FC, Melbourne Victory).
+        "kxalea",
+
+        # ── Combat sports ─────────────────────────────────────────────────
+        "kxboxing", "kxwwe",
+
+        # ── Racing ────────────────────────────────────────────────────────
+        "kxf1", "kxnascar",
+
+        # ── Rugby / Olympic / other ───────────────────────────────────────
+        "kxrugby", "kxolympic", "kxthail", "kxsl",
+
+        # ── Esports ───────────────────────────────────────────────────────
         "kxow", "kxvalorant", "kxlol", "kxleague",
         "kxrl", "kxrocketleague",
         "kxcsgo", "kxcs2", "kxdota", "kxintlf",
         "kxapex", "kxfort", "kxhalo", "kxsc2",
-        "kxegypt", "kxvenf",
-        # ── Formula 1 ─────────────────────────────────────────────────────
-        "kxf1",
+        "kxesport", "kxegypt", "kxvenf",
+        "kxr6g",       # Rainbow Six — v11.3
+
+        # ── International sports (generic) ────────────────────────────────
+        # v11.3: kxintl was missing → bled into politics via "kxintl" keyword.
+        "kxintl",
+
+        # ── Entertainment / unmodelable (block from all sector bots) ──────
+        # v11.3: Survivor TV show (429 signals) matched WeatherBot via city
+        # keywords in episode titles. No bot can model this, so blocking it
+        # here causes it to be skipped entirely (correct behavior).
+        "kxsurv",      # Survivor TV show mentions
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -118,6 +185,7 @@ class EconomicsBot(BaseBot):
         "kxpce", "kxnfp", "kxyield", "kxrate", "kxinfl",
         "kxhousing", "kxretail", "kxdebt", "kxtrade", "kxconsumer",
         "kxoil", "kxgold", "kxcommodity", "kxdow", "kxspx", "kxvix",
+        "kxwti", "kxjble", "kxekst", "kxapfd",
 
         # ── US economic indicators ─────────────────────────────────────────
         "cpi", "inflation", "unemployment", "nonfarm", "payroll",
@@ -209,6 +277,7 @@ class CryptoBot(BaseBot):
         "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
         "kxbnb", "kxavax", "kxlink", "kxcoin", "kxmatic", "kxada",
         "kxdot", "kxatom", "kxnear", "kxfil", "kxapt", "kxsui",
+        "kxspot", "kxshib", "kxnetf",
 
         # ── Major coins ────────────────────────────────────────────────────
         "bitcoin", "btc", "ethereum", "eth", "solana", "xrp", "ripple",
@@ -299,12 +368,17 @@ class CryptoBot(BaseBot):
 class PoliticsBot(BaseBot):
     """
     US + international elections, legislation, geopolitics, appointments.
+
+    v11.3: Removed "kxintl" from KEYWORDS — those are international sports
+    (KXINTLFIGHT etc.), not politics. Politics retains "kxun", "kxnato",
+    "kxeu" for international political markets.
     """
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
         "kxpres", "kxsenate", "kxhouse", "kxgov", "kxelect",
-        "kxpol", "kxcong", "kxsupct", "kxadmin", "kxintl",
+        "kxpol", "kxcong", "kxsupct", "kxadmin",
+        # v11.3: removed "kxintl" — international sports, not politics
         "kxun", "kxnato", "kxeu",
 
         # ── US politics ────────────────────────────────────────────────────
@@ -372,43 +446,53 @@ class PoliticsBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  4. WEATHER BOT  (v11.2 — esports blocklist added)
+#  4. WEATHER BOT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class WeatherBot(BaseBot):
     """
     Temperature, precipitation, storms — worldwide city coverage.
 
-    v11.2: Added _ESPORTS_BLOCKLIST to is_relevant() as a secondary guard.
-    OWL (Overwatch League) and VCT (Valorant) market titles contain city-named
-    teams (Los Angeles, Atlanta, San Francisco, etc.) that substring-matched
-    against the city keyword list, causing esports markets to be traded as
-    weather markets with completely wrong NOAA-derived priors.
-
-    Primary fix: kxow/kxvalorant/kxlol/kxrl/kxatp added to _has_sports_prefix.
-    Secondary fix: _ESPORTS_BLOCKLIST here as defense in depth.
+    v11.3: Renamed _ESPORTS_BLOCKLIST → _NON_WEATHER_BLOCKLIST and expanded
+    with cricket (kxcba), track (kxdima), A-League (kxalea), Survivor (kxsurv),
+    and all international soccer/basketball prefixes that were matching city
+    keywords and getting NOAA priors applied to sports markets.
     """
 
-    # ── Esports prefix blocklist — defense in depth ────────────────────────────
-    # Primary guard is _has_sports_prefix() which now includes these prefixes.
-    # This secondary check ensures no esports market ever gets a NOAA prior
-    # even if prefix normalization or UUID stripping produces an unexpected form.
-    _ESPORTS_BLOCKLIST = (
-        "kxow",          # Overwatch League
-        "kxvalorant",    # VCT Valorant Champions Tour
-        "kxlol",         # League of Legends esports
-        "kxleague",      # LoL alternate prefix
-        "kxrl",          # Rocket League
-        "kxrocketleague",
-        "kxcsgo",        # CS:GO legacy
-        "kxcs2",         # CS2
-        "kxdota",        # Dota 2
-        "kxapex",        # Apex Legends
-        "kxfort",        # Fortnite
-        "kxhalo",        # Halo
-        "kxsc2",         # StarCraft 2
-        "kxesport",      # Generic esports
-        "kxintlf",       # International fighting
+    # ── Non-weather prefix blocklist — defense in depth ────────────────────────
+    # Primary guard is _has_sports_prefix(). This secondary check ensures no
+    # non-weather market ever gets a NOAA prior even if prefix normalization
+    # or UUID stripping produces an unexpected form.
+    _NON_WEATHER_BLOCKLIST = (
+        # Esports (from v11.2)
+        "kxow", "kxvalorant", "kxlol", "kxleague",
+        "kxrl", "kxrocketleague",
+        "kxcsgo", "kxcs2", "kxdota",
+        "kxapex", "kxfort", "kxhalo", "kxsc2",
+        "kxesport", "kxintlf",
+        # v11.3 additions — these all matched city keywords
+        "kxcba",       # Cricket (matched city names → 0.92 NOAA priors)
+        "kxdima",      # Diamond League
+        "kxalea",      # A-League ("melbourne" match)
+        "kxsurv",      # Survivor TV show
+        "kxarg",       # Argentine soccer ("buenos aires")
+        "kxbras",      # Brazilian soccer ("sao paulo", "rio")
+        "kxlali",      # La Liga ("madrid", "barcelona")
+        "kxbund",      # Bundesliga ("munich", "berlin")
+        "kxseri",      # Serie A ("rome", "milan")
+        "kxbelg",      # Belgian ("brussels")
+        "kxswis",      # Swiss ("zurich", "geneva")
+        "kxjlea",      # J-League ("tokyo", "osaka")
+        "kxpga",       # PGA golf
+        "kxowga",      # Golf
+        "kxahlg",      # AHL hockey
+        "kxfiba",      # FIBA basketball
+        "kxacbg",      # ACB basketball
+        "kxvtbg",      # VTB basketball
+        "kxuclt",      # Champions League
+        "kxr6g",       # Rainbow Six
+        "kxintl",      # International sports
+        "kxfifa",      # FIFA
     )
 
     KEYWORDS = [
@@ -416,6 +500,7 @@ class WeatherBot(BaseBot):
         "kxwthr", "kxhurr", "kxsnow", "kxtmp", "kxrain",
         "kxstorm", "kxtornado", "kxblizz", "kxfrost",
         "kxcyclone", "kxtyphoon", "kxmonsoon",
+        "kxlowt", "kxhigh", "kxtemp", "kxchll", "kxdens",
 
         # ── Core weather terms ─────────────────────────────────────────────
         "temperature", "fahrenheit", "celsius",
@@ -555,12 +640,12 @@ class WeatherBot(BaseBot):
         if _has_sports_prefix(market):
             return False
 
-        # ── Secondary guard: explicit esports blocklist ────────────────────
-        # Defense in depth — catches esports markets even if _has_sports_prefix
-        # misses them due to UUID suffix or normalization edge cases.
+        # ── Secondary guard: explicit non-weather blocklist ────────────────
+        # Defense in depth — catches non-weather markets even if
+        # _has_sports_prefix misses them due to UUID suffix or normalization.
         et = market.get("event_ticker", "").lower()
         tk = market.get("ticker", "").lower()
-        if any(et.startswith(p) or tk.startswith(p) for p in self._ESPORTS_BLOCKLIST):
+        if any(et.startswith(p) or tk.startswith(p) for p in self._NON_WEATHER_BLOCKLIST):
             return False
 
         return _search_fields(market, self.KEYWORDS)
@@ -707,7 +792,7 @@ class WeatherBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. TECH BOT  (v11.2 — unchanged)
+#  5. TECH BOT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TechBot(BaseBot):
@@ -806,17 +891,15 @@ class TechBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  6. SPORTS BOT  (v11.2 — esports + tennis prefixes added)
+#  6. SPORTS BOT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SportsBot(BaseBot):
     """
     US + international sports, esports, combat sports, Olympic events.
 
-    v11.1: KXMVECROSS* and KXMVESPORTSMULTIGAME* blocked until Brier ≤ 0.10.
-    v11.2: Added kxow, kxvalorant, kxlol, kxrl, kxatp to KEYWORDS and
-           LEAGUE_MAP so these markets are positively claimed by SportsBot
-           now that they're blocked from other bots via _has_sports_prefix.
+    v11.3: Added all international soccer, cricket, basketball, golf, hockey,
+    track & field, and A-League prefixes to KEYWORDS and LEAGUE_MAP.
     """
 
     # ── Structural market blocklist ────────────────────────────────────────────
@@ -835,17 +918,58 @@ class SportsBot(BaseBot):
         "kxmvecbchampionship",
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-        # ── Tennis — added v11.2 ───────────────────────────────────────────
+        # ── Tennis ─────────────────────────────────────────────────────────
         "kxatp", "kxwta", "kxtennis",
         "kxf1", "kxolympic", "kxepl", "kxsoccer",
         "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
         "kxthail", "kxsl",
-        # ── Esports — added v11.2 ─────────────────────────────────────────
+        # ── Esports ────────────────────────────────────────────────────────
         "kxow", "kxvalorant", "kxlol", "kxleague",
         "kxrl", "kxrocketleague",
         "kxdota", "kxintlf", "kxcs2", "kxcsgo",
         "kxapex", "kxfort",
         "kxegypt", "kxvenf",
+        "kxr6g",           # Rainbow Six — v11.3
+
+        # ── International soccer — v11.3 ──────────────────────────────────
+        "kxarg",           # Argentine Primera División
+        "kxlali",          # La Liga
+        "kxbund",          # Bundesliga
+        "kxseri",          # Serie A
+        "kxliga",          # Liga generic
+        "kxligu",          # Ligue 1
+        "kxbras",          # Brasileirão
+        "kxswis",          # Swiss Super League
+        "kxbelg",          # Belgian Pro League
+        "kxecul",          # Ecuadorian Liga Pro
+        "kxpslg",          # PSL
+        "kxsaud",          # Saudi Pro League
+        "kxjlea",          # J-League
+        "kxuclt",          # UEFA Champions League
+        "kxfifa",          # FIFA
+        "kxintl",          # International sports
+        "kxalea",          # A-League (Australia)
+
+        # ── Golf — v11.3 ──────────────────────────────────────────────────
+        "kxpga",           # PGA Tour
+        "kxowga",          # Golf (was leaking into economics)
+
+        # ── Cricket — v11.3 ───────────────────────────────────────────────
+        "kxcba",           # CBA cricket
+
+        # ── International basketball — v11.3 ──────────────────────────────
+        "kxfiba",          # FIBA
+        "kxacbg",          # ACB (Spanish)
+        "kxvtbg",          # VTB League (Russian)
+        "kxbalg",          # Baltic basketball
+        "kxbbse",          # BBL / basketball
+        "kxnpbg",          # NBP / basketball
+
+        # ── Hockey — v11.3 ────────────────────────────────────────────────
+        "kxahlg",          # AHL
+
+        # ── Track & field — v11.3 ─────────────────────────────────────────
+        "kxdima",          # Diamond League
 
         # ── US major leagues ───────────────────────────────────────────────
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
@@ -874,6 +998,10 @@ class SportsBot(BaseBot):
         "juventus", "inter milan", "ac milan", "napoli",
         "psg", "paris saint germain", "ajax", "benfica",
         "porto", "celtic", "rangers",
+        # v11.3 additions
+        "argentine primera", "brasileirao", "j-league",
+        "saudi pro league", "belgian pro league", "swiss super league",
+        "a-league",
 
         # ── Tennis ─────────────────────────────────────────────────────────
         "wimbledon", "us open tennis", "french open", "roland garros",
@@ -897,18 +1025,22 @@ class SportsBot(BaseBot):
         "formula 1", "f1", "grand prix", "monaco gp", "daytona 500",
         "indy 500", "nascar cup", "verstappen", "hamilton", "leclerc",
 
-        # ── Esports — added v11.2 ─────────────────────────────────────────
+        # ── Esports ────────────────────────────────────────────────────────
         "league of legends", "valorant", "cs2", "counter strike",
         "dota 2", "overwatch", "overwatch league", "owl match",
         "rocket league", "apex legends",
         "fortnite tournament", "esports championship", "worlds lol",
         "majors cs2", "vlr valorant", "vct", "valorant champions",
+        "rainbow six", "r6 siege",
+
+        # ── Cricket — v11.3 ───────────────────────────────────────────────
+        "cricket", "test match", "odi cricket", "ipl", "ashes",
 
         # ── Other sports ───────────────────────────────────────────────────
-        "cricket", "test match", "odi cricket", "ipl", "ashes",
         "rugby world cup", "six nations", "rugby union",
         "olympic games", "summer olympics", "winter olympics",
         "tour de france", "cycling grand tour",
+        "diamond league", "ahl hockey", "fiba basketball",
 
         # ── Generic sports terms ────────────────────────────────────────────
         "wins by", "points scored", "spread", "mvp",
@@ -923,20 +1055,50 @@ class SportsBot(BaseBot):
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
         "kxmvesports": "NBA", "kxmvecbchampionship": "NCAAB",
         "kxepl": "EPL", "kxsoccer": "MLS",
-        # ── Tennis — added v11.2 ───────────────────────────────────────────
+        # Tennis
         "kxatp": "ATP", "kxwta": "WTA", "kxtennis": "ATP",
         "kxf1": "F1",
         "kxboxing": "BOXING", "kxgolf": "PGA",
-        # ── Esports — added v11.2 ─────────────────────────────────────────
-        "kxow": "OWL",          # Overwatch League
-        "kxvalorant": "VCT",    # Valorant Champions Tour
-        "kxlol": "LOL",         # League of Legends
-        "kxleague": "LOL",
-        "kxrl": "RL",           # Rocket League
-        "kxrocketleague": "RL",
-        "kxdota": "DOTA2",
-        "kxcs2": "CS2",
-        "kxcsgo": "CS2",
+        # Esports
+        "kxow": "OWL", "kxvalorant": "VCT", "kxlol": "LOL",
+        "kxleague": "LOL", "kxrl": "RL", "kxrocketleague": "RL",
+        "kxdota": "DOTA2", "kxcs2": "CS2", "kxcsgo": "CS2",
+        "kxr6g": "R6",
+        # ── v11.3 additions ────────────────────────────────────────────────
+        # International soccer
+        "kxarg":  "ARGPD",
+        "kxlali": "LALIGA",
+        "kxbund": "BUNDESLIGA",
+        "kxseri": "SERIEA",
+        "kxliga": "LIGA",
+        "kxligu": "LIGUE1",
+        "kxbras": "BRASILEIRAO",
+        "kxswis": "SWISS",
+        "kxbelg": "BELGIAN",
+        "kxecul": "ECUADORIAN",
+        "kxpslg": "PSL",
+        "kxsaud": "SAUDI",
+        "kxjlea": "JLEAGUE",
+        "kxuclt": "UCL",
+        "kxfifa": "FIFA",
+        "kxintl": "INTL",
+        "kxalea": "ALEAGUE",
+        # Golf
+        "kxpga":  "PGA",
+        "kxowga": "PGA",
+        # Cricket
+        "kxcba":  "CRICKET",
+        # Basketball
+        "kxfiba": "FIBA",
+        "kxacbg": "ACB",
+        "kxvtbg": "VTB",
+        "kxbalg": "BALTIC",
+        "kxbbse": "BBL",
+        "kxnpbg": "NBP",
+        # Hockey
+        "kxahlg": "AHL",
+        # Track
+        "kxdima": "DIAMOND",
     }
 
     @property
