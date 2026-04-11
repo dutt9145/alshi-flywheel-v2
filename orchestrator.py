@@ -778,6 +778,9 @@ class FlywheelOrchestrator:
 
         lead_sector = signals[0].sector
 
+        # v19.18: Track if this is a new ticker we haven't seen before
+        _already_seen = ticker in self._last_bot_probs
+
         self._last_bot_probs[ticker]   = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
@@ -795,18 +798,23 @@ class FlywheelOrchestrator:
             )
             return
 
-        try:
-            log_signal(
-                ticker      = ticker,
-                sector      = lead_sector,
-                our_prob    = consensus.avg_prob,
-                market_prob = yes_price / 100,
-                edge        = consensus.avg_edge,
-                confidence  = consensus.avg_confidence,
-                direction   = consensus.direction,
-            )
-        except Exception as e:
-            logger.error("log_signal failed for %s: %s", ticker, e)
+        # v19.18: Only log signal once per ticker — prevents 40k duplicate
+        # signals from the same market being re-evaluated every scan cycle.
+        # _last_bot_probs persists across scans (cleared on nightly retrain),
+        # so a market only gets logged the first time it's seen each day.
+        if not _already_seen:
+            try:
+                log_signal(
+                    ticker      = ticker,
+                    sector      = lead_sector,
+                    our_prob    = consensus.avg_prob,
+                    market_prob = yes_price / 100,
+                    edge        = consensus.avg_edge,
+                    confidence  = consensus.avg_confidence,
+                    direction   = consensus.direction,
+                )
+            except Exception as e:
+                logger.error("log_signal failed for %s: %s", ticker, e)
 
         self._execute_trade(
             ticker      = ticker,
