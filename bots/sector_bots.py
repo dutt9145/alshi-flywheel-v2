@@ -250,6 +250,48 @@ def _has_sports_prefix(market: dict) -> bool:
         # v11.3: kxintl was missing → bled into politics via "kxintl" keyword.
         "kxintl",
 
+        # ── v11.7: Prefixes found by classifier_audit.py ────────────────
+        # CONMEBOL (98 signals → weather/crypto)
+        "kxconmebol",
+        # Chilean soccer (22 signals → weather via "kxchll" chill keyword)
+        "kxchll",
+        # Euroleague basketball (6 signals → politics via "kxeu" prefix)
+        "kxeuroleague",
+        # Ekstraklasa Polish soccer (3 signals → politics/economics)
+        "kxekstraklasa",
+        # Swedish Hockey League
+        "kxshl",
+        # Uruguayan Primera División
+        "kxurypd",
+        # UCL spread (kxuclt was too specific — missed kxuclspread)
+        "kxucl",
+        # Turkish Super Lig
+        "kxsuperlig",
+        # Egyptian Premier League
+        "kxegypl",
+        # ITF tennis (women + men)
+        "kxitf",
+        # IPL cricket (team totals, fours, sixes)
+        "kxipl",
+        # Scottish Premiership
+        "kxscottishprem",
+        # UEFA Europa League
+        "kxuel",
+        # Eredivisie (Dutch soccer)
+        "kxeredivisie",
+        # MotoGP racing
+        "kxmotogp",
+        # BBL (Big Bash League)
+        "kxbbl",
+        # KF tour
+        "kxkf",
+        # Allsvenskan (Swedish soccer)
+        "kxallsvenskan",
+        # Argentine Premier Division (more specific than kxarg)
+        "kxargpremdiv",
+        # NextAG
+        "kxnextag",
+
         # ── Entertainment / unmodelable (block from all sector bots) ──────
         # v11.3: Survivor TV show (429 signals) matched WeatherBot via city
         # keywords in episode titles. No bot can model this, so blocking it
@@ -306,6 +348,7 @@ def _is_entertainment_market(market: dict) -> bool:
     """
     ENTERTAINMENT_PREFIXES = (
         "kxspotify",     # Spotify chart positions
+        "kxspotstream",  # Spotify streaming markets (was incorrectly in crypto)
         "kxbox",         # Box office (if exists)
         "kxnetflix",     # Netflix subscriber/show predictions
         "kxhbo",         # HBO show predictions
@@ -431,8 +474,9 @@ class CryptoBot(BaseBot):
         "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
         "kxbnb", "kxavax", "kxlink", "kxcoin", "kxmatic", "kxada",
         "kxdot", "kxatom", "kxnear", "kxfil", "kxapt", "kxsui",
-        # v11.5: kxspotstream not kxspot — kxspot was matching KXSPOTIFY
-        "kxspotstream", "kxshib", "kxnetf",
+        # v11.7: removed kxspotstream — it was Spotify streaming, not crypto.
+        # Spot BTC ETF tickers use kxspotbtc/kxnetf, not kxspotstream.
+        "kxshib", "kxnetf",
         "kxshiba",  # SHIB token explicit
 
         # ── Major coins ────────────────────────────────────────────────────
@@ -1221,6 +1265,28 @@ class SportsBot(BaseBot):
         "playoff", "championship series",
         "nba finals", "stanley cup", "nfl championship",
         "world series finals", "ncaa championship",
+
+        # ── v11.7: classifier audit additions ─────────────────────────────
+        "kxconmebol",      # CONMEBOL (South American soccer)
+        "kxchll",          # Chilean soccer
+        "kxeuroleague",    # Euroleague basketball
+        "kxekstraklasa",   # Polish Ekstraklasa
+        "kxshl",           # Swedish Hockey League
+        "kxurypd",         # Uruguayan Primera División
+        "kxucl",           # UCL (broader than kxuclt)
+        "kxsuperlig",      # Turkish Super Lig
+        "kxegypl",         # Egyptian Premier League
+        "kxitf",           # ITF tennis
+        "kxipl",           # IPL cricket
+        "kxscottishprem",  # Scottish Premiership
+        "kxuel",           # UEFA Europa League
+        "kxeredivisie",    # Eredivisie (Dutch)
+        "kxmotogp",        # MotoGP
+        "kxbbl",           # Big Bash League
+        "kxkf",            # KF tour
+        "kxallsvenskan",   # Allsvenskan (Swedish soccer)
+        "kxargpremdiv",    # Argentine Premier Division
+        "kxnextag",        # NextAG
     ]
 
     LEAGUE_MAP = {
@@ -1593,6 +1659,7 @@ class EntertainmentBot(BaseBot):
 
     KEYWORDS = [
         "kxspotify",     # Spotify chart positions
+        "kxspotstream",  # Spotify streaming markets (v11.7: moved from crypto)
         "kxbox",         # Box office
         "kxnetflix",     # Netflix
         "kxhbo",         # HBO
