@@ -1381,31 +1381,37 @@ class SportsBot(BaseBot):
 
         parsed = parse_nba_ticker(ticker)
         if parsed is None:
+            logger.info("[sports/nba] PARSE FAIL: %s", ticker)
             return False, None
 
         team_info = NBA_TEAMS_MAP.get(parsed.player_team_code)
         if not team_info:
-            logger.debug("[sports/nba] unknown team code %s", parsed.player_team_code)
+            logger.info("[sports/nba] unknown team: %s in %s", parsed.player_team_code, ticker)
             return False, None
         team_id = team_info[0]
 
         player = nba_lookup_player(
             team_id, parsed.player_first, parsed.player_last, parsed.player_jersey,
+            team_code=parsed.player_team_code,
         )
         if not player:
-            logger.debug("[sports/nba] player not found: %s %s #%s on %s",
+            logger.info("[sports/nba] PLAYER NOT FOUND: %s.%s #%s (%s) — %s",
                          parsed.player_first, parsed.player_last,
-                         parsed.player_jersey, parsed.player_team_code)
+                         parsed.player_jersey, parsed.player_team_code, ticker)
             return False, None
 
         season = nba_fetch_player_stats(player.player_id)
         if not season or season.games_played <= 0:
+            logger.info("[sports/nba] NO STATS for %s (ESPN ID %d)",
+                         player.full_name, player.player_id)
             return False, None
 
         rolling = nba_fetch_player_rolling(player.player_id, n_games=10)
 
         prediction = predict_nba_prop(parsed, season, rolling)
         if not prediction:
+            logger.info("[sports/nba] MODEL FAIL for %s %s ≥%d",
+                         player.full_name, parsed.prop_code, parsed.threshold)
             return False, None
 
         # ── We have a valid model prediction — COMMIT to it ──────────────
