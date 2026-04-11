@@ -222,6 +222,7 @@ def _has_sports_prefix(market: dict) -> bool:
         # v11.3: kxalea missing → A-League bled into weather via "melbourne"
         # city keyword match (Melbourne City FC, Melbourne Victory).
         "kxalea",
+        "kxafl",       # AFL (Australian Football League)
 
         # ── UFL (United Football League) — v11.5 ─────────────────────────
         # Was leaking into weather via city name keyword matching.
@@ -710,6 +711,7 @@ class WeatherBot(BaseBot):
         "kxhighinfl",  # KXHIGHINFLATION matched "kxhigh" weather prefix
         "kxfestival",  # Festival events (matched "nyc" city keyword)
         "kxthevoice",  # The Voice TV show
+        "kxafl",       # AFL (Australian Football League — "sydney" city match)
     )
 
     KEYWORDS = [
@@ -1187,6 +1189,7 @@ class SportsBot(BaseBot):
         "kxfifa",          # FIFA
         "kxintl",          # International sports
         "kxalea",          # A-League (Australia)
+        "kxafl",           # AFL (Australian Football League)
 
         # ── Golf — v11.3 ──────────────────────────────────────────────────
         "kxpga",           # PGA Tour
@@ -1344,6 +1347,7 @@ class SportsBot(BaseBot):
         "kxfifa": "FIFA",
         "kxintl": "INTL",
         "kxalea": "ALEAGUE",
+        "kxafl":  "AFL",
         # Golf
         "kxpga":  "PGA",
         "kxowga": "PGA",
