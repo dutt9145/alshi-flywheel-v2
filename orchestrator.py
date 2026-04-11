@@ -68,6 +68,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
+# v19.18d: Reduce log volume to stay under Railway's 500 logs/sec limit.
+# sharp_detector emits an INFO [SHARP] line for every market with a spread,
+# generating 200+ lines/scan. MLB stats fetcher logs every opposing pitcher
+# lookup. Both are noise at INFO — promote to WARNING so only actionable
+# SHARP VETO lines (logged in orchestrator at INFO) survive.
+logging.getLogger("shared.sharp_detector").setLevel(logging.WARNING)
+logging.getLogger("shared.mlb_stats_fetcher").setLevel(logging.WARNING)
+
 # ── Duplicate trade cooldown ───────────────────────────────────────────────────
 RECENT_TRADE_WINDOW_SEC = 300  # 5 minutes
 
@@ -1074,6 +1082,22 @@ class FlywheelOrchestrator:
                     sig.event_group,
                 )
                 continue
+
+            # v19.18d: CONMEBOL duplicate fix — track event_group, not just
+            # individual tickers. The correlation engine produces multiple
+            # divergent pairs per event_group per scan. Without this guard,
+            # CONMEBOL groups generated 26 duplicate trades because each pair
+            # had a unique ticker that passed the per-ticker duplicate guard.
+            corr_key = f"__corr__{sig.event_group}"
+            now = time.monotonic()
+            last_corr = self._recently_traded.get(corr_key, 0.0)
+            if (now - last_corr) < RECENT_TRADE_WINDOW_SEC:
+                logger.debug(
+                    "CORR DUPLICATE GUARD skip %s — already traded this group",
+                    sig.event_group,
+                )
+                continue
+            self._recently_traded[corr_key] = now
 
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
 

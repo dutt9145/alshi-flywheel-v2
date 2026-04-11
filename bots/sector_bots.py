@@ -458,6 +458,17 @@ class EconomicsBot(BaseBot):
         context["contract_target"] = target
         return features, context
 
+    def evaluate(self, market, news_signal=None):
+        """v11.8d: Disable trading — no real model yet.
+
+        Economics signals are flat-prior (our_p=0.500, conf=0.27) and
+        generate coinflip trades. Disable until a real macro model is
+        built (e.g., FRED data pipeline, yield curve model).
+        """
+        ticker = market.get("ticker", "")
+        logger.debug("[economics] %s claimed (no model yet)", ticker)
+        return None
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  2. CRYPTO BOT
@@ -566,6 +577,49 @@ class CryptoBot(BaseBot):
         context["contract_target"] = target
         context["price_vs_target"]  = ratio
         return features, context
+
+    # v11.8d: Per-coin confidence scaling based on historical Brier scores
+    COIN_CONFIDENCE_SCALE = {
+        "bitcoin":      0.85,   # Brier 0.113 — strong
+        "binancecoin":  0.85,   # Brier 0.127 — strong
+        "ethereum":     0.70,   # Brier 0.187 — decent
+        "solana":       0.50,   # Brier 0.276 — weak
+        "ripple":       0.50,   # Brier 0.269 — weak
+        "dogecoin":     0.0,    # Brier 0.395 — excluded
+    }
+
+    def evaluate(self, market, news_signal=None):
+        """v11.8d: Scale confidence per coin based on historical Brier scores.
+
+        BTC/BNB keep near-full confidence (Brier <= 0.13).
+        ETH gets 70% (Brier 0.187).
+        SOL/XRP get 50% (Brier ~0.27).
+        DOGE 15M markets excluded entirely (Brier 0.395).
+        """
+        ticker  = market.get("ticker", "").lower()
+        coin_id = self._detect_coin(market)
+
+        # DOGE 15M: exclude (worst performer, Brier 0.395)
+        if coin_id == "dogecoin" and "15m" in ticker:
+            logger.debug("[crypto] DOGE 15M excluded: %s", ticker)
+            return None
+
+        signal = super().evaluate(market, news_signal)
+        if signal is None:
+            return None
+
+        scale = self.COIN_CONFIDENCE_SCALE.get(coin_id, 0.60)
+        if scale <= 0.0:
+            logger.debug("[crypto] %s excluded (scale=0): %s", coin_id, ticker)
+            return None
+
+        return BotSignal(
+            sector      = signal.sector,
+            prob        = signal.prob,
+            confidence  = signal.confidence * scale,
+            market_prob = signal.market_prob,
+            brier_score = signal.brier_score,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1103,7 +1157,9 @@ class FinancialMarketsBot(BaseBot):
         "apple": "AAPL",    "google": "GOOGL",   "microsoft": "MSFT",
         "amazon": "AMZN",   "nvidia": "NVDA",    "tesla": "TSLA",
         "intel": "INTC",    "amd": "AMD",         "qualcomm": "QCOM",
-        "tsmc": "TSM",      "samsung": "005930.KS",
+        "tsmc": "TSM",
+        # v11.8d: removed "samsung": "005930.KS" — Finnhub 403s on Korean
+        # tickers every scan. FinancialMarketsBot disabled anyway.
         "jpmorgan": "JPM",  "goldman sachs": "GS", "bank of america": "BAC",
         "pfizer": "PFE",    "exxon": "XOM",       "walmart": "WMT",
     }
@@ -1141,6 +1197,17 @@ class FinancialMarketsBot(BaseBot):
         features = np.append(features, target)
         context["contract_target"] = target
         return features, context
+
+    def evaluate(self, market, news_signal=None):
+        """v11.8d: Disable trading — no real model.
+
+        Falls through to BaseBot flat-prior BayesianPolyModel producing
+        our_p=0.500 conf=0.27 on every market. Also eliminates Finnhub
+        403 spam on 005930.KS. Disable until a real equity model is built.
+        """
+        ticker = market.get("ticker", "")
+        logger.debug("[financial_markets] %s claimed (no model yet)", ticker)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1457,7 +1524,7 @@ class SportsBot(BaseBot):
                     if game_date:
                         opp_pitcher_stats = fetch_opposing_pitcher(game_date, opp_team_info[0])
                         if opp_pitcher_stats:
-                            logger.info(
+                            logger.debug(
                                 "[sports/mlb] %s facing pitcher K/9=%.1f",
                                 player.full_name, opp_pitcher_stats.k_per_9,
                             )
@@ -1476,9 +1543,10 @@ class SportsBot(BaseBot):
         edge        = abs(our_prob - market_prob)
         direction   = "YES" if our_prob > market_prob else "NO"
 
-        # Log EVERY prediction so we can see the model running on every market,
-        # not just ones that cross the edge threshold.
-        logger.info(
+        # v11.8d: Changed from INFO to DEBUG to reduce Railway log volume.
+        # Per-market predictions were generating 300-400+ lines/scan, hitting
+        # Railway's 500 logs/sec rate limit and dropping messages.
+        logger.debug(
             "[sports/mlb] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
             ticker, player.full_name, our_prob, market_prob,
             our_prob - market_prob, direction, prediction.confidence,
