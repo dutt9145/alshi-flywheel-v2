@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 _ESPN_V3   = "https://site.api.espn.com/apis/common/v3/sports/basketball/nba"
+_ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+_ESPN_WEB  = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
 
 # ── ESPN team ID mapping (Kalshi team code → ESPN numeric ID) ──────────────────
 _KALSHI_TO_ESPN_TEAM_ID = {
@@ -323,19 +325,32 @@ def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
     if player_id in _stats_cache:
         return _stats_cache[player_id]
 
-    # Try the per-athlete statistics endpoint
-    url = f"{_ESPN_BASE}/athletes/{player_id}/statistics"
-    data = _espn_get(url)
+    # Try ESPN Core API (what ESPN's own web app uses)
+    url1 = f"{_ESPN_CORE}/athletes/{player_id}/statistics"
+    data = _espn_get(url1)
+    if data:
+        result = _parse_statistics_response(player_id, data)
+        if result:
+            return result
 
-    if not data:
-        # Fallback: try the v2 athlete summary which includes stats
-        url2 = f"{_ESPN_BASE}/athletes/{player_id}"
-        data2 = _espn_get(url2)
-        if data2:
-            return _parse_athlete_summary_stats(player_id, data2)
-        return None
+    # Try ESPN Web API
+    url2 = f"{_ESPN_WEB}/athletes/{player_id}/stats"
+    data = _espn_get(url2)
+    if data:
+        result = _parse_statistics_response(player_id, data)
+        if result:
+            return result
 
-    return _parse_statistics_response(player_id, data)
+    # Try v3 API
+    url3 = f"{_ESPN_V3}/athletes/{player_id}/statistics"
+    data = _espn_get(url3)
+    if data:
+        result = _parse_statistics_response(player_id, data)
+        if result:
+            return result
+
+    logger.info("[nba_stats] ALL stats endpoints failed for ESPN ID %d", player_id)
+    return None
 
 
 def _parse_statistics_response(player_id: int, data: dict) -> Optional[PlayerStats]:
@@ -432,8 +447,14 @@ def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingS
     
     The model handles None rolling gracefully (uses 100% season weight).
     """
-    url = f"{_ESPN_BASE}/athletes/{player_id}/gamelog"
+    url = f"{_ESPN_CORE}/athletes/{player_id}/statistics/log"
     data = _espn_get(url)
+    if not data:
+        url2 = f"{_ESPN_WEB}/athletes/{player_id}/gamelog"
+        data = _espn_get(url2)
+    if not data:
+        url3 = f"{_ESPN_V3}/athletes/{player_id}/gamelog"
+        data = _espn_get(url3)
     if not data:
         return None
 
