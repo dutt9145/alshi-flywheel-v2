@@ -99,6 +99,19 @@ from shared.mlb_hit_model import predict_mlb_prop
 from shared.consensus_engine import BotSignal
 from config.settings import MIN_EDGE_PCT
 
+# ── v11.6: NBA player prop integration imports ──────────────────────────────
+from shared.nba_ticker_parser import (
+    parse_nba_ticker,
+    is_nba_non_player_prop_market,
+    NBA_TEAMS as NBA_TEAMS_MAP,
+)
+from shared.nba_stats_fetcher import (
+    lookup_player as nba_lookup_player,
+    fetch_player_stats as nba_fetch_player_stats,
+    fetch_player_rolling as nba_fetch_player_rolling,
+)
+from shared.nba_props_model import predict_nba_prop
+
 logger = logging.getLogger(__name__)
 
 
@@ -1330,15 +1343,94 @@ class SportsBot(BaseBot):
         )
 
     def evaluate(self, market, news_signal=None):
-        """Override BaseBot.evaluate() to try the MLB player prop path first.
+        """Override BaseBot.evaluate() to try player prop models first.
 
+        Order: MLB → NBA → base class fallback.
         Commits to the new model whenever it can produce a prediction,
         even if the signal is filtered out by the edge threshold.
         """
         handled, signal = self._try_mlb_player_prop(market)
         if handled:
             return signal
+
+        handled, signal = self._try_nba_player_prop(market)
+        if handled:
+            return signal
+
         return super().evaluate(market, news_signal=news_signal)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # v11.6: NBA PLAYER PROP ROUTING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _try_nba_player_prop(self, market: dict):
+        """Route NBA player prop markets through the Poisson/Binomial model.
+
+        Same (handled, signal) tuple pattern as MLB:
+          handled=False → couldn't process, fall through to base class
+          handled=True, signal=None → processed but edge too small, skip
+          handled=True, signal=BotSignal → processed, emit signal
+        """
+        ticker = market.get("ticker", "")
+        if not ticker.upper().startswith("KXNBA"):
+            return False, None
+
+        # Game-level NBA markets → base class path
+        if is_nba_non_player_prop_market(ticker):
+            return False, None
+
+        parsed = parse_nba_ticker(ticker)
+        if parsed is None:
+            return False, None
+
+        team_info = NBA_TEAMS_MAP.get(parsed.player_team_code)
+        if not team_info:
+            logger.debug("[sports/nba] unknown team code %s", parsed.player_team_code)
+            return False, None
+        team_id = team_info[0]
+
+        player = nba_lookup_player(
+            team_id, parsed.player_first, parsed.player_last, parsed.player_jersey,
+        )
+        if not player:
+            logger.debug("[sports/nba] player not found: %s %s #%s on %s",
+                         parsed.player_first, parsed.player_last,
+                         parsed.player_jersey, parsed.player_team_code)
+            return False, None
+
+        season = nba_fetch_player_stats(player.player_id)
+        if not season or season.games_played <= 0:
+            return False, None
+
+        rolling = nba_fetch_player_rolling(player.player_id, n_games=10)
+
+        prediction = predict_nba_prop(parsed, season, rolling)
+        if not prediction:
+            return False, None
+
+        # ── We have a valid model prediction — COMMIT to it ──────────────
+        from bots.base_bot import _market_prob
+        market_prob = _market_prob(market)
+        our_prob    = prediction.prob_yes
+        edge        = abs(our_prob - market_prob)
+        direction   = "YES" if our_prob > market_prob else "NO"
+
+        logger.info(
+            "[sports/nba] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
+            ticker, player.full_name, our_prob, market_prob,
+            our_prob - market_prob, direction, prediction.confidence,
+        )
+
+        if edge < MIN_EDGE_PCT:
+            return True, None
+
+        return True, BotSignal(
+            sector      = self.sector_name,
+            prob        = our_prob,
+            confidence  = prediction.confidence,
+            market_prob = market_prob,
+            brier_score = 0.10,
+        )
 
     # ─────────────────────────────────────────────────────────────────────
 
