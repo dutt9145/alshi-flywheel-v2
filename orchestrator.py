@@ -1,5 +1,15 @@
 """
-orchestrator.py  (v19.17 — risk manager + prop correlation + Brier tracker)
+orchestrator.py  (v19.18 — is_relevant gate + prefix sync)
+
+Changes vs v19.17:
+  1. _evaluate_market: Added `if not bot.is_relevant(market): continue` gate
+     before bot.evaluate(). Fixes news-spike path in BaseBot.evaluate()
+     bypassing sector classification — weather bot was evaluating politics,
+     economics, entertainment markets at 0.920 conf via news velocity signal.
+  2. _SPORTS_PREFIXES: synced with sector_bots.py v11.8 (~40 missing prefixes
+     added). Fixes misclassified sector P&L on resolution ingestion.
+  3. _TICKER_SECTOR_MAP: synced with all sector prefixes for correct sector
+     inference during resolution ingestion.
 
 Changes vs v19.16:
   1. RiskManager: drawdown kill switch (-20%), per-player cap (5%),
@@ -70,19 +80,57 @@ def _normalize_ticker(ticker: str) -> str:
     return _UUID_SUFFIX_RE.sub('', ticker)
 
 
-# ── Sports prefix guard ────────────────────────────────────────────────────────
+# ── Sports prefix guard (v19.18: synced with sector_bots.py v11.8) ─────────
 _SPORTS_PREFIXES = (
+    # MVE family
     "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
     "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
     "kxmvecbchampionship",
+    # US major sports
     "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
     "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-    "kxtennis", "kxf1", "kxolympic", "kxthail", "kxsl",
-    "kxdota", "kxintlf", "kxcs2", "kxegypt", "kxvenf",
-    "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
-    "kxrugby", "kxesport",
-    "kxeuroleague", "kxcba", "kxcbagame",
-    "kxacbgame", "kxaleaguegame", "kxaleague",
+    # Tennis
+    "kxatp", "kxwta", "kxtennis",
+    # Golf
+    "kxpga", "kxowga",
+    # International soccer
+    "kxepl", "kxsoccer",
+    "kxarg", "kxlali", "kxbund", "kxseri", "kxliga", "kxligu",
+    "kxbras", "kxswis", "kxbelg", "kxecul", "kxpslg", "kxsaud",
+    "kxjlea", "kxuclt", "kxucl", "kxfifa", "kxalea",
+    "kxconmebol", "kxchll", "kxargpremdiv",
+    "kxsuperlig", "kxegypl", "kxscottishprem",
+    "kxuel", "kxeredivisie", "kxallsvenskan",
+    # Cricket
+    "kxcba", "kxcricket", "kxt20", "kxipl", "kxbbl",
+    # International basketball
+    "kxfiba", "kxacbg", "kxvtbg", "kxbalg", "kxbbse", "kxnpbg",
+    "kxeuroleague",
+    # Hockey
+    "kxahlg", "kxshl",
+    # Track & field
+    "kxdima",
+    # Combat sports
+    "kxboxing", "kxwwe",
+    # Racing
+    "kxf1", "kxmotogp",
+    # Olympic / other
+    "kxolympic", "kxrugby", "kxthail", "kxsl", "kxufl",
+    "kxintl", "kxkf", "kxnextag",
+    # Esports
+    "kxow", "kxvalorant", "kxlol", "kxleague",
+    "kxrl", "kxrocketleague",
+    "kxcsgo", "kxcs2", "kxdota", "kxintlf",
+    "kxapex", "kxfort", "kxhalo", "kxsc2",
+    "kxesport", "kxegypt", "kxvenf", "kxr6g",
+    # Entertainment / unmodelable (block from non-sports)
+    "kxsurv",
+    # Legacy aliases
+    "kxcbagame", "kxacbgame", "kxaleaguegame", "kxaleague",
+    # ITF tennis
+    "kxitf",
+    # Ekstraklasa / Uruguayan
+    "kxekstraklasa", "kxurypd",
 )
 
 
@@ -117,23 +165,44 @@ def _is_blocked_structural_market(ticker: str) -> bool:
 SCAN_PAGE_SLEEP_SEC = 0.25
 
 
-# ── Sector inference from ticker ───────────────────────────────────────────────
+# ── Sector inference from ticker (v19.18: synced with sector_bots.py) ──────
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
     (("kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-      "kxtennis", "kxf1", "kxolympic", "kxepl", "kxsoccer",
+      "kxatp", "kxwta", "kxtennis", "kxpga", "kxowga",
+      "kxf1", "kxolympic", "kxepl", "kxsoccer",
       "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
-      "kxdota", "kxintlf", "kxcs2",
-      "kxeuroleague", "kxcba", "kxcbagame",
+      "kxdota", "kxintlf", "kxcs2", "kxcsgo",
+      "kxeuroleague", "kxcba", "kxcbagame", "kxt20", "kxipl", "kxbbl",
       "kxacbgame", "kxaleaguegame", "kxaleague",
+      "kxarg", "kxlali", "kxbund", "kxseri", "kxliga", "kxligu",
+      "kxbras", "kxswis", "kxbelg", "kxecul", "kxpslg", "kxsaud",
+      "kxjlea", "kxuclt", "kxucl", "kxfifa", "kxalea",
+      "kxconmebol", "kxchll", "kxargpremdiv",
+      "kxfiba", "kxacbg", "kxvtbg", "kxbalg", "kxbbse", "kxnpbg",
+      "kxahlg", "kxshl", "kxdima", "kxufl", "kxintl",
+      "kxsuperlig", "kxegypl", "kxscottishprem", "kxuel", "kxeredivisie",
+      "kxmotogp", "kxallsvenskan", "kxekstraklasa", "kxurypd",
+      "kxow", "kxvalorant", "kxlol", "kxleague",
+      "kxrl", "kxrocketleague", "kxapex", "kxfort", "kxr6g",
+      "kxitf", "kxkf", "kxnextag", "kxsurv",
       ), "sports"),
-    (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi"), "crypto"),
+    (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi",
+      "kxxrp", "kxdoge", "kxbnb", "kxavax", "kxlink",
+      "kxcoin", "kxmatic", "kxada", "kxshib",
+      ), "crypto"),
     (("kxelect", "kxpres", "kxsen", "kxhouse", "kxgov",
-      "kxpol", "kxvote", "kxapprove"), "politics"),
+      "kxpol", "kxvote", "kxapprove",
+      "kxswalwell", "kxtrumppardons", "kxtrumpendorse",
+      "kxdenmarkpm", "kxisraelpm",
+      ), "politics"),
     (("kxhurr", "kxtemp", "kxrain", "kxsnow", "kxweather",
-      "kxnoaa", "kxclimate"), "weather"),
+      "kxnoaa", "kxclimate", "kxlowt", "kxchll", "kxdens",
+      ), "weather"),
     (("kxai", "kxtech", "kxfed", "kxcpi", "kxgdp",
-      "kxjobs", "kxrate", "kxinfl"), "economics"),
+      "kxjobs", "kxrate", "kxinfl", "kxwti", "kxpayroll",
+      "kxhighinfl",
+      ), "economics"),
 ]
 
 
@@ -675,8 +744,14 @@ class FlywheelOrchestrator:
         self.news.register_market(title)
         sharp_signal = self.sharp.analyze(market)
 
+        # v19.18: Gate bot.evaluate() behind bot.is_relevant()
+        # Fixes: news-spike path in BaseBot.evaluate() was bypassing sector
+        # classification, causing weather bot to evaluate politics/economics
+        # markets at 0.920 conf via news velocity signal.
         signals = []
         for bot in self.bots:
+            if not bot.is_relevant(market):
+                continue
             try:
                 sig = bot.evaluate(market, news_signal=self.news)
                 if sig is not None:
@@ -1249,7 +1324,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.17 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.18 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()

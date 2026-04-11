@@ -1,26 +1,23 @@
 """
-bots/sector_bots.py  (v11.5 — MENTION skip + EntertainmentBot scaffold + leak fixes)
+bots/sector_bots.py  (v11.8 — T20/entertainment leak fixes + prefix sync)
 
-Changes vs v11.4:
+Changes vs v11.5:
   Bug fixes:
+    - WeatherBot: added kxt20, kxhighinfl, kxfestival, kxthevoice to
+      _NON_WEATHER_BLOCKLIST. KXHIGHINFLATION was matching "kxhigh" weather
+      prefix. T20 cricket (SWE vs IDN) leaked via city keywords. The Voice
+      and festival events matched city keywords ("nyc").
+    - SPORTS_PREFIXES: added kxt20 (T20 cricket was leaking to weather/politics)
+    - _is_entertainment_market: added kxthevoice, kxfestival
+    - SportsBot: added kxt20 to KEYWORDS and LEAGUE_MAP
+
+  Carried forward from v11.5:
     - CryptoBot: kxspot → kxspotstream (was matching KXSPOTIFY incorrectly)
     - SPORTS_PREFIXES: added kxufl (United Football League leaking to weather)
     - CryptoBot KEYWORDS: added kxshiba (SHIB token explicit)
-
-  New helpers:
     - _is_unmodelable_market(): returns True for MENTION markets and Survivor.
-      Catches ~460 noise signals/day. Every bot now checks this first.
-    - _is_entertainment_market(): returns True for KXSPOTIFY/KXNETFLIX/etc.
-      Routes them to the new EntertainmentBot.
-
-  New bot:
-    - EntertainmentBot: scaffold only. Claims Spotify/Netflix/awards markets
-      so they stop polluting other sectors. evaluate() returns None until
-      a real model is built (next session).
-
-  All bots now check _is_unmodelable_market() and _is_entertainment_market()
-  at the top of is_relevant() so noise markets are skipped before any
-  feature fetching or model evaluation happens.
+    - _is_entertainment_market(): routes to GlobalEventsBot.
+    - EntertainmentBot → GlobalEventsBot (v11.7)
 
 Changes vs v11.3:
   SportsBot:
@@ -202,6 +199,7 @@ def _has_sports_prefix(market: dict) -> bool:
         # applied to cricket matches. All 6 "resolved" weather outcomes
         # were cricket → Brier 0.4269.
         "kxcba", "kxcricket",
+        "kxt20",             # v11.8: T20 cricket (was leaking to weather/politics)
 
         # ── International basketball ──────────────────────────────────────
         # v11.3: all missing → bled into crypto and weather.
@@ -341,10 +339,12 @@ def _is_unmodelable_market(market: dict) -> bool:
 def _is_entertainment_market(market: dict) -> bool:
     """v11.5: Entertainment / streaming / awards markets.
 
-    These get claimed by EntertainmentBot. Listed separately from
-    _is_unmodelable_market because EntertainmentBot WILL eventually
+    These get claimed by GlobalEventsBot. Listed separately from
+    _is_unmodelable_market because GlobalEventsBot WILL eventually
     have a real model — for now it just claims the markets to keep
     them out of crypto/weather/economics.
+
+    v11.8: Added kxthevoice, kxfestival.
     """
     ENTERTAINMENT_PREFIXES = (
         "kxspotify",     # Spotify chart positions
@@ -357,6 +357,8 @@ def _is_entertainment_market(market: dict) -> bool:
         "kxemmy",        # Emmy awards
         "kxgoldenglobe", # Golden Globes
         "kxbillboard",   # Billboard chart
+        "kxthevoice",    # The Voice TV show
+        "kxfestival",    # Festival events (KXFESTIVALEVENTPACHNYC etc.)
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -665,6 +667,8 @@ class WeatherBot(BaseBot):
     with cricket (kxcba), track (kxdima), A-League (kxalea), Survivor (kxsurv),
     and all international soccer/basketball prefixes that were matching city
     keywords and getting NOAA priors applied to sports markets.
+
+    v11.8: Added kxt20, kxhighinfl, kxfestival, kxthevoice.
     """
 
     # ── Non-weather prefix blocklist — defense in depth ────────────────────────
@@ -701,6 +705,11 @@ class WeatherBot(BaseBot):
         "kxr6g",       # Rainbow Six
         "kxintl",      # International sports
         "kxfifa",      # FIFA
+        # v11.8 additions
+        "kxt20",       # T20 cricket (SWE/IDN matched city keywords)
+        "kxhighinfl",  # KXHIGHINFLATION matched "kxhigh" weather prefix
+        "kxfestival",  # Festival events (matched "nyc" city keyword)
+        "kxthevoice",  # The Voice TV show
     )
 
     KEYWORDS = [
@@ -1289,6 +1298,7 @@ class SportsBot(BaseBot):
         "kxegypl",         # Egyptian Premier League
         "kxitf",           # ITF tennis
         "kxipl",           # IPL cricket
+        "kxt20",           # v11.8: T20 cricket internationals
         "kxscottishprem",  # Scottish Premiership
         "kxuel",           # UEFA Europa League
         "kxeredivisie",    # Eredivisie (Dutch)
@@ -1339,6 +1349,7 @@ class SportsBot(BaseBot):
         "kxowga": "PGA",
         # Cricket
         "kxcba":  "CRICKET",
+        "kxt20":  "T20",       # v11.8
         # Basketball
         "kxfiba": "FIBA",
         "kxacbg": "ACB",
