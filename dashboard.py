@@ -1,11 +1,11 @@
 """
-dashboard.py  (v4 — direct sector queries + demo mode indicator)
+dashboard.py  (v5 — Fab 7 sectors: Financial Markets + Global Events)
 
-Changes vs v3:
-  1. Trades query uses sector column directly (no join through signals)
-  2. P&L query joins outcomes to trades directly (faster, no signal join)
-  3. DEMO_MODE indicator added to topbar — green LIVE / amber DEMO MODE
-  4. created_at no longer needs ::timestamptz cast (fixed in schema tonight)
+Changes vs v4:
+  1. Replaced "tech" sector with "financial_markets"
+  2. Added "global_events" as 7th sector (alpha bucket)
+  3. Grid layout updated for 7 cards
+  4. Icons updated: 💹 Financial Markets, 🌍 Global Events
 
 LOCAL:   python3 dashboard.py
 RAILWAY: set DATABASE_URL env var
@@ -23,10 +23,11 @@ USE_POSTGRES = bool(DATABASE_URL)
 PORT         = int(os.getenv("PORT", "5555"))
 DEMO_MODE    = os.getenv("DEMO_MODE", "true").lower() == "true"
 
-SECTORS      = ["economics", "crypto", "politics", "weather", "tech", "sports"]
+SECTORS      = ["economics", "crypto", "politics", "weather", "financial_markets", "sports", "global_events"]
 SECTOR_ICONS = {
     "economics": "📈", "crypto": "₿", "politics": "🏛",
-    "weather": "🌤",  "tech": "💻",  "sports": "🏆",
+    "weather": "🌤", "financial_markets": "💹", "sports": "🏆",
+    "global_events": "🌍",
 }
 
 def query(sql, params=()):
@@ -75,7 +76,6 @@ def get_overview():
     }
 
 def get_sector_stats():
-    # Signals — pulled directly from signals table
     sigs = query("""
         SELECT sector, COUNT(*) AS signals, AVG(edge) AS avg_edge,
                AVG(confidence) AS avg_conf,
@@ -86,7 +86,6 @@ def get_sector_stats():
     """)
     sig_map = {r["sector"]: r for r in sigs}
 
-    # Trades — direct query using sector column (no join needed)
     trd = query("""
         SELECT sector, COUNT(id) AS trades, SUM(dollars_risked) AS dollars
         FROM trades
@@ -94,7 +93,6 @@ def get_sector_stats():
     """)
     trd_map = {r["sector"]: r for r in trd}
 
-    # P&L — join outcomes to trades directly using ticker
     pnl = query("""
         SELECT t.sector, SUM(o.pnl_usd) AS pnl, COUNT(*) AS resolved
         FROM outcomes o
@@ -110,7 +108,7 @@ def get_sector_stats():
         p = pnl_map.get(sec, {})
         result.append({
             "sector":   sec,
-            "icon":     SECTOR_ICONS[sec],
+            "icon":     SECTOR_ICONS.get(sec, "📊"),
             "signals":  b.get("signals", 0) or 0,
             "trades":   t.get("trades", 0) or 0,
             "dollars":  round((t.get("dollars") or 0), 2),
@@ -287,11 +285,13 @@ def build_html(overview, sectors, trades, arbs, pnl_series):
         ec = "#00ff88" if s["avg_edge"] > 0 else "#ff4444"
         pc = "#00ff88" if s["pnl"] >= 0 else "#ff4444"
         bb = min(int(s["brier"] * 1000), 100)
+        # Format sector display name (replace underscores with spaces)
+        display_name = s["sector"].replace("_", " ").upper()
         sector_cards += (
             '<div class="sector-card">'
             '<div class="sector-header">'
             f'<span class="sector-icon">{s["icon"]}</span>'
-            f'<span class="sector-name">{s["sector"].upper()}</span>'
+            f'<span class="sector-name">{display_name}</span>'
             f'<span class="sector-pnl" style="color:{pc}">${s["pnl"]:+.2f}</span>'
             '</div>'
             '<div class="stat-row">'
@@ -403,7 +403,7 @@ def build_html(overview, sectors, trades, arbs, pnl_series):
         '<div class="section-title">// arb opportunities</div>'
         '<div class="table-wrap">' + arb_table + '</div>'
         '</div>'
-        f'<footer>KALSHI FLYWHEEL ORACLE · AUTO-REFRESH 60s · {now}</footer>'
+        f'<footer>KALSHI FLYWHEEL ORACLE · FAB 7 · AUTO-REFRESH 60s · {now}</footer>'
         '<script>' + chart_js + '</script>'
         '</body></html>'
     )
@@ -430,5 +430,6 @@ if __name__ == "__main__":
     print(f"  http://localhost:{PORT}")
     print(f"  DB: {'Supabase' if USE_POSTGRES else DB_PATH}")
     print(f"  Mode: {'DEMO' if DEMO_MODE else 'LIVE'}")
+    print(f"  Sectors: {len(SECTORS)} (Fab 7)")
     print(f"  Ctrl+C to stop\n")
     server.serve_forever()
