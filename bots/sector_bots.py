@@ -1006,57 +1006,66 @@ class WeatherBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. TECH BOT
+#  5. FINANCIAL MARKETS BOT (replaces TechBot v11.7)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TechBot(BaseBot):
+class FinancialMarketsBot(BaseBot):
     """
-    Earnings, M&A, AI milestones, product launches — worldwide tech companies.
+    Individual stocks, earnings, M&A, IPOs across ALL sectors — not just tech.
+
+    v11.7: Replaces TechBot. Broader scope covers banks, healthcare, energy,
+    retail alongside tech. Economics handles macro (CPI, GDP, FOMC);
+    this bot handles company-level financial events.
     """
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
         "kxaapl", "kxgoog", "kxmsft", "kxamzn", "kxmeta", "kxnvda",
-        "kxtsla", "kxearnings", "kxtech", "kxai", "kxipo",
-        "kxopenai", "kxanthropic", "kxnasdaq", "kxsemiconductor",
+        "kxtsla", "kxearnings", "kxipo",
         "kxintc", "kxamd", "kxqcom", "kxtsm", "kxsamsng",
+        "kxnasdaq", "kxsemiconductor",
 
         # ── US Big Tech ─────────────────────────────────────────────────────
         "apple", "google", "microsoft", "amazon", "nvidia", "tesla",
-        "meta", "netflix", "adobe", "salesforce", "oracle", "ibm",
+        "meta", "adobe", "salesforce", "oracle", "ibm",
         "intel", "amd", "qualcomm", "broadcom", "texas instruments",
-        "micron", "western digital", "seagate", "hp", "dell",
-        "paypal", "square", "stripe", "shopify", "uber", "lyft",
-        "airbnb", "doordash", "instacart", "twitter", "snap",
-        "pinterest", "reddit", "discord",
+        "micron", "western digital", "hp", "dell",
+        "paypal", "shopify", "uber", "lyft",
+        "airbnb", "doordash", "snap",
 
         # ── Global Tech ─────────────────────────────────────────────────────
         "samsung", "tsmc", "taiwan semiconductor", "asml",
-        "arm holdings", "arm", "softbank", "sony", "panasonic",
-        "toshiba", "hitachi", "fujitsu", "nec", "nintendo",
-        "baidu", "alibaba", "tencent", "bytedance", "tiktok",
-        "huawei", "xiaomi", "oppo", "dji", "lenovo",
-        "infosys", "wipro", "tata consultancy", "accenture",
-        "capgemini", "sap", "siemens digital", "ericsson", "nokia",
+        "arm holdings", "softbank", "sony",
+        "baidu", "alibaba", "tencent", "bytedance",
+        "infosys", "accenture", "sap",
 
-        # ── AI models and companies ─────────────────────────────────────────
-        "openai", "anthropic", "gpt", "chatgpt", "gpt-4", "gpt-5",
-        "claude", "gemini", "grok", "llama", "mistral",
-        "deepmind", "google deepmind", "stability ai",
-        "midjourney", "dall-e", "sora", "artificial intelligence",
-        "large language model", "llm", "agi", "ai regulation",
-        "ai safety", "foundation model",
+        # ── Banks & financial services ──────────────────────────────────────
+        "jpmorgan", "goldman sachs", "morgan stanley",
+        "bank of america", "citigroup", "wells fargo",
+        "blackrock", "berkshire", "charles schwab",
+        "visa", "mastercard", "american express",
 
-        # ── Semiconductors ─────────────────────────────────────────────────
+        # ── Healthcare / pharma ─────────────────────────────────────────────
+        "pfizer", "moderna", "johnson & johnson", "unitedhealth",
+        "eli lilly", "novo nordisk", "abbvie", "merck",
+
+        # ── Energy ──────────────────────────────────────────────────────────
+        "exxon", "chevron", "conocophillips",
+
+        # ── Retail / consumer ───────────────────────────────────────────────
+        "walmart", "costco", "target", "home depot",
+        "starbucks", "mcdonalds", "nike", "coca cola", "pepsi",
+        "procter gamble", "disney",
+
+        # ── Semiconductors ──────────────────────────────────────────────────
         "semiconductor", "chip shortage", "chip act",
-        "foundry", "fab", "wafer", "moore's law",
-        "gpu", "cpu", "tpu", "npu", "h100", "blackwell",
+        "foundry", "fab", "wafer",
+        "gpu", "cpu", "h100", "blackwell",
 
         # ── Business events ─────────────────────────────────────────────────
         "earnings", "revenue", "eps", "ipo", "merger",
-        "acquisition", "nasdaq", "antitrust", "regulation",
-        "product launch", "wwdc", "google io", "microsoft build",
-        "ces", "mwc", "tech layoffs",
+        "acquisition", "nasdaq", "antitrust",
+        "stock split", "buyback", "dividend",
     ]
 
     TICKER_PREFIX_MAP = {
@@ -1071,11 +1080,13 @@ class TechBot(BaseBot):
         "amazon": "AMZN",   "nvidia": "NVDA",    "tesla": "TSLA",
         "intel": "INTC",    "amd": "AMD",         "qualcomm": "QCOM",
         "tsmc": "TSM",      "samsung": "005930.KS",
+        "jpmorgan": "JPM",  "goldman sachs": "GS", "bank of america": "BAC",
+        "pfizer": "PFE",    "exxon": "XOM",       "walmart": "WMT",
     }
 
     @property
     def sector_name(self) -> str:
-        return "tech"
+        return "financial_markets"
 
     def is_relevant(self, market: dict) -> bool:
         if _is_unmodelable_market(market):
@@ -1632,34 +1643,30 @@ class SportsBot(BaseBot):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  7. ENTERTAINMENT BOT  (v11.5 — scaffold, no model yet)
+#  7. GLOBAL EVENTS BOT  (v11.7 — replaces EntertainmentBot)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class EntertainmentBot(BaseBot):
+class GlobalEventsBot(BaseBot):
     """
-    Entertainment / streaming / awards markets — Spotify, Netflix, awards.
+    Alpha bucket — entertainment, AI milestones, product launches, misc events.
 
-    v11.5: SCAFFOLD ONLY. This bot CLAIMS entertainment markets to keep them
-    out of crypto (KXSPOTIFY was matching crypto's kxspot keyword). It does
-    NOT yet produce predictions — evaluate() returns None until a real model
-    is built.
+    v11.7: Replaces EntertainmentBot. Absorbs entertainment markets AND catches
+    everything that doesn't fit the core 6 sectors. This is the "everything
+    else" bucket where new market types land until they get a dedicated model.
 
-    Why this exists despite having no model:
-      - Prevents KXSPOTIFY → crypto misclassification (7 signals/day)
-      - Reserves the "entertainment" sector slot in the calibration table
-      - Documents which prefixes belong here for future model work
-      - Logs claimed markets so we can size the opportunity
+    Subsectors:
+      - Entertainment: Spotify streaming, Netflix, box office, awards
+      - AI / Tech launches: OpenAI releases, product launches, WWDC, CES
+      - Miscellaneous: anything not sports/crypto/weather/econ/politics/finance
 
-    Future model ideas:
-      - Spotify chart positions: predict via current rank + 7-day velocity
-        (Spotify Charts API is free, no auth)
-      - Box office: opening weekend predictions from BoxOfficeMojo trends
-      - Awards shows: nominee count + Vegas odds aggregator
+    No model yet — evaluate() returns None. The value is CLAIMING these
+    markets so they don't bleed into other sectors and corrupt calibration.
     """
 
     KEYWORDS = [
+        # ── Entertainment / streaming ───────────────────────────────────────
         "kxspotify",     # Spotify chart positions
-        "kxspotstream",  # Spotify streaming markets (v11.7: moved from crypto)
+        "kxspotstream",  # Spotify streaming
         "kxbox",         # Box office
         "kxnetflix",     # Netflix
         "kxhbo",         # HBO
@@ -1668,34 +1675,51 @@ class EntertainmentBot(BaseBot):
         "kxemmy",
         "kxgoldenglobe",
         "kxbillboard",
+
+        # ── AI / tech launches ──────────────────────────────────────────────
+        "kxtech",        # General tech events
+        "kxai",          # AI milestones
+        "kxopenai",      # OpenAI releases
+        "kxanthropic",   # Anthropic releases
+        "openai", "anthropic", "chatgpt", "gpt-4", "gpt-5",
+        "claude", "gemini", "grok", "llama", "mistral",
+        "deepmind", "stability ai", "midjourney", "dall-e", "sora",
+        "artificial intelligence", "large language model", "llm",
+        "agi", "ai regulation", "ai safety", "foundation model",
+        "product launch", "wwdc", "google io", "microsoft build",
+        "ces", "mwc", "tech layoffs",
     ]
 
     @property
     def sector_name(self) -> str:
-        return "entertainment"
+        return "global_events"
 
     def is_relevant(self, market: dict) -> bool:
         if _is_unmodelable_market(market):
             return False
-        return _is_entertainment_market(market)
+        if _has_sports_prefix(market):
+            return False
+        # Claim entertainment markets
+        if _is_entertainment_market(market):
+            return True
+        return _search_fields(market, self.KEYWORDS)
 
     def evaluate(self, market, news_signal=None):
-        """v11.5: scaffold only — log the claim, return no signal.
+        """v11.7: scaffold — claim the market, return no signal.
 
-        This prevents entertainment markets from polluting other sectors
+        Prevents global event markets from polluting other sectors
         without producing flat-prior garbage signals.
         """
         if not self.is_relevant(market):
             return None
         ticker = market.get("ticker", "")
-        logger.info(
-            "[entertainment] %s claimed (no model yet — scaffold)",
+        logger.debug(
+            "[global_events] %s claimed (no model yet)",
             ticker,
         )
         return None
 
     def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
-        # Stub — never called because evaluate() returns early
         return np.array([0.0]), {}
 
 
@@ -1707,7 +1731,7 @@ def all_bots() -> list[BaseBot]:
         CryptoBot(),
         PoliticsBot(),
         WeatherBot(),
-        TechBot(),
+        FinancialMarketsBot(),   # v11.7: replaces TechBot
         SportsBot(),
-        EntertainmentBot(),  # v11.5
+        GlobalEventsBot(),       # v11.7: replaces EntertainmentBot
     ]
