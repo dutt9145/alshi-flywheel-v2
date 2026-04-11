@@ -1,17 +1,13 @@
 """
-orchestrator.py  (v19.16 — fix sizing zero + crash protection + sector edge ceilings)
+orchestrator.py  (v19.17 — risk manager + prop correlation + Brier tracker)
 
-Changes vs v19.15:
-  1. scan_markets() now resets self._exposure at the start of each scan.
-     Previously exposure accumulated across scans and never decreased when
-     trades resolved. After 5 trades ($150 cap / $30 per trade), every
-     subsequent trade sized to zero for the rest of the day.
-
-  2. _execute_fades(), _execute_correlations(), _execute_resolution_timing()
-     are now wrapped in try/except so a crash in any secondary engine cannot
-     kill the main bot. The KXFOXNEWSMENTION correlation crash is now non-fatal.
-
-  3. Carries forward all v19.15 changes.
+Changes vs v19.16:
+  1. RiskManager: drawdown kill switch (-20%), per-player cap (5%),
+     per-trade cap (3%), per-sector cap (30%). Checked before every trade.
+  2. Same-game prop correlation: tracks trades per player+game within a scan,
+     downscales Kelly by 1/sqrt(n) for correlated bets.
+  3. BrierTracker: records per-prop outcomes on resolution, persists to Supabase.
+  4. All v19.16 changes carried forward intact.
 """
 
 import logging
@@ -50,6 +46,11 @@ from shared.news_signal import NewsSignal
 from shared.resolution_timer import ResolutionTimer
 from shared.sharp_detector import SharpDetector
 from bots.sector_bots import all_bots
+
+# v19.17: Going-live safety + tracking
+import math
+from shared.risk_manager import RiskManager
+from shared.brier_tracker import BrierTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -407,6 +408,11 @@ class FlywheelOrchestrator:
 
         self._open_provisionals: dict[str, float] = {}
 
+        # v19.17: Risk manager + Brier tracker + correlation tracking
+        self.risk_manager = RiskManager(bankroll=BANKROLL)
+        self.brier_tracker = BrierTracker.from_supabase(os.getenv("DATABASE_URL", ""))
+        self._scan_player_trades: dict[str, int] = {}
+
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
     def _get_sector_resolved_count(self, sector: str) -> int:
@@ -528,6 +534,19 @@ class FlywheelOrchestrator:
 
             _update_signal_brier(ticker, resolved_yes)
 
+            # v19.17: Brier tracker per-prop recording
+            if sig_rows:
+                _prop_code = None
+                for _code in ("HIT", "TB", "HRR", "HR", "KS"):
+                    if f"KXMLB{_code}" in ticker.upper():
+                        _prop_code = _code
+                        break
+                if _prop_code:
+                    self.brier_tracker.record(
+                        _prop_code, float(sig_rows[0]["our_prob"]),
+                        1 if resolved_yes else 0,
+                    )
+
             if not sig_rows:
                 processed_this_run.add(ticker)
                 continue
@@ -603,6 +622,13 @@ class FlywheelOrchestrator:
                     "outcome counted but not persisted; will retry next ingestion cycle",
                     ticker, primary_trade_id, e,
                 )
+
+        # v19.17: Save Brier tracker state
+        if recorded > 0:
+            try:
+                self.brier_tracker.save_to_supabase(os.getenv("DATABASE_URL", ""))
+            except Exception as e:
+                logger.warning("Brier tracker save failed: %s", e)
 
         logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
@@ -740,6 +766,11 @@ class FlywheelOrchestrator:
             logger.warning("CIRCUIT BREAKER HALT — skipping trade for %s", ticker)
             return
 
+        # v19.17: Risk manager master gate
+        if not self.risk_manager.can_trade():
+            logger.warning("RISK HALT: %s — skipping %s", self.risk_manager.halt_reason, ticker)
+            return
+
         cap = sector_loss_cap(lead_sector)
         if cap == 0.0:
             logger.warning(
@@ -818,6 +849,29 @@ class FlywheelOrchestrator:
             )
             return
 
+        # v19.17: Risk manager pre-trade checks
+        player_key = ticker.split("-")[2] if len(ticker.split("-")) >= 3 and ticker.upper().startswith("KXMLB") else ticker
+        ok, reason = self.risk_manager.pre_trade_check(player_key, lead_sector, sizing["dollars"])
+        if not ok:
+            logger.info("RISK BLOCKED %s: %s", ticker, reason)
+            return
+
+        # v19.17: Same-game prop correlation downscale
+        parts = ticker.split("-")
+        player_game_key = f"{parts[1]}-{parts[2]}" if len(parts) >= 3 and ticker.upper().startswith("KXMLB") else ticker
+        prev_count = self._scan_player_trades.get(player_game_key, 0)
+        if prev_count > 0:
+            scale = 1.0 / math.sqrt(prev_count + 1)
+            old_dollars = sizing["dollars"]
+            sizing["dollars"] = round(sizing["dollars"] * scale, 2)
+            sizing["contracts"] = max(1, int(sizing["contracts"] * scale))
+            logger.info(
+                "[CORRELATION] %s: %d prior props → $%.2f × %.2f = $%.2f",
+                player_game_key[:30], prev_count, old_dollars, scale, sizing["dollars"],
+            )
+            if sizing["contracts"] <= 0:
+                return
+
         client_order_id = str(uuid.uuid4())
 
         if DEMO_MODE:
@@ -846,6 +900,10 @@ class FlywheelOrchestrator:
         self._recently_traded[ticker]   = now
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
+
+        # v19.17: Record in risk manager + correlation tracker
+        self.risk_manager.record_trade(player_key, lead_sector, sizing["dollars"])
+        self._scan_player_trades[player_game_key] = prev_count + 1
 
         provisional_loss = -sizing["dollars"]
         with self._sector_pnl_lock:
@@ -1030,6 +1088,12 @@ class FlywheelOrchestrator:
         # should be replaced with real position querying from Kalshi API.
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
 
+        # v19.17: Update risk manager + reset correlation tracking
+        self.risk_manager.update_daily_pnl(
+            self._scan_summary.get("realized_pnl", 0.0)
+        )
+        self._scan_player_trades = {}
+
         try:
             markets = self.client.get_all_open_markets(
                 page_sleep_sec=SCAN_PAGE_SLEEP_SEC,
@@ -1102,10 +1166,6 @@ class FlywheelOrchestrator:
         )
 
         # ── v19.16: Secondary engines wrapped in try/except ───────────────
-        # A crash in any secondary engine (fades, correlations, resolution
-        # timing) cannot kill the main bot. Previously a KXFOXNEWSMENTION
-        # market in the correlation engine crashed kelly_sizer and took
-        # down the entire orchestrator.
         try:
             self._execute_fades(markets)
         except Exception as e:
@@ -1124,11 +1184,16 @@ class FlywheelOrchestrator:
         with self._sector_pnl_lock:
             sector_pnl_snapshot = dict(self._sector_daily_pnl)
 
+        # v19.17: Log risk manager status
+        risk_status = self.risk_manager.status()
         logger.info(
-            "Scan complete | daily_pnl=$%.2f trades=%d halted=%s | sector_pnl=%s",
+            "Scan complete | daily_pnl=$%.2f trades=%d halted=%s | "
+            "risk: %d player exposures, %s | sector_pnl=%s",
             self._scan_summary.get("realized_pnl", 0.0),
             self._scan_summary.get("trade_count", 0),
             self._scan_summary.get("halted", False),
+            len(risk_status["player_exposures"]),
+            "HALTED" if risk_status["halted"] else "OK",
             {k: f"${v:+.2f}" for k, v in sector_pnl_snapshot.items()},
         )
 
@@ -1168,13 +1233,23 @@ class FlywheelOrchestrator:
         self._resolved_count_cache.clear()
         self._resolved_count_cache_ts = 0.0
 
+        # v19.17: Reset risk manager + log Brier stats
+        self.risk_manager = RiskManager(bankroll=live_bankroll)
+        for stat in self.brier_tracker.all_stats():
+            if stat:
+                logger.info(
+                    "[BRIER] %s: %.4f (%d samples, trend=%s, ×%.1f)",
+                    stat["prop_code"], stat["brier"] or 0,
+                    stat["count"], stat["trend"], stat["multiplier"],
+                )
+
         logger.info("=== Retrain complete ===")
 
     # ── Run ────────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.16 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.17 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()

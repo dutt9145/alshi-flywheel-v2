@@ -550,6 +550,126 @@ def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional["P
         logger.warning("[mlb_stats] probable pitcher lookup failed: %s", e)
         return None
 
+# ── Historical stats-as-of-date (v11.7) ──────────────────────────────────────
+
+def fetch_batter_stats_as_of(
+    player_id: int, as_of_date: "date",
+) -> "Optional[BatterSeasonStats]":
+    """Season batting stats through a specific date (for backtesting).
+
+    Uses MLB Stats API's endDate parameter to get stats only through
+    the given date. This ensures backtests use the same information
+    the model would have had at prediction time.
+
+    Cache TTL is 86400 because historical data never changes.
+    """
+    season = as_of_date.year
+    # MLB API expects MM/DD/YYYY for date filters
+    end_date_str = as_of_date.strftime("%m/%d/%Y")
+    start_date_str = f"01/01/{season}"
+
+    data = _get(
+        f"{BASE}/people/{player_id}/stats",
+        {
+            "stats": "byDateRange",
+            "group": "hitting",
+            "season": season,
+            "startDate": start_date_str,
+            "endDate": end_date_str,
+        },
+        ttl=86400,  # historical data never changes
+    )
+    if not data:
+        return None
+    try:
+        splits = data["stats"][0]["splits"]
+        if not splits:
+            return None
+        stat = splits[0]["stat"]
+        return BatterSeasonStats(
+            player_id  = player_id,
+            games      = int(stat.get("gamesPlayed", 0)),
+            plate_apps = int(stat.get("plateAppearances", 0)),
+            at_bats    = int(stat.get("atBats", 0)),
+            hits       = int(stat.get("hits", 0)),
+            doubles    = int(stat.get("doubles", 0)),
+            triples    = int(stat.get("triples", 0)),
+            home_runs  = int(stat.get("homeRuns", 0)),
+            walks      = int(stat.get("baseOnBalls", 0)),
+            strikeouts = int(stat.get("strikeOuts", 0)),
+            avg        = float(stat.get("avg") or 0),
+            obp        = float(stat.get("obp") or 0),
+            slg        = float(stat.get("slg") or 0),
+            ops        = float(stat.get("ops") or 0),
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        logger.debug("historical batter stats parse failed for %d as of %s: %s",
+                      player_id, as_of_date, e)
+        return None
+
+
+def fetch_batter_rolling_as_of(
+    player_id: int, as_of_date: "date", n_games: int = 10,
+) -> "Optional[BatterRollingStats]":
+    """Rolling stats over the last N games before a specific date.
+
+    Uses the gameLog endpoint and filters to games on or before as_of_date.
+    """
+    season = as_of_date.year
+    data = _get(
+        f"{BASE}/people/{player_id}/stats",
+        {"stats": "gameLog", "group": "hitting", "season": season},
+        ttl=86400,
+    )
+    if not data:
+        return None
+    try:
+        splits = data["stats"][0]["splits"]
+
+        # Filter to games on or before the target date
+        filtered = []
+        for g in splits:
+            game_date_str = g.get("date", "")
+            if game_date_str and game_date_str <= as_of_date.isoformat():
+                filtered.append(g)
+
+        # Take the last n_games from the filtered list
+        recent = filtered[-n_games:]
+        if not recent:
+            return None
+
+        at_bats = hits = hrs = tb = 0
+        for g in recent:
+            s = g["stat"]
+            ab   = int(s.get("atBats", 0))
+            h    = int(s.get("hits", 0))
+            hr   = int(s.get("homeRuns", 0))
+            d2   = int(s.get("doubles", 0))
+            d3   = int(s.get("triples", 0))
+            at_bats += ab
+            hits    += h
+            hrs     += hr
+            tb      += (h - d2 - d3 - hr) + 2 * d2 + 3 * d3 + 4 * hr
+
+        avg = hits / at_bats if at_bats > 0 else 0.0
+        slg = tb / at_bats if at_bats > 0 else 0.0
+        iso = max(0.0, slg - avg)
+
+        return BatterRollingStats(
+            player_id   = player_id,
+            n_games     = len(recent),
+            at_bats     = at_bats,
+            hits        = hits,
+            home_runs   = hrs,
+            total_bases = tb,
+            avg         = avg,
+            iso         = iso,
+        )
+    except (KeyError, IndexError, ValueError) as e:
+        logger.debug("historical rolling stats failed for %d as of %s: %s",
+                      player_id, as_of_date, e)
+        return None
+    
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
