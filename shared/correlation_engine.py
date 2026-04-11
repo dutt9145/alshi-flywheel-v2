@@ -1,5 +1,12 @@
 """
-shared/correlation_engine.py
+shared/correlation_engine.py  (v2 — skip unmodelable markets, crash protection)
+
+Changes vs v1:
+  1. scan() now skips MENTION, Survivor, and other unmodelable markets
+     before grouping. Previously these were being correlated, passed to
+     kelly_sizer, and crashing the entire orchestrator.
+  2. _find_divergence() wrapped in try/except so a single bad market
+     can't crash the scan loop.
 
 Cross-market correlation engine.
 
@@ -12,19 +19,6 @@ Examples:
 When two correlated markets diverge, one of them is mispriced.
 Legging into both sides (long the cheap one, short the expensive one)
 is the closest thing to riskless arbitrage available on Kalshi.
-
-How it works:
-  1. Builds a correlation map by grouping markets by event_ticker prefix
-  2. Detects price divergence between correlated markets
-  3. Emits CorrSignal pairs that the orchestrator can leg into
-
-Usage:
-    from shared.correlation_engine import CorrelationEngine
-    engine = CorrelationEngine()
-    signals = engine.scan(open_markets)
-    for sig in signals:
-        # leg into sig.cheap_ticker (sig.cheap_direction)
-        # leg into sig.expensive_ticker (opposite direction)
 """
 
 import logging
@@ -36,19 +30,29 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ── v2: Markets the correlation engine should never touch ──────────────────────
+# These markets are unmodelable and cause crashes when passed to kelly_sizer.
+# Check is done via substring match on ticker/event_ticker (case-insensitive).
+_CORR_SKIP_SUBSTRINGS = (
+    "mention",      # KXFOXNEWSMENTION, KXMLBMENTION, KXNBAMENTION, etc.
+    "survivor",     # KXSURVIVORMENTION
+    "roty",         # Rookie of the Year futures
+    "seasonhr",     # Season-long HR totals
+)
+
 
 @dataclass
 class CorrSignal:
     """A detected correlated market pair with price divergence."""
-    event_group:        str        # shared event_ticker prefix
-    cheap_ticker:       str        # underpriced market
-    cheap_direction:    str        # direction to bet on cheap market ("YES" or "NO")
+    event_group:        str
+    cheap_ticker:       str
+    cheap_direction:    str
     cheap_price_cents:  int
-    expensive_ticker:   str        # overpriced market
-    expensive_direction: str       # direction to bet on expensive market
+    expensive_ticker:   str
+    expensive_direction: str
     expensive_price_cents: int
-    divergence_cents:   float      # price gap between the two markets
-    confidence:         float      # 0.0–1.0
+    divergence_cents:   float
+    confidence:         float
     notes:              str = ""
 
 
@@ -124,10 +128,6 @@ def _event_group(market: dict) -> str:
     """
     Extract the event group key from a market.
     Uses event_ticker if available, falls back to ticker prefix.
-
-    Examples:
-      event_ticker="KXFED-25MAR" → group="KXFED-25MAR"
-      ticker="KXBTC-25MAR-100K" → group="KXBTC-25MAR"
     """
     et = market.get("event_ticker", "").strip()
     if et:
@@ -138,6 +138,13 @@ def _event_group(market: dict) -> str:
     if len(parts) >= 2:
         return f"{parts[0]}-{parts[1]}".upper()
     return parts[0].upper() if parts else ""
+
+
+def _should_skip_market(market: dict) -> bool:
+    """v2: Return True if this market should be excluded from correlation analysis."""
+    ticker_lower = market.get("ticker", "").lower()
+    et_lower     = market.get("event_ticker", "").lower()
+    return any(s in ticker_lower or s in et_lower for s in _CORR_SKIP_SUBSTRINGS)
 
 
 class CorrelationEngine:
@@ -167,10 +174,19 @@ class CorrelationEngine:
         """
         Group open markets by event, then find divergent pairs.
         Returns list of CorrSignal sorted by divergence descending.
+
+        v2: Skips unmodelable markets (MENTION, Survivor, etc.) that
+        previously crashed the orchestrator when passed to kelly_sizer.
         """
-        # Group markets by event
+        # Group markets by event, skipping unmodelable ones
         groups: dict[str, list[dict]] = {}
+        skipped = 0
         for market in open_markets:
+            # v2: skip unmodelable markets before grouping
+            if _should_skip_market(market):
+                skipped += 1
+                continue
+
             price = _get_yes_price(market)
             if price == 0:
                 continue
@@ -178,6 +194,11 @@ class CorrelationEngine:
             if not group:
                 continue
             groups.setdefault(group, []).append(market)
+
+        if skipped > 0:
+            logger.debug(
+                "CorrelationEngine skipped %d unmodelable markets", skipped
+            )
 
         # Only process groups with 2+ markets
         signals: list[CorrSignal] = []
@@ -187,8 +208,15 @@ class CorrelationEngine:
             if len(markets) > self.max_group_size:
                 continue
 
-            group_signals = self._find_divergence(group, markets)
-            signals.extend(group_signals)
+            # v2: wrap in try/except so one bad group can't crash the scan
+            try:
+                group_signals = self._find_divergence(group, markets)
+                signals.extend(group_signals)
+            except Exception as e:
+                logger.warning(
+                    "CorrelationEngine: error processing group %s: %s",
+                    group, e,
+                )
 
         # Sort by divergence — biggest opportunity first
         signals.sort(key=lambda s: s.divergence_cents, reverse=True)
@@ -207,16 +235,6 @@ class CorrelationEngine:
         """
         For each pair in the group, detect if they imply contradictory
         probabilities at a detectable spread.
-
-        For markets within the same event:
-          If market A implies P(event) = 0.80 and market B implies 0.65,
-          the spread of 15 cents is tradeable — buy B YES, sell A YES
-          (or equivalently buy A NO).
-
-        We detect this by comparing YES prices and checking if the
-        sum of YES prices across a pair exceeds 100 + min_divergence
-        (implying one is overpriced) or falls below 100 - min_divergence
-        (implying one is underpriced).
         """
         signals = []
 
@@ -230,19 +248,10 @@ class CorrelationEngine:
             ticker_a = m_a.get("ticker", "")
             ticker_b = m_b.get("ticker", "")
 
-            # Determine relationship type
-            # Type 1: Nested thresholds (BTC above $100k vs $90k)
-            # The $90k market should ALWAYS be >= $100k market
-            # If $100k > $90k, that's a divergence (higher bar priced higher)
             title_a   = m_a.get("title", "").lower()
             title_b   = m_b.get("title", "").lower()
             nested    = self._detect_nested_thresholds(title_a, title_b, price_a, price_b)
-
-            # Type 2: Timeframe mismatch (March cut vs Q1 cut)
-            # The broader timeframe market should be >= the narrower one
             timeframe = self._detect_timeframe_mismatch(title_a, title_b, price_a, price_b)
-
-            # Type 3: Raw price divergence (same event, very different prices)
             raw_div   = abs(price_a - price_b)
 
             if nested and nested["divergence"] >= self.min_divergence_cents:
@@ -258,7 +267,6 @@ class CorrelationEngine:
                     self._log_divergence(sig)
 
             elif raw_div >= self.min_divergence_cents * 1.5:
-                # Raw divergence needs a higher bar since we don't know direction
                 sig = CorrSignal(
                     event_group          = group,
                     cheap_ticker         = ticker_b if price_b < price_a else ticker_a,
@@ -301,20 +309,17 @@ class CorrelationEngine:
         if num_a is None or num_b is None or num_a == num_b:
             return None
 
-        # Lower threshold should have higher probability
         if num_a < num_b:
-            # A is easier to achieve → P(A) should be > P(B)
             if price_a < price_b:
                 divergence = price_b - price_a
                 return {
                     "type":       "nested_threshold",
                     "divergence": divergence,
-                    "cheap":      "a",   # A should be more expensive but isn't
+                    "cheap":      "a",
                     "expensive":  "b",
                     "notes":      f"Nested threshold: easier market (${num_a:,.0f}) underpriced vs harder (${num_b:,.0f})",
                 }
         else:
-            # B is easier → P(B) should be > P(A)
             if price_b < price_a:
                 divergence = price_a - price_b
                 return {
@@ -331,11 +336,7 @@ class CorrelationEngine:
         self, title_a: str, title_b: str, price_a: int, price_b: int
     ) -> Optional[dict]:
         """
-        Detect if one market has a broader timeframe than the other,
-        making it necessarily more likely to resolve YES.
-
-        e.g. "Fed cut in March" (narrow) vs "Fed cut in Q1" (broad)
-        The Q1 market should be >= March market.
+        Detect if one market has a broader timeframe than the other.
         """
         broad_terms  = ["q1", "q2", "q3", "q4", "year", "annual", "2025", "2026"]
         narrow_terms = ["january", "february", "march", "april", "may", "june",
@@ -352,7 +353,7 @@ class CorrelationEngine:
             return {
                 "type":       "timeframe_mismatch",
                 "divergence": divergence,
-                "cheap":      "a",   # broader timeframe is underpriced
+                "cheap":      "a",
                 "expensive":  "b",
                 "notes":      "Broader timeframe market priced below narrower — buy broad",
             }

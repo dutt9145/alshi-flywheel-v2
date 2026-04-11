@@ -1,5 +1,26 @@
 """
-bots/sector_bots.py  (v11.4 — MLB player prop integration)
+bots/sector_bots.py  (v11.5 — MENTION skip + EntertainmentBot scaffold + leak fixes)
+
+Changes vs v11.4:
+  Bug fixes:
+    - CryptoBot: kxspot → kxspotstream (was matching KXSPOTIFY incorrectly)
+    - SPORTS_PREFIXES: added kxufl (United Football League leaking to weather)
+    - CryptoBot KEYWORDS: added kxshiba (SHIB token explicit)
+
+  New helpers:
+    - _is_unmodelable_market(): returns True for MENTION markets and Survivor.
+      Catches ~460 noise signals/day. Every bot now checks this first.
+    - _is_entertainment_market(): returns True for KXSPOTIFY/KXNETFLIX/etc.
+      Routes them to the new EntertainmentBot.
+
+  New bot:
+    - EntertainmentBot: scaffold only. Claims Spotify/Netflix/awards markets
+      so they stop polluting other sectors. evaluate() returns None until
+      a real model is built (next session).
+
+  All bots now check _is_unmodelable_market() and _is_entertainment_market()
+  at the top of is_relevant() so noise markets are skipped before any
+  feature fetching or model evaluation happens.
 
 Changes vs v11.3:
   SportsBot:
@@ -166,6 +187,10 @@ def _has_sports_prefix(market: dict) -> bool:
         # city keyword match (Melbourne City FC, Melbourne Victory).
         "kxalea",
 
+        # ── UFL (United Football League) — v11.5 ─────────────────────────
+        # Was leaking into weather via city name keyword matching.
+        "kxufl",
+
         # ── Combat sports ─────────────────────────────────────────────────
         "kxboxing", "kxwwe",
 
@@ -196,6 +221,65 @@ def _has_sports_prefix(market: dict) -> bool:
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
     return any(et.startswith(p) or tk.startswith(p) for p in SPORTS_PREFIXES)
+
+
+def _is_unmodelable_market(market: dict) -> bool:
+    """v11.5: Markets that no current bot can meaningfully predict.
+
+    These markets either:
+    - Require live transcript / video analysis (MENTION markets)
+    - Require domain knowledge no API exposes (Survivor TV outcomes)
+    - Are pure entertainment trivia (awards show predictions)
+
+    Every bot's is_relevant() checks this FIRST and returns False.
+    The market is then skipped entirely — no signal is logged, no garbage
+    predictions pollute the calibration data.
+
+    This eliminates ~460+ noise signals/day in 26-04 audit:
+      - 440 KXSURVIVORMENT
+      - 13  KXMLBMENTION
+      - 13  KXNBAMENTION
+      - 13  KXPOLITICSMENT
+      - 13  KXGOVERNORMENT
+      - 1   KXFOXNEWSMENTI
+      - 1   KXFURYMENTION
+    """
+    et = market.get("event_ticker", "").lower()
+    tk = market.get("ticker", "").lower()
+
+    # MENTION markets — require live transcript analysis
+    if "mention" in et or "mention" in tk:
+        return True
+
+    # Survivor TV show — requires watching the episode
+    if et.startswith("kxsurv") or tk.startswith("kxsurv"):
+        return True
+
+    return False
+
+
+def _is_entertainment_market(market: dict) -> bool:
+    """v11.5: Entertainment / streaming / awards markets.
+
+    These get claimed by EntertainmentBot. Listed separately from
+    _is_unmodelable_market because EntertainmentBot WILL eventually
+    have a real model — for now it just claims the markets to keep
+    them out of crypto/weather/economics.
+    """
+    ENTERTAINMENT_PREFIXES = (
+        "kxspotify",     # Spotify chart positions
+        "kxbox",         # Box office (if exists)
+        "kxnetflix",     # Netflix subscriber/show predictions
+        "kxhbo",         # HBO show predictions
+        "kxgrammy",      # Grammy awards
+        "kxoscar",       # Oscar awards
+        "kxemmy",        # Emmy awards
+        "kxgoldenglobe", # Golden Globes
+        "kxbillboard",   # Billboard chart
+    )
+    et = market.get("event_ticker", "").lower()
+    tk = market.get("ticker", "").lower()
+    return any(et.startswith(p) or tk.startswith(p) for p in ENTERTAINMENT_PREFIXES)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,6 +357,10 @@ class EconomicsBot(BaseBot):
         return "economics"
 
     def is_relevant(self, market: dict) -> bool:
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
         if _has_sports_prefix(market):
             return False
         return _search_fields(market, self.KEYWORDS)
@@ -305,7 +393,9 @@ class CryptoBot(BaseBot):
         "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
         "kxbnb", "kxavax", "kxlink", "kxcoin", "kxmatic", "kxada",
         "kxdot", "kxatom", "kxnear", "kxfil", "kxapt", "kxsui",
-        "kxspot", "kxshib", "kxnetf",
+        # v11.5: kxspotstream not kxspot — kxspot was matching KXSPOTIFY
+        "kxspotstream", "kxshib", "kxnetf",
+        "kxshiba",  # SHIB token explicit
 
         # ── Major coins ────────────────────────────────────────────────────
         "bitcoin", "btc", "ethereum", "eth", "solana", "xrp", "ripple",
@@ -360,6 +450,10 @@ class CryptoBot(BaseBot):
         return "crypto"
 
     def is_relevant(self, market: dict) -> bool:
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
         if _has_sports_prefix(market):
             return False
         return _search_fields(market, self.KEYWORDS)
@@ -450,6 +544,10 @@ class PoliticsBot(BaseBot):
         return "politics"
 
     def is_relevant(self, market: dict) -> bool:
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
         if _has_sports_prefix(market):
             return False
         return _search_fields(market, self.KEYWORDS)
@@ -664,6 +762,12 @@ class WeatherBot(BaseBot):
         return "weather"
 
     def is_relevant(self, market: dict) -> bool:
+        # ── v11.5 guards ──────────────────────────────────────────────────
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
+
         # ── Primary guard: sports prefix check ────────────────────────────
         if _has_sports_prefix(market):
             return False
@@ -892,6 +996,10 @@ class TechBot(BaseBot):
         return "tech"
 
     def is_relevant(self, market: dict) -> bool:
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
         if _has_sports_prefix(market):
             return False
         return _search_fields(market, self.KEYWORDS)
@@ -1235,6 +1343,12 @@ class SportsBot(BaseBot):
     # ─────────────────────────────────────────────────────────────────────
 
     def is_relevant(self, market: dict) -> bool:
+        # ── v11.5 guards ──────────────────────────────────────────────────
+        if _is_unmodelable_market(market):
+            return False
+        if _is_entertainment_market(market):
+            return False
+
         et = market.get("event_ticker", "").lower()
         tk = market.get("ticker", "").lower()
 
@@ -1303,6 +1417,73 @@ class SportsBot(BaseBot):
         return features, context
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  7. ENTERTAINMENT BOT  (v11.5 — scaffold, no model yet)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EntertainmentBot(BaseBot):
+    """
+    Entertainment / streaming / awards markets — Spotify, Netflix, awards.
+
+    v11.5: SCAFFOLD ONLY. This bot CLAIMS entertainment markets to keep them
+    out of crypto (KXSPOTIFY was matching crypto's kxspot keyword). It does
+    NOT yet produce predictions — evaluate() returns None until a real model
+    is built.
+
+    Why this exists despite having no model:
+      - Prevents KXSPOTIFY → crypto misclassification (7 signals/day)
+      - Reserves the "entertainment" sector slot in the calibration table
+      - Documents which prefixes belong here for future model work
+      - Logs claimed markets so we can size the opportunity
+
+    Future model ideas:
+      - Spotify chart positions: predict via current rank + 7-day velocity
+        (Spotify Charts API is free, no auth)
+      - Box office: opening weekend predictions from BoxOfficeMojo trends
+      - Awards shows: nominee count + Vegas odds aggregator
+    """
+
+    KEYWORDS = [
+        "kxspotify",     # Spotify chart positions
+        "kxbox",         # Box office
+        "kxnetflix",     # Netflix
+        "kxhbo",         # HBO
+        "kxgrammy",
+        "kxoscar",
+        "kxemmy",
+        "kxgoldenglobe",
+        "kxbillboard",
+    ]
+
+    @property
+    def sector_name(self) -> str:
+        return "entertainment"
+
+    def is_relevant(self, market: dict) -> bool:
+        if _is_unmodelable_market(market):
+            return False
+        return _is_entertainment_market(market)
+
+    def evaluate(self, market, news_signal=None):
+        """v11.5: scaffold only — log the claim, return no signal.
+
+        This prevents entertainment markets from polluting other sectors
+        without producing flat-prior garbage signals.
+        """
+        if not self.is_relevant(market):
+            return None
+        ticker = market.get("ticker", "")
+        logger.info(
+            "[entertainment] %s claimed (no model yet — scaffold)",
+            ticker,
+        )
+        return None
+
+    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
+        # Stub — never called because evaluate() returns early
+        return np.array([0.0]), {}
+
+
 # ── Convenience factory ───────────────────────────────────────────────────────
 
 def all_bots() -> list[BaseBot]:
@@ -1313,4 +1494,5 @@ def all_bots() -> list[BaseBot]:
         WeatherBot(),
         TechBot(),
         SportsBot(),
+        EntertainmentBot(),  # v11.5
     ]

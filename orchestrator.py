@@ -1115,9 +1115,20 @@ class FlywheelOrchestrator:
         )
         # ── END DIAGNOSTIC 2 ──
 
-        self._execute_fades(markets)
-        self._execute_correlations(markets)
-        self._execute_resolution_timing(markets)
+        try:
+            self._execute_fades(markets)
+        except Exception as e:
+            logger.error("Fade scanner crashed (non-fatal): %s", e)
+
+        try:
+            self._execute_correlations(markets)
+        except Exception as e:
+            logger.error("Correlation engine crashed (non-fatal): %s", e)
+
+        try:
+            self._execute_resolution_timing(markets)
+        except Exception as e:
+            logger.error("Resolution timing crashed (non-fatal): %s", e)
 
         with self._sector_pnl_lock:
             sector_pnl_snapshot = dict(self._sector_daily_pnl)
