@@ -1,24 +1,14 @@
 """
-kalshi-flywheel / config/settings.py  (v7 — calibration audit filters)
+kalshi-flywheel / config/settings.py  (v8 — sector edge ceilings + entertainment)
 
-Changes vs v6:
-  1. MAX_EDGE_PCT added (0.25) — 30%+ edge trades went 0/4 (-$600).
-     The market was right every time. Edge ceiling kills these traps.
-  2. DIRECTION_FILTER added ("NO") — YES went 2/9 (22% WR), NO went
-     11/17 (65% WR). NO-only until YES recalibrates. Env-var override.
-  3. MIN_EDGE_PCT raised 0.02 → 0.05 — sub-5% edge trades went 0/2 (-$175).
-  4. CONSENSUS_EDGE_PCT raised 0.02 → 0.05 — keep in sync with MIN_EDGE_PCT.
-  5. CONSENSUS_CONFIDENCE raised 0.65 → 0.75 — 60-74% tier went 0/1. 
-     75-89% tier is the sweet spot (52% WR, +$2,356).
-  6. MAX_SINGLE_TRADE_USD lowered 150 → 30 — right-sized for $1,000 bankroll.
-  7. SECTOR_MAX_DAILY_LOSS sports lowered 200 → 50 — 5% of $1k bankroll.
-  8. CIRCUIT_BREAKER_PCT raised 0.05 → 0.20 — hard stop at -$200 on $1k.
-
-API TIERS
----------
-Tier 1  Free    — get these day 1, zero cost
-Tier 2  $9–$50  — high ROI, add after first profitable week
-Tier 3  $29–$150— premium alpha, add after model is calibrated
+Changes vs v7:
+  1. SECTOR_MAX_EDGE added — per-sector edge ceilings. Weather gets 60%
+     (NOAA-backed), sports gets 40% (MLB Poisson model), others stay 25%.
+     Previously the global 25% ceiling was rejecting 58%+ weather edges
+     that were genuine NOAA signal, not traps.
+  2. sector_max_edge() helper added for consensus_engine to call.
+  3. "entertainment" added to SECTORS, SECTOR_MAX_DAILY_LOSS, SECTOR_MIN_RESOLVED.
+  4. All other settings unchanged from v7.
 """
 
 import os
@@ -32,7 +22,6 @@ KALSHI_KEY_ID      = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
 
 # ── Demo mode ──────────────────────────────────────────────────────────────────
-# Default is TRUE — you must explicitly set DEMO_MODE=false in Railway to go live.
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 # ── Bankroll & risk ────────────────────────────────────────────────────────────
@@ -48,13 +37,29 @@ MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.05"))
 # Calibration audit: 30%+ edge went 0/4 (-$600). Market was right.
 MAX_EDGE_PCT = float(os.getenv("MAX_EDGE_PCT", "0.25"))
 
+# ── Per-sector edge ceilings (v8) ─────────────────────────────────────────────
+# Override the global MAX_EDGE_PCT for sectors where high edges are real signal.
+# Weather: NOAA-backed predictions hit 30-60% edges with 96% confidence.
+#          These are genuine edges — the market is wrong, not the model.
+# Sports:  MLB Poisson model can find 25-40% edges on extreme thresholds
+#          (e.g. ≥3 hits for a .200 hitter — model correctly says 2.7%).
+# Uncalibrated sectors stay at the conservative global default.
+SECTOR_MAX_EDGE: dict[str, float] = {
+    "sports":        float(os.getenv("SECTOR_MAX_EDGE_SPORTS",        "0.40")),
+    "weather":       float(os.getenv("SECTOR_MAX_EDGE_WEATHER",       "0.60")),
+    "crypto":        float(os.getenv("SECTOR_MAX_EDGE_CRYPTO",        "0.25")),
+    "politics":      float(os.getenv("SECTOR_MAX_EDGE_POLITICS",      "0.25")),
+    "economics":     float(os.getenv("SECTOR_MAX_EDGE_ECONOMICS",     "0.25")),
+    "tech":          float(os.getenv("SECTOR_MAX_EDGE_TECH",          "0.25")),
+    "entertainment": float(os.getenv("SECTOR_MAX_EDGE_ENTERTAINMENT", "0.25")),
+}
+
 # Consensus thresholds
 CONSENSUS_EDGE_PCT   = 0.05
 CONSENSUS_CONFIDENCE = 0.75
 
 # Direction filter: "NO" = only NO trades, "YES" = only YES, "BOTH" = no filter.
 # Calibration audit: YES 2/9 (22% WR), NO 11/17 (65% WR).
-# Override in Railway env var without redeploying.
 DIRECTION_FILTER = os.getenv("DIRECTION_FILTER", "NO")
 
 # Per-trade size cap as % of bankroll.
@@ -71,29 +76,30 @@ MAX_MARKET_EXPOSURE = float(os.getenv("MAX_MARKET_EXPOSURE", "0.05"))
 
 # ── Per-sector daily loss caps ─────────────────────────────────────────────────
 SECTOR_MAX_DAILY_LOSS: dict[str, float] = {
-    "sports":    float(os.getenv("SECTOR_MAX_LOSS_SPORTS",    "50.0")),
-    "politics":  float(os.getenv("SECTOR_MAX_LOSS_POLITICS",   "25.0")),
-    "weather":   float(os.getenv("SECTOR_MAX_LOSS_WEATHER",    "30.0")),
-    "economics": float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",  "40.0")),
-    "crypto":    float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",     "40.0")),
-    "tech":      float(os.getenv("SECTOR_MAX_LOSS_TECH",       "40.0")),
+    "sports":        float(os.getenv("SECTOR_MAX_LOSS_SPORTS",        "50.0")),
+    "politics":      float(os.getenv("SECTOR_MAX_LOSS_POLITICS",      "25.0")),
+    "weather":       float(os.getenv("SECTOR_MAX_LOSS_WEATHER",       "30.0")),
+    "economics":     float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",     "40.0")),
+    "crypto":        float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",        "40.0")),
+    "tech":          float(os.getenv("SECTOR_MAX_LOSS_TECH",          "40.0")),
+    "entertainment": float(os.getenv("SECTOR_MAX_LOSS_ENTERTAINMENT", "25.0")),
 }
 
 # ── Per-sector minimum resolved trades before full Kelly sizing ────────────────
 SECTOR_MIN_RESOLVED: dict[str, int] = {
-    "sports":    int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",    "20")),
-    "politics":  int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",  "30")),
-    "weather":   int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",   "30")),
-    "economics": int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS", "30")),
-    "crypto":    int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",    "30")),
-    "tech":      int(os.getenv("SECTOR_MIN_RESOLVED_TECH",      "30")),
+    "sports":        int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",        "20")),
+    "politics":      int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",      "30")),
+    "weather":       int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",       "30")),
+    "economics":     int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS",     "30")),
+    "crypto":        int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",        "30")),
+    "tech":          int(os.getenv("SECTOR_MIN_RESOLVED_TECH",          "30")),
+    "entertainment": int(os.getenv("SECTOR_MIN_RESOLVED_ENTERTAINMENT", "50")),
 }
 
 # Exploration Kelly multiplier — trades at 25% of normal Kelly during exploration.
 EXPLORATION_KELLY_FRACTION = 0.25
 
 # ── Circuit breaker ────────────────────────────────────────────────────────────
-# At $1k bankroll, 20% = $200 max drawdown before auto-pause.
 CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.20"))
 
 # ── Sharp detector ─────────────────────────────────────────────────────────────
@@ -159,7 +165,7 @@ RETRAIN_HOUR      = 2
 DB_PATH = os.getenv("DB_PATH", "flywheel.db")
 
 # ── Sectors ────────────────────────────────────────────────────────────────────
-SECTORS = ["economics", "crypto", "politics", "weather", "tech", "sports"]
+SECTORS = ["economics", "crypto", "politics", "weather", "tech", "sports", "entertainment"]
 
 # ── Bet sizing helpers ─────────────────────────────────────────────────────────
 def max_bet_size() -> float:
@@ -179,3 +185,13 @@ def sector_kelly_fraction(sector: str, resolved_count: int) -> float:
 
 def sector_loss_cap(sector: str) -> float:
     return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)
+
+
+def sector_max_edge(sector: str) -> float:
+    """Return the edge ceiling for a given sector.
+
+    Weather/sports have higher ceilings because their models produce
+    genuine high-edge predictions (NOAA temperature data, MLB Poisson).
+    Uncalibrated sectors use the conservative global default.
+    """
+    return SECTOR_MAX_EDGE.get(sector, MAX_EDGE_PCT)

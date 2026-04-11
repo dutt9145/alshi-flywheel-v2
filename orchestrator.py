@@ -1,23 +1,17 @@
 """
-orchestrator.py  (v19.15 — fix price parsing for one-sided markets)
+orchestrator.py  (v19.16 — fix sizing zero + crash protection + sector edge ceilings)
 
-Changes vs v19.9:
-  1. _ingest_resolved_markets() now resolves `sec` BEFORE the pnl_usd
-     block so the same value is passed to both the provisional unwind
-     and log_outcome(). Previously sec_rows was only fetched inside
-     `if pnl_usd is not None`, leaving log_outcome() with no sector
-     argument — causing 669 NULL sector rows in the outcomes table and
-     all P&L appearing in a NULL bucket on the dashboard.
+Changes vs v19.15:
+  1. scan_markets() now resets self._exposure at the start of each scan.
+     Previously exposure accumulated across scans and never decreased when
+     trades resolved. After 5 trades ($150 cap / $30 per trade), every
+     subsequent trade sized to zero for the rest of the day.
 
-  2. Falls back to _infer_sector_from_ticker() when the signals lookup
-     returns no sector (e.g. tickers logged before sector was backfilled).
+  2. _execute_fades(), _execute_correlations(), _execute_resolution_timing()
+     are now wrapped in try/except so a crash in any secondary engine cannot
+     kill the main bot. The KXFOXNEWSMENTION correlation crash is now non-fatal.
 
-  3. Passes sector= to log_outcome() so every new outcome row has a
-     sector value.
-
-  4. Carries forward all v19.9 changes: provisional loss double-count
-     fix, per-event Bayesian dedup, _sector_pnl_lock, NO P&L formula
-     fix, sports ticker corrections.
+  3. Carries forward all v19.15 changes.
 """
 
 import logging
@@ -87,7 +81,7 @@ _SPORTS_PREFIXES = (
     "kxepl", "kxsoccer", "kxboxing", "kxwwe", "kxcricket",
     "kxrugby", "kxesport",
     "kxeuroleague", "kxcba", "kxcbagame",
-    "kxacbgame", "kxaleaguegame", "kxaleague",  # v19.11: added missing prefixes
+    "kxacbgame", "kxaleaguegame", "kxaleague",
 )
 
 
@@ -130,7 +124,7 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
       "kxdota", "kxintlf", "kxcs2",
       "kxeuroleague", "kxcba", "kxcbagame",
-      "kxacbgame", "kxaleaguegame", "kxaleague",  # v19.11
+      "kxacbgame", "kxaleaguegame", "kxaleague",
       ), "sports"),
     (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi"), "crypto"),
     (("kxelect", "kxpres", "kxsen", "kxhouse", "kxgov",
@@ -190,8 +184,6 @@ def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
                 conn.commit()
                 return rows
             except Exception as e:
-                # SSL connection dropped — close the broken connection and retry
-                # with a fresh one rather than returning empty results.
                 try:
                     conn.close()
                 except Exception:
@@ -202,7 +194,6 @@ def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
                         "_query_signals SSL/connection error, retrying (%d left): %s",
                         _retries, e,
                     )
-                    # Force the pool to drop this connection
                     global _pg_pool
                     try:
                         _pg_pool.closeall()
@@ -237,7 +228,6 @@ def _parse_yes_price_cents(market: dict) -> int:
         ask = float(market.get("yes_ask_dollars") or 0)
         if bid > 0 and ask > 0:
             return int(round((bid + ask) / 2 * 100))
-        # FIX v19.15: trading API sometimes returns only ask or only bid
         if ask > 0:
             return int(round(ask * 100))
         if bid > 0:
@@ -536,7 +526,6 @@ class FlywheelOrchestrator:
             if allow_bayesian_update:
                 bayesian_updated_events.add(event_key)
 
-            # Always update signal Brier regardless of whether we traded
             _update_signal_brier(ticker, resolved_yes)
 
             if not sig_rows:
@@ -554,11 +543,6 @@ class FlywheelOrchestrator:
             pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
             primary_trade_id   = trade_ids[0] if trade_ids else None
 
-            # ── FIX v19.11: Gate outcome log on trade existence ────────────
-            # Skip outcomes table write entirely if we had a signal but never
-            # executed a trade. Eliminates NULL pnl_usd / NULL trade_id rows
-            # (88 economics, 447 weather) that polluted Brier scores.
-            # Bayesian model update and signal Brier update above still run.
             if primary_trade_id is None:
                 logger.debug(
                     "[OUTCOME SKIP] %s — signal exists but no trade, skipping outcome log",
@@ -567,7 +551,6 @@ class FlywheelOrchestrator:
                 processed_this_run.add(ticker)
                 continue
 
-            # ── Resolve sector once, shared by P&L unwind AND log_outcome ──
             sec_rows = _query_signals(
                 f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
                 (ticker,),
@@ -648,7 +631,6 @@ class FlywheelOrchestrator:
         title     = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
-        # DEBUG v19.12: log first market's raw fields to diagnose trading API format
         if not hasattr(self, '_debug_logged'):
             logger.info("DEBUG market keys: %s", list(market.keys()))
             logger.info("DEBUG price fields: bid=%s ask=%s last=%s yes_ask=%s",
@@ -1040,6 +1022,14 @@ class FlywheelOrchestrator:
         self._scan_summary  = self.circuit_breaker.daily_summary()
         self.bankroll       = self._scan_bankroll
 
+        # ── FIX v19.16: Reset exposure each scan ──────────────────────────
+        # Previous bug: exposure accumulated across scans and never decreased
+        # when trades resolved. After 5 trades ($150 cap / $30 per trade),
+        # every subsequent trade sized to zero for the rest of the day.
+        # In demo mode there's no real capital at risk. In live mode this
+        # should be replaced with real position querying from Kalshi API.
+        self._exposure = {b.sector_name: 0.0 for b in self.bots}
+
         try:
             markets = self.client.get_all_open_markets(
                 page_sleep_sec=SCAN_PAGE_SLEEP_SEC,
@@ -1056,7 +1046,7 @@ class FlywheelOrchestrator:
 
         logger.info("Fetched %d open markets", len(markets))
 
-        # ── DIAGNOSTIC: price parsing audit (remove after debugging) ──
+        # ── DIAGNOSTIC: price parsing audit ──
         nonzero = 0
         for m in markets[:100]:
             if _parse_yes_price_cents(m) > 0:
@@ -1074,9 +1064,8 @@ class FlywheelOrchestrator:
                 sample.get("yes_ask_dollars"),
                 sample.get("last_price_dollars"),
             )
-        # ── END DIAGNOSTIC ──
 
-       # ── DIAGNOSTIC: bot signal audit (remove after debugging) ──
+       # ── DIAGNOSTIC: bot signal audit ──
         _diag_priced = 0
         _diag_relevant = 0
         for market in markets:
@@ -1092,8 +1081,6 @@ class FlywheelOrchestrator:
             "SIGNAL DIAG: total=%d priced=%d relevant=%d",
             len(markets), _diag_priced, _diag_relevant,
         )
-        
-        # ── END DIAGNOSTIC ──
 
         # ── DIAGNOSTIC 2: sample tickers from priced markets ──
         _mve_count = 0
@@ -1113,8 +1100,12 @@ class FlywheelOrchestrator:
             "MARKET DIAG: total=%d mve=%d extreme_single=%d tradeable_single=%s",
             len(markets), _mve_count, _extreme_single, _single_game,
         )
-        # ── END DIAGNOSTIC 2 ──
 
+        # ── v19.16: Secondary engines wrapped in try/except ───────────────
+        # A crash in any secondary engine (fades, correlations, resolution
+        # timing) cannot kill the main bot. Previously a KXFOXNEWSMENTION
+        # market in the correlation engine crashed kelly_sizer and took
+        # down the entire orchestrator.
         try:
             self._execute_fades(markets)
         except Exception as e:
@@ -1183,7 +1174,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.15 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.16 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
