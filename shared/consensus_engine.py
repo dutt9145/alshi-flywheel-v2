@@ -1,16 +1,15 @@
 """
-shared/consensus_engine.py  (v3 — calibration audit gates)
+shared/consensus_engine.py  (v4 — per-sector edge ceilings)
 
-Changes vs v2:
-  1. Gate 5 added: edge ceiling (MAX_EDGE_PCT). 30%+ edge trades went
-     0/4 for -$600 — the market was right, the model was fooled by
-     stale pricing or efficient markets. Rejects anything above 25%.
-  2. Gate 6 added: direction filter (DIRECTION_FILTER). YES went 2/9
-     (22% WR), NO went 11/17 (65% WR). Default NO-only until YES
-     recalibrates. Override via Railway env var without redeploying.
-  3. Import updated to pull MAX_EDGE_PCT, DIRECTION_FILTER from settings.
-  4. Gates renumbered: 1=bot count, 2=direction agreement, 3=edge floor,
-     4=confidence floor, 5=edge ceiling, 6=direction filter.
+Changes vs v3:
+  1. Gate 5 now uses sector_max_edge(sector) instead of global MAX_EDGE_PCT.
+     Weather gets 60% ceiling (NOAA-backed predictions), sports gets 40%
+     (MLB Poisson model), uncalibrated sectors stay at 25%.
+     Previously, weather was rejecting 30-60% edges that were genuine NOAA
+     signal — Houston temperature markets with 96% confidence and 58% edge
+     were being thrown away because the global ceiling was 25%.
+  2. Import updated to pull sector_max_edge from settings.
+  3. All other gates unchanged from v3.
 """
 
 import logging
@@ -22,6 +21,7 @@ import numpy as np
 from config.settings import (
     CONSENSUS_EDGE_PCT, CONSENSUS_CONFIDENCE, SECTORS,
     MAX_EDGE_PCT, DIRECTION_FILTER,
+    sector_max_edge,   # v4: per-sector edge ceilings
 )
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ class ConsensusEngine:
       2. All responding bots agree on direction
       3. Weighted-average edge >= CONSENSUS_EDGE_PCT (floor)
       4. Weighted-average confidence >= CONSENSUS_CONFIDENCE
-      5. Weighted-average edge <= MAX_EDGE_PCT (ceiling — traps)
+      5. Weighted-average edge <= sector edge ceiling (per-sector, v4)
       6. Direction matches DIRECTION_FILTER (NO-only mode)
     """
 
@@ -177,11 +177,18 @@ class ConsensusEngine:
                 ),
             )
 
-        # ── Gate 5: edge ceiling (calibration audit: 30%+ = 0/4, -$600) ───────
-        if avg_edge > MAX_EDGE_PCT:
+        # ── Gate 5: edge ceiling (v4: per-sector) ─────────────────────────────
+        # v3 used global MAX_EDGE_PCT (25%) for all sectors. This rejected
+        # genuine weather signals (NOAA 96% conf, 58% edge on Houston temp)
+        # and extreme MLB player props (≥3 hits for a .200 hitter).
+        # v4 uses sector_max_edge() which gives weather 60%, sports 40%.
+        lead_sector = signals[0].sector
+        edge_ceiling = sector_max_edge(lead_sector)
+
+        if avg_edge > edge_ceiling:
             logger.info(
-                "[Consensus] %s REJECTED: edge %.2f%% exceeds ceiling %.2f%%",
-                ticker, avg_edge * 100, MAX_EDGE_PCT * 100,
+                "[Consensus] %s REJECTED: edge %.2f%% exceeds ceiling %.2f%% (sector=%s)",
+                ticker, avg_edge * 100, edge_ceiling * 100, lead_sector,
             )
             return ConsensusResult(
                 ticker=ticker, execute=False,
@@ -189,7 +196,7 @@ class ConsensusEngine:
                 avg_edge=avg_edge, avg_confidence=avg_conf,
                 signals=signals,
                 reject_reason=(
-                    f"Edge {avg_edge:.2%} > ceiling {MAX_EDGE_PCT:.2%}"
+                    f"Edge {avg_edge:.2%} > ceiling {edge_ceiling:.2%}"
                 ),
             )
 
