@@ -90,7 +90,7 @@ _SPORTS_PREFIXES = (
     "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
     "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
     # Tennis
-    "kxatp", "kxwta", "kxtennis",
+    "kxatp", "kxwta", "kxtennis", "kxabagame",
     # Golf
     "kxpga", "kxowga",
     # International soccer
@@ -169,7 +169,7 @@ SCAN_PAGE_SLEEP_SEC = 0.25
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
     (("kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-      "kxatp", "kxwta", "kxtennis", "kxpga", "kxowga",
+      "kxatp", "kxwta", "kxtennis", "kxabagame", "kxpga", "kxowga",
       "kxf1", "kxolympic", "kxepl", "kxsoccer",
       "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
       "kxdota", "kxintlf", "kxcs2", "kxcsgo",

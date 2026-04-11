@@ -164,7 +164,7 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxufc", "kxncaa", "kxcbb", "kxcfb",
 
         # ── Tennis ────────────────────────────────────────────────────────
-        "kxatp", "kxwta", "kxtennis",
+        "kxatp", "kxwta", "kxtennis", "kxabagame",
 
         # ── Golf ──────────────────────────────────────────────────────────
         # v11.3: kxpga was missing → bled into crypto ("pga" no match but
@@ -712,6 +712,19 @@ class WeatherBot(BaseBot):
         "kxfestival",  # Festival events (matched "nyc" city keyword)
         "kxthevoice",  # The Voice TV show
         "kxafl",       # AFL (Australian Football League — "sydney" city match)
+        # v11.8d: news-spike bypass leaks — these tickers fire on ALL bots
+        # via BaseBot.evaluate() news-velocity path, bypassing is_relevant()
+        "kxswalwell",  # Swalwell dropout (politics)
+        "kxtrumppardons",  # Trump pardons (politics)
+        "kxtrumpendorse",  # Trump endorsements (politics)
+        "kxdenmarkpm",     # Denmark PM (politics)
+        "kxisraelpm",      # Israel PM (politics)
+        "kxswencounters",  # Star Wars encounters (entertainment)
+        "kxabagame",       # WTA tennis (ABA → sports, not weather)
+        "kxpayrolls",      # Payrolls (economics)
+        "kxlcpi",          # CPI (economics)
+        "kxcpi",           # CPI (economics)
+        "kxwti",           # WTI crude oil (economics)
     )
 
     KEYWORDS = [
@@ -1159,8 +1172,7 @@ class SportsBot(BaseBot):
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
         # ── Tennis ─────────────────────────────────────────────────────────
-        "kxatp", "kxwta", "kxtennis",
-        "kxf1", "kxolympic", "kxepl", "kxsoccer",
+        "kxatp", "kxwta", "kxtennis", "kxabagame",        "kxf1", "kxolympic", "kxepl", "kxsoccer",
         "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
         "kxthail", "kxsl",
         # ── Esports ────────────────────────────────────────────────────────
@@ -1320,7 +1332,7 @@ class SportsBot(BaseBot):
         "kxmvesports": "NBA", "kxmvecbchampionship": "NCAAB",
         "kxepl": "EPL", "kxsoccer": "MLS",
         # Tennis
-        "kxatp": "ATP", "kxwta": "WTA", "kxtennis": "ATP",
+        "kxatp": "ATP", "kxwta": "WTA", "kxtennis": "ATP", "kxabagame": "ABA",
         "kxf1": "F1",
         "kxboxing": "BOXING", "kxgolf": "PGA",
         # Esports
