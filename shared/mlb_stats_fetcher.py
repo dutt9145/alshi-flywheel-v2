@@ -495,6 +495,60 @@ PARK_FACTORS = {
     120: 0.98,  # Washington (Nationals Park)
 }
 
+# Add this function to the END of shared/mlb_stats_fetcher.py
+# Also add 'fetch_opposing_pitcher' to any __all__ if present.
+
+def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional["PitcherSeasonStats"]:
+    """Fetch probable pitcher stats for a given team on a given date.
+
+    Uses MLB Stats API schedule endpoint with probablePitcher hydration.
+    game_date: "YYYY-MM-DD" format
+    opponent_team_id: MLB team ID of the opposing team (the team PITCHING against our batter)
+
+    Returns PitcherSeasonStats for the opposing starter, or None if unavailable.
+    """
+    data = _get(
+        f"{BASE}/schedule",
+        {
+            "sportId": 1,
+            "date": game_date,
+            "hydrate": "probablePitcher",
+            "teamId": opponent_team_id,
+        },
+        ttl=1800,  # 30 min cache — probable pitchers don't change often
+    )
+    if not data:
+        return None
+
+    try:
+        for date_entry in data.get("dates", []):
+            for game in date_entry.get("games", []):
+                away = game.get("teams", {}).get("away", {})
+                home = game.get("teams", {}).get("home", {})
+
+                # Find which side has the opponent team → get their pitcher
+                if away.get("team", {}).get("id") == opponent_team_id:
+                    pp = away.get("probablePitcher")
+                elif home.get("team", {}).get("id") == opponent_team_id:
+                    pp = home.get("probablePitcher")
+                else:
+                    continue
+
+                if pp and pp.get("id"):
+                    pitcher_stats = fetch_pitcher_stats(pp["id"])
+                    if pitcher_stats:
+                        logger.info(
+                            "[mlb_stats] opposing pitcher: %s (K/9=%.1f, %.0fIP)",
+                            pp.get("fullName", "?"),
+                            pitcher_stats.k_per_9,
+                            pitcher_stats.innings,
+                        )
+                    return pitcher_stats
+
+        return None
+    except Exception as e:
+        logger.warning("[mlb_stats] probable pitcher lookup failed: %s", e)
+        return None
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
@@ -550,3 +604,5 @@ if __name__ == "__main__":
     print("=" * 78)
 
     sys.exit(0 if passes >= len(TESTS) - 1 else 1)  # allow 1 miss for early-season rosters
+
+    

@@ -94,6 +94,7 @@ from shared.mlb_stats_fetcher import (
     fetch_batter_stats,
     fetch_batter_rolling,
     fetch_pitcher_stats,
+    fetch_opposing_pitcher,
 )
 from shared.mlb_hit_model import predict_mlb_prop
 from shared.consensus_engine import BotSignal
@@ -113,6 +114,30 @@ from shared.nba_stats_fetcher import (
 from shared.nba_props_model import predict_nba_prop
 
 logger = logging.getLogger(__name__)
+
+_MONTH_MAP = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+def _extract_mlb_game_date(ticker: str) -> Optional[str]:
+    """Extract game date from MLB ticker as YYYY-MM-DD.
+
+    Ticker format: KXMLBHIT-26APR092140COLSD-...
+    Date portion:  YY MON DD after the first hyphen.
+    """
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    m = re.match(r"(\d{2})([A-Z]{3})(\d{2})", parts[1])
+    if not m:
+        return None
+    year = 2000 + int(m.group(1))
+    month = _MONTH_MAP.get(m.group(2), 0)
+    day = int(m.group(3))
+    if month == 0:
+        return None
+    return f"{year}-{month:02d}-{day:02d}"
 
 
 def _search_fields(market: dict, keywords: list[str]) -> bool:
@@ -1309,7 +1334,29 @@ class SportsBot(BaseBot):
             if not season or season.plate_apps <= 0:
                 return False, None
             rolling = fetch_batter_rolling(player.player_id, n_games=10)
-            prediction = predict_mlb_prop(parsed, season, rolling, None)
+
+            # v11.7: Wire opposing pitcher context into batter predictions
+            opp_pitcher_stats = None
+            try:
+                # Determine opponent team
+                opp_code = (parsed.away_team_code
+                            if parsed.player_team_code == parsed.home_team_code
+                            else parsed.home_team_code)
+                opp_team_info = MLB_TEAMS.get(opp_code)
+                if opp_team_info:
+                    # Extract game date from ticker: KXMLB...-26APR092140COLSD-...
+                    game_date = _extract_mlb_game_date(ticker)
+                    if game_date:
+                        opp_pitcher_stats = fetch_opposing_pitcher(game_date, opp_team_info[0])
+                        if opp_pitcher_stats:
+                            logger.info(
+                                "[sports/mlb] %s facing pitcher K/9=%.1f",
+                                player.full_name, opp_pitcher_stats.k_per_9,
+                            )
+            except Exception as e:
+                logger.debug("[sports/mlb] probable pitcher lookup failed: %s", e)
+
+            prediction = predict_mlb_prop(parsed, season, rolling, opp_pitcher_stats)
 
         if not prediction:
             return False, None
