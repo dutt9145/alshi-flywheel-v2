@@ -130,13 +130,42 @@ def _fetch_espn_roster(kalshi_team_code: str) -> list[dict]:
         return []
 
     athletes = []
-    # ESPN roster response has "athletes" array with position groups
-    for group in data.get("athletes", []):
-        items = group.get("items", [])
-        for athlete in items:
-            athletes.append(athlete)
+
+    # Log top-level keys for debugging
+    logger.info("[nba_stats] ESPN roster keys for %s: %s", kalshi_team_code, list(data.keys())[:10])
+
+    # Format A: grouped by position → {"athletes": [{"position":"Guard","items":[...]}]}
+    # Format B: flat athlete list → {"athletes": [{"id":"123","displayName":"X"},...]}
+    # Format C: nested under team → {"team": {"athletes": [...]}}
+
+    raw_athletes = data.get("athletes", [])
+    if not raw_athletes:
+        # Try nested under "team"
+        raw_athletes = data.get("team", {}).get("athletes", [])
+
+    for entry in raw_athletes:
+        if "items" in entry:
+            # Format A: position-grouped
+            for athlete in entry["items"]:
+                athletes.append(athlete)
+        elif "id" in entry and ("displayName" in entry or "fullName" in entry):
+            # Format B: flat athlete dict
+            athletes.append(entry)
+        elif "athlete" in entry:
+            # Format C: wrapped in {"athlete": {...}}
+            athletes.append(entry["athlete"])
 
     logger.info("[nba_stats] ESPN roster for %s: %d players", kalshi_team_code, len(athletes))
+
+    if athletes:
+        # Log first player for format verification
+        first = athletes[0]
+        logger.info("[nba_stats] sample player: %s #%s (id=%s) keys=%s",
+                     first.get("displayName", first.get("fullName", "?")),
+                     first.get("jersey", "?"),
+                     first.get("id", "?"),
+                     list(first.keys())[:8])
+
     _roster_cache[espn_id] = athletes
     return athletes
 
@@ -227,7 +256,7 @@ def lookup_player(
 def _search_player_espn(first_initial, last_name, jersey, team_id, cache_key) -> Optional[NBAPlayer]:
     """Fallback: search ESPN for player by name."""
     search_name = last_name.capitalize()
-    url = f"{_ESPN_V3}/athletes?search={search_name}&limit=25"
+    url = f"{_ESPN_BASE}/athletes?search={search_name}&limit=25"
     data = _espn_get(url)
     if not data:
         return None
@@ -295,7 +324,7 @@ def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
         return _stats_cache[player_id]
 
     # Try the per-athlete statistics endpoint
-    url = f"{_ESPN_V3}/athletes/{player_id}/statistics"
+    url = f"{_ESPN_BASE}/athletes/{player_id}/statistics"
     data = _espn_get(url)
 
     if not data:
@@ -403,7 +432,7 @@ def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingS
     
     The model handles None rolling gracefully (uses 100% season weight).
     """
-    url = f"{_ESPN_V3}/athletes/{player_id}/gamelog"
+    url = f"{_ESPN_BASE}/athletes/{player_id}/gamelog"
     data = _espn_get(url)
     if not data:
         return None
