@@ -1416,6 +1416,10 @@ class SportsBot(BaseBot):
             return False, None
 
         # Fetch stats — different path for batters vs pitchers
+        # v11.8: Set home_team_id so the model can look up park factors
+        home_team_info = MLB_TEAMS.get(parsed.home_team_code)
+        parsed.home_team_id = home_team_info[0] if home_team_info else None
+
         if parsed.prop_code == "KS":
             pitcher = fetch_pitcher_stats(player.player_id)
             if not pitcher or pitcher.innings <= 0:
