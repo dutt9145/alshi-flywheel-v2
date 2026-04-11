@@ -1392,9 +1392,10 @@ class SportsBot(BaseBot):
     def evaluate(self, market, news_signal=None):
         """Override BaseBot.evaluate() to try player prop models first.
 
-        Order: MLB → NBA → base class fallback.
-        Commits to the new model whenever it can produce a prediction,
-        even if the signal is filtered out by the edge threshold.
+        Order: MLB → NBA → silence.
+        If neither model can handle the market, return None instead of
+        falling through to the flat-prior BayesianPolyModel which produces
+        garbage our_p=0.452 on every unmodeled sport.
         """
         handled, signal = self._try_mlb_player_prop(market)
         if handled:
@@ -1404,7 +1405,9 @@ class SportsBot(BaseBot):
         if handled:
             return signal
 
-        return super().evaluate(market, news_signal=news_signal)
+        # v11.7: No model for this market → stay silent.
+        # Don't fall through to base class flat prior.
+        return None
 
     # ─────────────────────────────────────────────────────────────────────
     # v11.6: NBA PLAYER PROP ROUTING
