@@ -1,14 +1,11 @@
 """
-shared/data_fetchers.py  (v7 — fix KeyError on odds API outcome parsing)
+shared/data_fetchers.py  (v8 — fix CoinGecko rate limiting)
 
-Changes vs v5:
-  1. fetch_sports_features() odds API TTL changed from 300s to 3600s.
-     At 300s (matching scan interval), the cache expired between every scan,
-     consuming ~576 credits/day and burning the 2,000/month paid tier in
-     under 4 days. Odds lines don't move meaningfully every 5 minutes —
-     1 hour is the right refresh cadence for pre-game lines.
-
-  2. Everything else unchanged from v5.
+Changes vs v7:
+  1. Added dogecoin and binancecoin to _KNOWN_COINS
+  2. Dedicated CoinGecko cache with 120s TTL that persists across failures
+  3. Cache check happens BEFORE rate limiter sleep
+  4. Returns stale cache on API failure instead of hammering retries
 
 Tier 1 (free)   : FRED, Open-Meteo, CoinGecko, Polymarket Gamma, NewsAPI, Finnhub, ESPN
 Tier 2 ($9-50)  : TheOddsAPI, OddsPapi, Polygon.io, MySportsFeeds, FMP
@@ -67,37 +64,74 @@ def _get(url: str, params: dict = None, headers: dict = None,
     return entry["data"] if entry else None
 
 
-# ── CoinGecko rate-limit guard ────────────────────────────────────────────────
+# ── CoinGecko batched fetch with dedicated cache (v8) ─────────────────────────
 
+_KNOWN_COINS = ["bitcoin", "ethereum", "solana", "ripple", "dogecoin", "binancecoin"]
+
+_cg_cache: dict[str, dict] = {}
+_cg_cache_ts: float = 0.0
+_CG_CACHE_TTL: float = 120.0  # 2 minutes — prices don't move faster than this
 _cg_lock = threading.Lock()
 _cg_last_call: float = 0.0
-_CG_MIN_INTERVAL: float = 2.0
+_CG_MIN_INTERVAL: float = 6.0  # 10 calls/minute max for free tier
 
-def _cg_rate_limited_get(url: str, params: dict, ttl: int) -> Optional[dict]:
-    global _cg_last_call
+
+def _fetch_all_cg_markets() -> dict[str, dict]:
+    """
+    Fetch all known coins in a single batched CoinGecko call.
+    Results are cached for 120 seconds to avoid rate limiting.
+    Returns stale cache on API failure.
+    """
+    global _cg_cache, _cg_cache_ts, _cg_last_call
+
+    # Fast path: return cached data if still fresh (no lock needed for read)
+    if _cg_cache and (time.time() - _cg_cache_ts < _CG_CACHE_TTL):
+        return _cg_cache
+
     with _cg_lock:
+        # Double-check after acquiring lock (another thread may have refreshed)
+        if _cg_cache and (time.time() - _cg_cache_ts < _CG_CACHE_TTL):
+            return _cg_cache
+
+        # Rate limit: wait if we called too recently
         elapsed = time.time() - _cg_last_call
         if elapsed < _CG_MIN_INTERVAL:
             time.sleep(_CG_MIN_INTERVAL - elapsed)
+
         _cg_last_call = time.time()
-    return _get(url, params, ttl=ttl)
 
+        # Make the batched API call
+        ids_str = ",".join(_KNOWN_COINS)
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "ids": ids_str,
+                    "price_change_percentage": "24h",
+                    "sparkline": "false",
+                },
+                timeout=12,
+            )
 
-# ── Batched CoinGecko fetch ───────────────────────────────────────────────────
+            if r.status_code == 429:
+                logger.warning("[CoinGecko] 429 rate limited — returning stale cache")
+                return _cg_cache
 
-_KNOWN_COINS = ["bitcoin", "ethereum", "solana", "ripple"]
+            r.raise_for_status()
+            data = r.json()
 
-def _fetch_all_cg_markets() -> dict[str, dict]:
-    ids_str = ",".join(_KNOWN_COINS)
-    data = _cg_rate_limited_get(
-        "https://api.coingecko.com/api/v3/coins/markets",
-        {"vs_currency": "usd", "ids": ids_str,
-         "price_change_percentage": "24h", "sparkline": "false"},
-        ttl=600,
-    )
-    if not data:
-        return {}
-    return {coin["id"]: coin for coin in data}
+            if data:
+                _cg_cache = {coin["id"]: coin for coin in data}
+                _cg_cache_ts = time.time()
+                logger.debug("[CoinGecko] Refreshed %d coins", len(_cg_cache))
+                return _cg_cache
+
+        except Exception as e:
+            logger.warning("[CoinGecko] Fetch failed: %s — returning stale cache", e)
+
+        # Return stale cache on any failure
+        return _cg_cache
 
 
 # =============================================================================
@@ -224,7 +258,8 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
 
     if POLYGON_API_KEY:
         sym = {"bitcoin": "X:BTCUSD", "ethereum": "X:ETHUSD",
-               "solana": "X:SOLUSD", "ripple": "X:XRPUSD"}.get(coin_id, "X:BTCUSD")
+               "solana": "X:SOLUSD", "ripple": "X:XRPUSD",
+               "dogecoin": "X:DOGEUSD", "binancecoin": "X:BNBUSD"}.get(coin_id, "X:BTCUSD")
         poly = _get(f"https://api.polygon.io/v2/last/trade/{sym}",
                     {"apiKey": POLYGON_API_KEY}, ttl=30)
         if poly:
@@ -255,7 +290,8 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
 
     funding_rate = 0.0
     if COINGLASS_KEY:
-        sym_cg = {"bitcoin": "BTC", "ethereum": "ETH"}.get(coin_id, "BTC")
+        sym_cg = {"bitcoin": "BTC", "ethereum": "ETH",
+                  "solana": "SOL", "dogecoin": "DOGE", "binancecoin": "BNB"}.get(coin_id, "BTC")
         fd = _get("https://open-api.coinglass.com/public/v2/funding",
                   {"symbol": sym_cg},
                   headers={"coinglassSecret": COINGLASS_KEY}, ttl=300)
@@ -268,7 +304,7 @@ def fetch_crypto_features(coin_id: str = "bitcoin") -> tuple[np.ndarray, dict]:
     social_volume = social_sentiment = 0.0
     if LUNARCRUSH_KEY:
         sym_lc = {"bitcoin": "BTC", "ethereum": "ETH",
-                  "solana": "SOL"}.get(coin_id, "BTC")
+                  "solana": "SOL", "dogecoin": "DOGE", "binancecoin": "BNB"}.get(coin_id, "BTC")
         lc = _get(f"https://lunarcrush.com/api4/public/coins/{sym_lc}/v1", {},
                   headers={"Authorization": f"Bearer {LUNARCRUSH_KEY}"}, ttl=600)
         if lc:
