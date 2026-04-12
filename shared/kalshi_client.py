@@ -41,7 +41,7 @@ _MAX_RETRIES = 3
 
 # How far back to look beyond the most recent logged outcome.
 # 2 hours catches any markets that resolved but weren't ingested in the last cycle.
-_INGESTION_LOOKBACK = timedelta(hours=2)
+_INGESTION_LOOKBACK = timedelta(days=7)  # v12: temporarily 7 days for backfill, revert to hours=2 after
 
 # The path prefix expected by the trading API in signatures.
 _API_PATH_PREFIX = "/trade-api/v2"
