@@ -1,27 +1,23 @@
 """
-shared/nba_stats_fetcher.py  (v7 — ESPN primary, BDL fallback)
+shared/nba_stats_fetcher.py  (v9 — use /overview endpoint)
 
-v7 changes
+v9 changes
 ----------
-ESPN public API (no auth required) is now the PRIMARY source for:
-  - Player lookup  → bulk team roster fetch (30 calls caches ALL players)
-  - Season stats   → per-player statistics endpoint
-  - Rolling stats  → per-player gamelog endpoint
+Use /overview endpoint:
+  https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{id}/overview
 
-BallDontLie remains as FALLBACK when ESPN fails.
+Response structure:
+  {
+    "statistics": {
+      "labels": ["GP","MIN","FG%","3P%","FT%","REB","AST","BLK","STL","PF","TO","PTS"],
+      "splits": [
+        {"displayName": "Regular Season", "stats": ["42","31.0","46.8",...,"26.6"]},
+        {"displayName": "Career", "stats": [...]}
+      ]
+    }
+  }
 
-This eliminates the hard dependency on a BDL API key that was causing
-100% of NBA player prop lookups to fail (401 Unauthorized).
-
-ESPN endpoints (no auth):
-  Roster:  site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{id}/roster
-  Stats:   site.api.espn.com/apis/site/v2/sports/basketball/nba/players/{id}/statistics
-  Gamelog: site.api.espn.com/apis/site/v2/sports/basketball/nba/players/{id}/gamelog
-
-BDL endpoints (auth required):
-  Players:         api.balldontlie.io/v1/players?search=LASTNAME
-  Season averages: api.balldontlie.io/v1/season_averages
-  Game log:        api.balldontlie.io/v1/stats
+splits[0].stats is parallel to labels — both are string arrays.
 """
 
 import json
@@ -29,10 +25,10 @@ import logging
 import os
 import time
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +36,14 @@ logger = logging.getLogger(__name__)
 _BDL_BASE = "https://api.balldontlie.io/v1"
 _API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "")
 
-_ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+# v9: Use /overview for stats
+_ESPN_ROSTER_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+_ESPN_STATS_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
 
 if _API_KEY:
     logger.info("[nba_stats] BDL API key loaded (%d chars) — available as fallback", len(_API_KEY))
 else:
-    logger.info("[nba_stats] No BDL API key — ESPN-only mode (this is fine)")
+    logger.info("[nba_stats] No BDL API key — ESPN-only mode")
 
 
 # ── ESPN team IDs ──────────────────────────────────────────────────────────────
@@ -59,15 +57,13 @@ _ESPN_TEAM_IDS: dict[str, int] = {
 }
 
 
-# ── Data classes (unchanged interface from v6) ────────────────────────────────
-
 @dataclass
 class NBAPlayer:
     player_id:  int
     full_name:  str
     team_id:    int
     jersey:     str
-    source:     str = "espn"    # "espn" or "bdl" — tells stats which API to hit
+    source:     str = "espn"
 
 
 @dataclass
@@ -101,16 +97,15 @@ class RollingStats:
     minutes_pg:     float
 
 
-# ── Caches ─────────────────────────────────────────────────────────────────────
-_player_cache:   dict[str, NBAPlayer] = {}   # cache_key → NBAPlayer
-_roster_loaded:  set[str] = set()            # team codes whose rosters are cached
+_player_cache:   dict[str, NBAPlayer] = {}
+_roster_loaded:  set[str] = set()
 _roster_ts:      float = 0.0
-_ROSTER_TTL      = 21600                     # 6 hours
+_ROSTER_TTL      = 21600
 
 _stats_cache:    dict[int, PlayerStats] = {}
 _rolling_cache:  dict[int, RollingStats] = {}
 _stats_ts:       float = 0.0
-_STATS_TTL       = 3600                      # 1 hour
+_STATS_TTL       = 3600
 
 
 def _check_roster_cache():
@@ -131,10 +126,7 @@ def _check_stats_cache():
         _stats_ts = now
 
 
-# ── HTTP helpers ───────────────────────────────────────────────────────────────
-
 def _espn_get(url: str, timeout: int = 15) -> Optional[dict]:
-    """Fetch from ESPN public API (no auth required)."""
     req = Request(url)
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "KalshiFlywheel/1.0")
@@ -142,15 +134,14 @@ def _espn_get(url: str, timeout: int = 15) -> Optional[dict]:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        logger.warning("[nba_stats] ESPN %d: %s", e.code, url[:100])
+        logger.debug("[nba_stats] ESPN %d: %s", e.code, url[:100])
         return None
     except Exception as e:
-        logger.warning("[nba_stats] ESPN request failed: %s → %s", url[:80], e)
+        logger.debug("[nba_stats] ESPN request failed: %s → %s", url[:80], e)
         return None
 
 
 def _bdl_get(endpoint: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
-    """Authenticated request to BallDontLie (fallback)."""
     if not _API_KEY:
         return None
     query = ""
@@ -174,15 +165,14 @@ def _bdl_get(endpoint: str, params: dict = None, timeout: int = 15) -> Optional[
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        logger.info("[nba_stats] BDL %d: %s", e.code, endpoint)
+        logger.debug("[nba_stats] BDL %d: %s", e.code, endpoint)
         return None
     except Exception as e:
-        logger.info("[nba_stats] BDL failed: %s → %s", endpoint, e)
+        logger.debug("[nba_stats] BDL failed: %s → %s", endpoint, e)
         return None
 
 
 def _normalize(name: str) -> str:
-    """Strip accents/diacritics and uppercase."""
     nfkd = unicodedata.normalize("NFKD", name)
     return "".join(c for c in nfkd if not unicodedata.combining(c)).upper()
 
@@ -194,7 +184,6 @@ def _get_current_season() -> int:
 
 
 def _parse_minutes(min_str) -> float:
-    """Parse '32:15' or '32.25' or '32' → float minutes."""
     s = str(min_str or "0")
     if ":" in s:
         parts = s.split(":")
@@ -208,133 +197,73 @@ def _parse_minutes(min_str) -> float:
         return 0.0
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ESPN ROSTER LOADING
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _espn_load_team_roster(team_code: str) -> list[NBAPlayer]:
-    """Fetch one team's full roster from ESPN (no auth)."""
     espn_id = _ESPN_TEAM_IDS.get(team_code)
     if not espn_id:
         return []
-
-    url = f"{_ESPN_BASE}/teams/{espn_id}/roster"
+    url = f"{_ESPN_ROSTER_BASE}/teams/{espn_id}/roster"
     data = _espn_get(url)
     if not data:
         return []
-
     players: list[NBAPlayer] = []
     athletes = data.get("athletes", [])
-
     for entry in athletes:
-        # ESPN groups players by position category:
-        #   {"position": "Guards", "items": [{player}, ...]}
-        # OR returns a flat list of player dicts
         if isinstance(entry, dict) and "items" in entry:
             items = entry["items"]
         elif isinstance(entry, dict) and "id" in entry:
             items = [entry]
         else:
             continue
-
         for p in items:
             try:
                 pid = int(p.get("id", 0))
-                name = (p.get("fullName", "")
-                        or p.get("displayName", "")
-                        or f"{p.get('firstName', '')} {p.get('lastName', '')}".strip())
+                name = (p.get("fullName", "") or p.get("displayName", "") or f"{p.get('firstName', '')} {p.get('lastName', '')}".strip())
                 jersey = str(p.get("jersey", "")).lstrip("0") or "0"
-
                 if pid and name:
-                    players.append(NBAPlayer(
-                        player_id=pid,
-                        full_name=name,
-                        team_id=espn_id,
-                        jersey=jersey,
-                        source="espn",
-                    ))
+                    players.append(NBAPlayer(player_id=pid, full_name=name, team_id=espn_id, jersey=jersey, source="espn"))
             except (ValueError, TypeError):
                 continue
-
     return players
 
 
 def _espn_ensure_team_loaded(team_code: str):
-    """Load a single team's roster into the player cache."""
     _check_roster_cache()
     if team_code in _roster_loaded:
         return
-
     players = _espn_load_team_roster(team_code)
     if not players:
-        logger.warning("[nba_stats] ESPN roster empty for %s — will try BDL", team_code)
-        _roster_loaded.add(team_code)      # don't retry every scan
+        logger.warning("[nba_stats] ESPN roster empty for %s", team_code)
+        _roster_loaded.add(team_code)
         return
-
     for p in players:
         norm_name = _normalize(p.full_name)
         name_parts = norm_name.split()
         if len(name_parts) < 2:
             continue
-
         first_initial = name_parts[0][0]
-        last_name     = name_parts[-1]
-
-        # Primary key: initial-last-jersey  (exact match)
-        key1 = f"{first_initial}-{last_name}-{p.jersey}"
-        _player_cache[key1] = p
-
-        # Secondary key: initial-last-team  (jersey might differ)
-        key2 = f"{first_initial}-{last_name}-{team_code}"
-        _player_cache.setdefault(key2, p)
-
-        # Tertiary: full-name-team (for brute-force fallback)
-        key3 = f"FULL-{norm_name}-{team_code}"
-        _player_cache[key3] = p
-
+        last_name = name_parts[-1]
+        _player_cache[f"{first_initial}-{last_name}-{p.jersey}"] = p
+        _player_cache.setdefault(f"{first_initial}-{last_name}-{team_code}", p)
+        _player_cache[f"FULL-{norm_name}-{team_code}"] = p
     _roster_loaded.add(team_code)
     logger.info("[nba_stats] ESPN roster loaded: %s (%d players)", team_code, len(players))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PLAYER LOOKUP  (ESPN primary → BDL fallback)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def lookup_player(
-    team_id: int,
-    first_initial: str,
-    last_name: str,
-    jersey: str,
-    team_code: str = "",
-) -> Optional[NBAPlayer]:
-    """
-    Find an NBA player by initial, last name, jersey, and team.
-
-    Tries ESPN roster cache first (free, bulk-loaded).
-    Falls back to BDL search API if ESPN can't match.
-    """
-    target_first  = first_initial.upper()
-    target_last   = _normalize(last_name)
+def lookup_player(team_id: int, first_initial: str, last_name: str, jersey: str, team_code: str = "") -> Optional[NBAPlayer]:
+    target_first = first_initial.upper()
+    target_last = _normalize(last_name)
     target_jersey = str(jersey).lstrip("0") or "0"
-
-    # ── 1. ESPN roster lookup ──────────────────────────────────────────────
     if team_code:
         _espn_ensure_team_loaded(team_code)
-
-    # Try exact: initial + last + jersey
     key_exact = f"{target_first}-{target_last}-{target_jersey}"
     if key_exact in _player_cache:
         return _player_cache[key_exact]
-
-    # Try team-based: initial + last + team_code
     if team_code:
         key_team = f"{target_first}-{target_last}-{team_code}"
         if key_team in _player_cache:
             p = _player_cache[key_team]
-            _player_cache[key_exact] = p       # cache the jersey key too
+            _player_cache[key_exact] = p
             return p
-
-    # Brute-force: scan all loaded players for this team by name similarity
     if team_code:
         espn_tid = _ESPN_TEAM_IDS.get(team_code, 0)
         for ck, p in _player_cache.items():
@@ -344,411 +273,221 @@ def lookup_player(
             parts = norm.split()
             if len(parts) < 2:
                 continue
-            p_first = parts[0][0]
-            p_last  = parts[-1]
-            if p_first == target_first and p_last == target_last:
+            if parts[0][0] == target_first and parts[-1] == target_last:
                 _player_cache[key_exact] = p
                 return p
-
-            # Handle compound last names: "GILGEOUS-ALEXANDER" → Kalshi may
-            # strip the hyphen and spaces: "GILGEOUSALEXANDER"
-            joined = "".join(parts[1:])
-            if parts[0][0] == target_first and joined == target_last:
-                _player_cache[key_exact] = p
-                return p
-
-    # ── 2. BDL fallback ────────────────────────────────────────────────────
-    bdl_player = _bdl_lookup_player(team_id, target_first, target_last,
-                                     target_jersey, team_code)
+    bdl_player = _bdl_lookup_player(team_id, target_first, target_last, target_jersey, team_code)
     if bdl_player:
         _player_cache[key_exact] = bdl_player
     return bdl_player
 
 
-def _bdl_lookup_player(
-    team_id: int,
-    first_initial: str,
-    last_name: str,
-    jersey: str,
-    team_code: str,
-) -> Optional[NBAPlayer]:
-    """BDL search fallback (requires API key)."""
+def _bdl_lookup_player(team_id: int, first_initial: str, last_name: str, jersey: str, team_code: str) -> Optional[NBAPlayer]:
     data = _bdl_get("players", {"search": last_name, "per_page": 25})
     if not data:
         return None
-
     players = data.get("data", [])
-    if not players:
-        return None
-
     target_jersey = str(jersey).lstrip("0") or "0"
     best: Optional[NBAPlayer] = None
     best_score = -1
-
     for p in players:
         p_first = _normalize(p.get("first_name", ""))
-        p_last  = _normalize(p.get("last_name", ""))
-        p_id    = p.get("id")
+        p_last = _normalize(p.get("last_name", ""))
+        p_id = p.get("id")
         p_jersey = str(p.get("jersey_number", "")).lstrip("0") or "0"
-        p_team   = p.get("team", {}).get("abbreviation", "")
-
+        p_team = p.get("team", {}).get("abbreviation", "")
         if not p_first or not p_id or not p_first.startswith(first_initial):
             continue
         if p_last != _normalize(last_name):
             continue
-
         score = 10
         if p_jersey == target_jersey:
             score += 5
         if team_code and p_team == team_code:
             score += 3
-
         if score > best_score:
             best_score = score
-            best = NBAPlayer(
-                player_id=int(p_id),
-                full_name=f"{p.get('first_name', '')} {p.get('last_name', '')}",
-                team_id=team_id,
-                jersey=p_jersey,
-                source="bdl",
-            )
-
+            best = NBAPlayer(player_id=int(p_id), full_name=f"{p.get('first_name', '')} {p.get('last_name', '')}", team_id=team_id, jersey=p_jersey, source="bdl")
     return best
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SEASON STATS  (ESPN primary → BDL fallback)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _espn_parse_stat_value(raw) -> float:
-    """Parse a stat value that might be a string, int, float, or '-'."""
-    if raw is None or raw == "-" or raw == "":
-        return 0.0
-    try:
-        return float(raw)
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _espn_extract_stats_dict(data: dict) -> dict[str, float]:
-    """
-    Extract stat name→value from ESPN's various response formats.
-    Returns a flat dict like {"GP": 65, "PTS": 25.8, "REB": 5.4, ...}.
-    """
-    result: dict[str, float] = {}
-
-    # ── Format A: "statistics" object with "splits.categories[].stats[]" ──
-    stats_obj = data.get("statistics", {})
-    if isinstance(stats_obj, dict):
-        splits = stats_obj.get("splits", {})
-        if isinstance(splits, dict):
-            for cat in splits.get("categories", []):
-                for s in cat.get("stats", []):
-                    name = s.get("name", "").upper()
-                    val  = s.get("value")
-                    if name and val is not None:
-                        result[name] = _espn_parse_stat_value(val)
-        if result:
-            return result
-
-    # ── Format B: "statistics" as a list with labels[] + stats[] ──────────
-    stats_list = data.get("statistics", [])
-    if isinstance(stats_list, list):
-        for block in stats_list:
-            if not isinstance(block, dict):
-                continue
-            labels = block.get("labels", block.get("names", []))
-            values = block.get("stats", block.get("values", block.get("averages", [])))
-            if labels and values and len(labels) == len(values):
-                for label, val in zip(labels, values):
-                    result[label.upper()] = _espn_parse_stat_value(val)
-        if result:
-            return result
-
-    # ── Format C: "categories" at top level ───────────────────────────────
-    for cat in data.get("categories", []):
-        labels = cat.get("labels", [])
-        values = cat.get("stats", cat.get("totals", []))
-        if labels and values:
-            for label, val in zip(labels, values):
-                result[label.upper()] = _espn_parse_stat_value(val)
-
-    # ── Format D: "athlete.statistics" embedded ───────────────────────────
-    athlete = data.get("athlete", {})
-    if isinstance(athlete, dict):
-        embedded = athlete.get("statistics", {})
-        if embedded:
-            return _espn_extract_stats_dict({"statistics": embedded})
-
-    if not result:
-        logger.debug("[nba_stats] ESPN stats parse: no recognized format. Keys: %s",
-                     list(data.keys())[:12])
-
-    return result
-
-
-def _espn_fetch_stats(player_id: int) -> Optional[PlayerStats]:
-    """Fetch season stats from ESPN."""
-    url = f"{_ESPN_BASE}/players/{player_id}/statistics"
+def _espn_fetch_overview(player_id: int) -> Optional[PlayerStats]:
+    """v9: Fetch stats from /overview endpoint."""
+    url = f"{_ESPN_STATS_BASE}/athletes/{player_id}/overview"
     data = _espn_get(url)
     if not data:
         return None
-
-    s = _espn_extract_stats_dict(data)
-    if not s:
-        logger.info("[nba_stats] ESPN no parseable stats for player %d", player_id)
+    stats_obj = data.get("statistics")
+    if not stats_obj:
+        logger.debug("[nba_stats] /overview: no 'statistics' for player %d", player_id)
         return None
-
+    labels = stats_obj.get("labels", [])
+    splits = stats_obj.get("splits", [])
+    if not labels or not splits:
+        logger.debug("[nba_stats] /overview: missing labels/splits for player %d", player_id)
+        return None
+    stat_values = splits[0].get("stats", [])
+    if not stat_values:
+        logger.debug("[nba_stats] /overview: no stats in splits[0] for player %d", player_id)
+        return None
+    s: dict[str, float] = {}
+    for i, label in enumerate(labels):
+        if i >= len(stat_values):
+            break
+        key = label.upper().replace("%", "PCT").replace(" ", "")
+        try:
+            s[key] = float(stat_values[i])
+        except (ValueError, TypeError):
+            s[key] = 0.0
     gp = int(s.get("GP", 0))
     if gp == 0:
+        logger.debug("[nba_stats] /overview: GP=0 for player %d", player_id)
         return None
-
-    three_pa = s.get("3PA", s.get("FG3A", 0.0))
-    three_pm = s.get("3PM", s.get("FG3M", 0.0))
-
-    return PlayerStats(
-        player_id=player_id,
-        games_played=gp,
-        minutes_pg=s.get("MIN", s.get("MINS", 0.0)),
-        points_pg=s.get("PTS", 0.0),
-        rebounds_pg=s.get("REB", 0.0),
-        assists_pg=s.get("AST", 0.0),
-        steals_pg=s.get("STL", 0.0),
-        blocks_pg=s.get("BLK", 0.0),
-        three_pm_pg=three_pm,
-        three_pa_pg=three_pa,
-        three_pct=three_pm / max(three_pa, 0.01),
-        fga_pg=s.get("FGA", 0.0),
-        fta_pg=s.get("FTA", 0.0),
-        turnovers_pg=s.get("TO", s.get("TOV", 0.0)),
-        usage_rate=0.0,
-    )
+    pts = s.get("PTS", 0.0)
+    reb = s.get("REB", 0.0)
+    ast = s.get("AST", 0.0)
+    stl = s.get("STL", 0.0)
+    blk = s.get("BLK", 0.0)
+    mins = s.get("MIN", 0.0)
+    to = s.get("TO", 0.0)
+    three_pct = s.get("3PCT", s.get("3PPCT", 0.0)) / 100.0
+    logger.info("[nba_stats] /overview player %d: %dG %.1fppg %.1frpg %.1fapg", player_id, gp, pts, reb, ast)
+    return PlayerStats(player_id=player_id, games_played=gp, minutes_pg=mins, points_pg=pts, rebounds_pg=reb, assists_pg=ast, steals_pg=stl, blocks_pg=blk, three_pm_pg=0.0, three_pa_pg=0.0, three_pct=three_pct, fga_pg=0.0, fta_pg=0.0, turnovers_pg=to, usage_rate=0.0)
 
 
 def _bdl_fetch_stats(player_id: int) -> Optional[PlayerStats]:
-    """BDL season averages fallback."""
     season = _get_current_season()
-    data = _bdl_get("season_averages", {
-        "season": season,
-        "player_ids": [player_id],
-    })
+    data = _bdl_get("season_averages", {"season": season, "player_ids": [player_id]})
     if not data:
         return None
-
     averages = data.get("data", [])
     if not averages:
         return None
-
     avg = averages[0]
     gp = int(avg.get("games_played", 0))
     if gp == 0:
         return None
-
     minutes = _parse_minutes(avg.get("min", "0"))
     three_pa = float(avg.get("fg3a", 0))
     three_pm = float(avg.get("fg3m", 0))
-
-    return PlayerStats(
-        player_id=player_id,
-        games_played=gp,
-        minutes_pg=minutes,
-        points_pg=float(avg.get("pts", 0)),
-        rebounds_pg=float(avg.get("reb", 0)),
-        assists_pg=float(avg.get("ast", 0)),
-        steals_pg=float(avg.get("stl", 0)),
-        blocks_pg=float(avg.get("blk", 0)),
-        three_pm_pg=three_pm,
-        three_pa_pg=three_pa,
-        three_pct=three_pm / max(three_pa, 0.01),
-        fga_pg=float(avg.get("fga", 0)),
-        fta_pg=float(avg.get("fta", 0)),
-        turnovers_pg=float(avg.get("turnover", 0)),
-        usage_rate=0.0,
-    )
+    return PlayerStats(player_id=player_id, games_played=gp, minutes_pg=minutes, points_pg=float(avg.get("pts", 0)), rebounds_pg=float(avg.get("reb", 0)), assists_pg=float(avg.get("ast", 0)), steals_pg=float(avg.get("stl", 0)), blocks_pg=float(avg.get("blk", 0)), three_pm_pg=three_pm, three_pa_pg=three_pa, three_pct=three_pm / max(three_pa, 0.01), fga_pg=float(avg.get("fga", 0)), fta_pg=float(avg.get("fta", 0)), turnovers_pg=float(avg.get("turnover", 0)), usage_rate=0.0)
 
 
-
-# ── ESPN→BDL ID bridge ────────────────────────────────────────────────────────
-# ESPN roster gives us player names; BDL needs its own IDs for stats.
-# This cache maps ESPN player_id → BDL player_id so we only search once.
 _espn_to_bdl: dict[int, Optional[int]] = {}
 
 
 def _bridge_espn_to_bdl(espn_player_id: int) -> Optional[int]:
-    """
-    Given an ESPN player ID, find the corresponding BDL player ID
-    by searching BDL with the player's name from the ESPN roster cache.
-    """
     if espn_player_id in _espn_to_bdl:
         return _espn_to_bdl[espn_player_id]
-
     if not _API_KEY:
         _espn_to_bdl[espn_player_id] = None
         return None
-
-    # Find the player's name from ESPN cache
     player_name = None
     for p in _player_cache.values():
         if p.player_id == espn_player_id:
             player_name = p.full_name
             break
-
     if not player_name:
         _espn_to_bdl[espn_player_id] = None
         return None
-
-    # Search BDL by last name
     name_parts = player_name.split()
     if len(name_parts) < 2:
         _espn_to_bdl[espn_player_id] = None
         return None
-
     last_name = name_parts[-1]
     first_initial = name_parts[0][0].upper()
-
     data = _bdl_get("players", {"search": last_name, "per_page": 25})
     if not data:
         _espn_to_bdl[espn_player_id] = None
         return None
-
     for p in data.get("data", []):
         p_first = _normalize(p.get("first_name", ""))
-        p_last  = _normalize(p.get("last_name", ""))
+        p_last = _normalize(p.get("last_name", ""))
         if p_first and p_first[0] == first_initial and p_last == _normalize(last_name):
             bdl_id = int(p.get("id", 0))
             if bdl_id:
                 _espn_to_bdl[espn_player_id] = bdl_id
-                logger.debug("[nba_stats] Bridge: %s → ESPN %d → BDL %d",
-                             player_name, espn_player_id, bdl_id)
                 return bdl_id
-
-    logger.debug("[nba_stats] Bridge failed: %s (ESPN %d) not found in BDL",
-                 player_name, espn_player_id)
     _espn_to_bdl[espn_player_id] = None
     return None
 
 
 def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
-    """Fetch season averages. Bridges ESPN→BDL when needed."""
     _check_stats_cache()
     if player_id in _stats_cache:
         return _stats_cache[player_id]
-
-    # Determine source from the player object if available
     source = "espn"
     for p in _player_cache.values():
         if p.player_id == player_id:
             source = p.source
             break
-
     stats: Optional[PlayerStats] = None
-
     if source == "espn":
-        # ESPN stats endpoint doesn't work (404) — bridge to BDL
-        bdl_id = _bridge_espn_to_bdl(player_id)
-        if bdl_id:
-            stats = _bdl_fetch_stats(bdl_id)
+        stats = _espn_fetch_overview(player_id)
+        if stats is None and _API_KEY:
+            bdl_id = _bridge_espn_to_bdl(player_id)
+            if bdl_id:
+                stats = _bdl_fetch_stats(bdl_id)
     else:
-        # BDL player — use BDL stats directly
         stats = _bdl_fetch_stats(player_id)
-
     if stats:
-        logger.debug("[nba_stats] %d: %dG %.1fppg %.1frpg %.1fapg (via %s→bdl)",
-                     player_id, stats.games_played, stats.points_pg,
-                     stats.rebounds_pg, stats.assists_pg, source)
         _stats_cache[player_id] = stats
-
     return stats
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ROLLING STATS / GAMELOG  (ESPN primary → BDL fallback)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _espn_fetch_gamelog(player_id: int, n_games: int = 10) -> Optional[RollingStats]:
-    """Fetch recent game log from ESPN."""
-    url = f"{_ESPN_BASE}/players/{player_id}/gamelog"
+    url = f"{_ESPN_STATS_BASE}/athletes/{player_id}/gamelog"
     data = _espn_get(url)
     if not data:
         return None
-
     games: list[dict[str, float]] = []
-
-    # ESPN gamelog format: seasonTypes[].categories[].events[]
-    # Each event has stats[] aligned with labels[]
     for st in data.get("seasonTypes", []):
         for cat in st.get("categories", []):
-            labels = [l.upper() for l in cat.get("labels", [])]
+            labels = cat.get("labels", [])
             if not labels:
                 continue
+            label_map = [l.upper().replace("%", "PCT") for l in labels]
             for event in cat.get("events", []):
                 raw_stats = event.get("stats", [])
                 game: dict[str, float] = {}
-                for i, label in enumerate(labels):
+                for i, label in enumerate(label_map):
                     if i >= len(raw_stats):
                         break
                     val = raw_stats[i]
                     if isinstance(val, str) and "-" in val and not val.startswith("-"):
-                        # "10-18" → made/attempted (FG, 3PT, FT)
                         try:
-                            parts = val.split("-")
-                            game[label] = float(parts[0])           # made
-                            game[f"{label}_ATT"] = float(parts[1])  # attempted
+                            game[label] = float(val.split("-")[0])
                         except (ValueError, IndexError):
                             pass
                     else:
                         try:
-                            game[label] = float(val)
+                            game[label] = float(val) if val else 0.0
                         except (ValueError, TypeError):
                             pass
                 if game:
                     games.append(game)
-
     if not games:
-        logger.debug("[nba_stats] ESPN gamelog empty for player %d. Keys: %s",
-                     player_id, list(data.keys())[:8])
         return None
-
-    # Take most recent n_games (ESPN returns most recent first)
     recent = games[:n_games]
     n = len(recent)
-
-    pts  = [g.get("PTS", 0.0) for g in recent]
-    reb  = [g.get("REB", 0.0) for g in recent]
-    ast  = [g.get("AST", 0.0) for g in recent]
-    tpm  = [g.get("3PT", g.get("FG3M", g.get("3PM", 0.0))) for g in recent]
-    stl  = [g.get("STL", 0.0) for g in recent]
-    blk  = [g.get("BLK", 0.0) for g in recent]
+    pts = [g.get("PTS", 0.0) for g in recent]
+    reb = [g.get("REB", 0.0) for g in recent]
+    ast = [g.get("AST", 0.0) for g in recent]
+    tpm = [g.get("3PT", g.get("3PM", g.get("FG3", 0.0))) for g in recent]
+    stl = [g.get("STL", 0.0) for g in recent]
+    blk = [g.get("BLK", 0.0) for g in recent]
     mins = [g.get("MIN", 0.0) for g in recent]
-
-    return RollingStats(
-        n_games=n,
-        points_pg=sum(pts) / n,
-        rebounds_pg=sum(reb) / n,
-        assists_pg=sum(ast) / n,
-        three_pm_pg=sum(tpm) / n,
-        steals_pg=sum(stl) / n,
-        blocks_pg=sum(blk) / n,
-        minutes_pg=sum(mins) / n,
-    )
+    return RollingStats(n_games=n, points_pg=sum(pts)/n, rebounds_pg=sum(reb)/n, assists_pg=sum(ast)/n, three_pm_pg=sum(tpm)/n, steals_pg=sum(stl)/n, blocks_pg=sum(blk)/n, minutes_pg=sum(mins)/n)
 
 
 def _bdl_fetch_rolling(player_id: int, n_games: int = 10) -> Optional[RollingStats]:
-    """BDL game log fallback."""
     season = _get_current_season()
-    data = _bdl_get("stats", {
-        "player_ids": [player_id],
-        "seasons": [season],
-        "per_page": n_games,
-        "sort": "-game.date",
-    })
+    data = _bdl_get("stats", {"player_ids": [player_id], "seasons": [season], "per_page": n_games, "sort": "-game.date"})
     if not data:
         return None
-
     games = data.get("data", [])
     if not games:
         return None
-
     pts, reb, ast, tpm, stl, blk, mins = [], [], [], [], [], [], []
     for g in games[:n_games]:
         pts.append(float(g.get("pts", 0)))
@@ -758,47 +497,30 @@ def _bdl_fetch_rolling(player_id: int, n_games: int = 10) -> Optional[RollingSta
         stl.append(float(g.get("stl", 0)))
         blk.append(float(g.get("blk", 0)))
         mins.append(_parse_minutes(g.get("min", "0")))
-
     n = len(pts)
     if n == 0:
         return None
-
-    return RollingStats(
-        n_games=n,
-        points_pg=sum(pts) / n,
-        rebounds_pg=sum(reb) / n,
-        assists_pg=sum(ast) / n,
-        three_pm_pg=sum(tpm) / n,
-        steals_pg=sum(stl) / n,
-        blocks_pg=sum(blk) / n,
-        minutes_pg=sum(mins) / n,
-    )
+    return RollingStats(n_games=n, points_pg=sum(pts)/n, rebounds_pg=sum(reb)/n, assists_pg=sum(ast)/n, three_pm_pg=sum(tpm)/n, steals_pg=sum(stl)/n, blocks_pg=sum(blk)/n, minutes_pg=sum(mins)/n)
 
 
 def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingStats]:
-    """Fetch last N games rolling stats. Bridges ESPN→BDL when needed."""
     _check_stats_cache()
-    cache_key = player_id
-    if cache_key in _rolling_cache:
-        return _rolling_cache[cache_key]
-
+    if player_id in _rolling_cache:
+        return _rolling_cache[player_id]
     source = "espn"
     for p in _player_cache.values():
         if p.player_id == player_id:
             source = p.source
             break
-
     rolling: Optional[RollingStats] = None
-
     if source == "espn":
-        # Bridge to BDL for rolling stats (ESPN gamelog may also 404)
-        bdl_id = _bridge_espn_to_bdl(player_id)
-        if bdl_id:
-            rolling = _bdl_fetch_rolling(bdl_id, n_games)
+        rolling = _espn_fetch_gamelog(player_id, n_games)
+        if rolling is None and _API_KEY:
+            bdl_id = _bridge_espn_to_bdl(player_id)
+            if bdl_id:
+                rolling = _bdl_fetch_rolling(bdl_id, n_games)
     else:
         rolling = _bdl_fetch_rolling(player_id, n_games)
-
     if rolling:
-        _rolling_cache[cache_key] = rolling
-
+        _rolling_cache[player_id] = rolling
     return rolling
