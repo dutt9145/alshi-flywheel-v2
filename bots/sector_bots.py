@@ -291,11 +291,26 @@ def _has_sports_prefix(market: dict) -> bool:
         # NextAG
         "kxnextag",
 
+        # v11.8d: New leagues found in 2026-04-12 logs
+        # DEL (Deutsche Eishockey Liga — German hockey)
+        "kxdel",
+        # KHL (Kontinental Hockey League — Russian hockey)
+        "kxkhl",
+        # J.B.League (Japanese basketball)
+        "kxjbleague",
+        # KBL (Korean basketball)
+        "kxkbl",
+        # K League (Korean soccer)
+        "kxkleague",
+
         # ── Entertainment / unmodelable (block from all sector bots) ──────
         # v11.3: Survivor TV show (429 signals) matched WeatherBot via city
         # keywords in episode titles. No bot can model this, so blocking it
         # here causes it to be skipped entirely (correct behavior).
         "kxsurv",      # Survivor TV show mentions
+        # v11.8d: Spotify artist streaming — should route to GlobalEventsBot
+        # but was leaking to weather (NOAA priors on Beatles) and crypto
+        "kxartiststream",
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -360,6 +375,7 @@ def _is_entertainment_market(market: dict) -> bool:
         "kxbillboard",   # Billboard chart
         "kxthevoice",    # The Voice TV show
         "kxfestival",    # Festival events (KXFESTIVALEVENTPACHNYC etc.)
+        "kxartiststream",  # v11.8d: Spotify artist streaming (KXARTISTSTREAMSU, KXARTISTSTREAMS)
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -779,6 +795,13 @@ class WeatherBot(BaseBot):
         "kxlcpi",          # CPI (economics)
         "kxcpi",           # CPI (economics)
         "kxwti",           # WTI crude oil (economics)
+        # v11.8d: new leagues found 2026-04-12
+        "kxdel",           # DEL German hockey
+        "kxkhl",           # KHL Russian hockey
+        "kxjbleague",      # J.B.League Japanese basketball
+        "kxkbl",           # KBL Korean basketball
+        "kxkleague",       # K League Korean soccer
+        "kxartiststream",  # Spotify streaming (entertainment)
     )
 
     KEYWORDS = [
@@ -1390,6 +1413,12 @@ class SportsBot(BaseBot):
         "kxallsvenskan",   # Allsvenskan (Swedish soccer)
         "kxargpremdiv",    # Argentine Premier Division
         "kxnextag",        # NextAG
+        # v11.8d: new leagues 2026-04-12
+        "kxdel",           # DEL (Deutsche Eishockey Liga)
+        "kxkhl",           # KHL (Kontinental Hockey League)
+        "kxjbleague",      # J.B.League (Japanese basketball)
+        "kxkbl",           # KBL (Korean basketball)
+        "kxkleague",       # K League (Korean soccer)
     ]
 
     LEAGUE_MAP = {
@@ -1444,6 +1473,12 @@ class SportsBot(BaseBot):
         "kxahlg": "AHL",
         # Track
         "kxdima": "DIAMOND",
+        # v11.8d: new leagues 2026-04-12
+        "kxdel":  "DEL",
+        "kxkhl":  "KHL",
+        "kxjbleague": "JBLEAGUE",
+        "kxkbl":  "KBL",
+        "kxkleague": "KLEAGUE",
     }
 
     @property

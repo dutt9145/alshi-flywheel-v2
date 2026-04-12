@@ -75,6 +75,7 @@ logger = logging.getLogger("orchestrator")
 # SHARP VETO lines (logged in orchestrator at INFO) survive.
 logging.getLogger("shared.sharp_detector").setLevel(logging.WARNING)
 logging.getLogger("shared.mlb_stats_fetcher").setLevel(logging.WARNING)
+logging.getLogger("shared.nba_stats_fetcher").setLevel(logging.WARNING)
 
 # ── Duplicate trade cooldown ───────────────────────────────────────────────────
 RECENT_TRADE_WINDOW_SEC = 300  # 5 minutes
@@ -139,6 +140,10 @@ _SPORTS_PREFIXES = (
     "kxitf",
     # Ekstraklasa / Uruguayan
     "kxekstraklasa", "kxurypd",
+    # v11.8d: new leagues 2026-04-12
+    "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
+    # Entertainment (block from sports path, route to GlobalEventsBot)
+    "kxartiststream",
 )
 
 
@@ -194,6 +199,7 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxow", "kxvalorant", "kxlol", "kxleague",
       "kxrl", "kxrocketleague", "kxapex", "kxfort", "kxr6g",
       "kxitf", "kxkf", "kxnextag", "kxsurv",
+      "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
       ), "sports"),
     (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi",
       "kxxrp", "kxdoge", "kxbnb", "kxavax", "kxlink",
