@@ -94,6 +94,10 @@ from shared.mlb_stats_fetcher import (
     fetch_opposing_pitcher,
 )
 from shared.mlb_hit_model import predict_mlb_prop
+from shared.mlb_logistic_model import (
+    extract_features as mlb_extract_features,
+    log_features as mlb_log_features,
+)
 from shared.consensus_engine import BotSignal
 from config.settings import MIN_EDGE_PCT
 
@@ -1534,6 +1538,9 @@ class SportsBot(BaseBot):
         home_team_info = MLB_TEAMS.get(parsed.home_team_code)
         parsed.home_team_id = home_team_info[0] if home_team_info else None
 
+        # v12: Init variables for both branches (needed for feature logging)
+        season = rolling = pitcher = opp_pitcher_stats = None
+
         if parsed.prop_code == "KS":
             pitcher = fetch_pitcher_stats(player.player_id)
             if not pitcher or pitcher.innings <= 0:
@@ -1546,7 +1553,6 @@ class SportsBot(BaseBot):
             rolling = fetch_batter_rolling(player.player_id, n_games=10)
 
             # v11.7: Wire opposing pitcher context into batter predictions
-            opp_pitcher_stats = None
             try:
                 # Determine opponent team
                 opp_code = (parsed.away_team_code
@@ -1578,9 +1584,22 @@ class SportsBot(BaseBot):
         edge        = abs(our_prob - market_prob)
         direction   = "YES" if our_prob > market_prob else "NO"
 
+        # v12: Log features for logistic regression training data
+        try:
+            from shared.mlb_stats_fetcher import PARK_FACTORS
+            _park = PARK_FACTORS.get(parsed.home_team_id, 1.0) if parsed.home_team_id else 1.0
+            _fv = mlb_extract_features(
+                parsed, season, rolling,
+                opp_pitcher=(pitcher if parsed.prop_code == "KS" else opp_pitcher_stats),
+                park_factor=_park,
+                market_prob=market_prob,
+            )
+            if _fv:
+                mlb_log_features(ticker, player.full_name, _fv, our_prob)
+        except Exception:
+            pass  # never block trading on logging failure
+
         # v11.8d: Changed from INFO to DEBUG to reduce Railway log volume.
-        # Per-market predictions were generating 300-400+ lines/scan, hitting
-        # Railway's 500 logs/sec rate limit and dropping messages.
         logger.debug(
             "[sports/mlb] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
             ticker, player.full_name, our_prob, market_prob,
