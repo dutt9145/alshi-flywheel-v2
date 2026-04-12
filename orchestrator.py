@@ -1,5 +1,10 @@
 """
-orchestrator.py  (v19.18 — is_relevant gate + prefix sync)
+orchestrator.py  (v19.19 — NBA outcome recording for logreg training)
+
+Changes vs v19.18:
+  1. _ingest_resolved_markets: Added NBA player prop outcome recording.
+     Calls record_nba_outcome() for KXNBAPTS/REB/AST/3PT/STL/BLK tickers
+     so resolved NBA props feed the logreg training pipeline (mirrors MLB).
 
 Changes vs v19.17:
   1. _evaluate_market: Added `if not bot.is_relevant(market): continue` gate
@@ -422,6 +427,16 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
         logger.warning("_update_signal_brier failed for %s: %s", ticker, e)
 
 
+# ── v19.19: NBA prop codes for outcome recording ───────────────────────────────
+_NBA_PROP_CODES = ("PTS", "REB", "AST", "3PT", "STL", "BLK")
+
+
+def _is_nba_player_prop(ticker: str) -> bool:
+    """Return True if ticker is an NBA player prop market."""
+    tk_upper = ticker.upper()
+    return any(tk_upper.startswith(f"KXNBA{code}") for code in _NBA_PROP_CODES)
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 class FlywheelOrchestrator:
@@ -617,7 +632,7 @@ class FlywheelOrchestrator:
 
             _update_signal_brier(ticker, resolved_yes)
 
-            # v19.17: Brier tracker per-prop recording
+            # v19.17: Brier tracker per-prop recording (MLB)
             if sig_rows:
                 _prop_code = None
                 for _code in ("HIT", "TB", "HRR", "HR", "KS"):
@@ -629,6 +644,15 @@ class FlywheelOrchestrator:
                         _prop_code, float(sig_rows[0]["our_prob"]),
                         1 if resolved_yes else 0,
                     )
+
+            # v19.19: NBA player prop outcome recording for logreg training
+            if _is_nba_player_prop(ticker):
+                try:
+                    from shared.nba_logistic_model import record_outcome as record_nba_outcome
+                    record_nba_outcome(ticker, 1 if resolved_yes else 0)
+                    logger.debug("[NBA LOGREG] Recorded outcome: %s → %s", ticker, result.upper())
+                except Exception as e:
+                    logger.warning("[NBA LOGREG] record_outcome failed for %s: %s", ticker, e)
 
             if not sig_rows:
                 processed_this_run.add(ticker)
@@ -1362,7 +1386,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.18 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.19 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()

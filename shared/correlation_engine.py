@@ -1,5 +1,17 @@
 """
-shared/correlation_engine.py  (v2 — skip unmodelable markets, crash protection)
+shared/correlation_engine.py  (v2.2 — artiststream skip + extreme price threshold)
+
+Changes vs v2.1:
+  1. Added "artiststream" to _CORR_SKIP_SUBSTRINGS — prevents spurious
+     correlation trades on Spotify artist streaming markets which have
+     no meaningful price relationship.
+  2. Raised _EXTREME_PRICE_CENTS from 2 to 5 — markets at ≤5¢ or ≥95¢
+     are too close to resolution for correlation trades. The 2¢ cutoff
+     was causing Kelly sizing edge cases on 3-4¢ markets.
+
+Changes vs v2:
+  1. Price extremes that crash Kelly sizing — markets priced ≤2¢ or ≥98¢
+     are filtered out before correlation analysis.
 
 Changes vs v1:
   1. scan() now skips MENTION, Survivor, and other unmodelable markets
@@ -30,20 +42,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── v2: Markets the correlation engine should never touch ──────────────────────
+# ── v2.2: Markets the correlation engine should never touch ────────────────────
 # These markets are unmodelable and cause crashes when passed to kelly_sizer.
 # Check is done via substring match on ticker/event_ticker (case-insensitive).
 _CORR_SKIP_SUBSTRINGS = (
-    "mention",      # KXFOXNEWSMENTION, KXMLBMENTION, KXNBAMENTION, etc.
-    "survivor",     # KXSURVIVORMENTION
-    "roty",         # Rookie of the Year futures
-    "seasonhr",     # Season-long HR totals
+    "mention",       # KXFOXNEWSMENTION, KXMLBMENTION, KXNBAMENTION, etc.
+    "survivor",      # KXSURVIVORMENTION
+    "roty",          # Rookie of the Year futures
+    "seasonhr",      # Season-long HR totals
+    "artiststream",  # v2.2: Spotify artist streaming — no meaningful correlation
 )
 
-# ── v2.1: Price extremes that crash Kelly sizing ───────────────────────────────
+# ── v2.2: Price extremes that crash Kelly sizing ───────────────────────────────
 # Markets priced ≤ this or ≥ (100 - this) are fully decided — no edge exists
 # and Kelly divides by ~0 causing float division by zero.
-_EXTREME_PRICE_CENTS = 2
+# v2.2: Raised from 2 to 5 — 3-4¢ markets were causing edge cases.
+_EXTREME_PRICE_CENTS = 5
 
 
 @dataclass
@@ -185,6 +199,8 @@ class CorrelationEngine:
 
         v2.1: Skips extreme-priced markets (≤2¢ or ≥98¢) that cause
         float division by zero in Kelly sizing.
+
+        v2.2: Skips artiststream markets, raised extreme threshold to 5¢.
         """
         # Group markets by event, skipping unmodelable ones
         groups: dict[str, list[dict]] = {}
@@ -199,7 +215,7 @@ class CorrelationEngine:
             if price == 0:
                 continue
 
-            # v2.1: skip extreme-priced markets — fully decided, no edge,
+            # v2.1/v2.2: skip extreme-priced markets — fully decided, no edge,
             # and Kelly divides by ~0 causing float division by zero
             if price <= _EXTREME_PRICE_CENTS or price >= (100 - _EXTREME_PRICE_CENTS):
                 continue
