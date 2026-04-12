@@ -540,7 +540,7 @@ class FlywheelOrchestrator:
             if min_ts:
                 logger.info("Incremental ingestion — fetching markets after %s", min_ts)
             resolved_markets = self.client.get_resolved_markets(
-                min_close_ts = min_ts,
+                min_settled_ts = min_ts,
                 max_pages    = 10 if min_ts else 350,
             )
         except Exception as e:

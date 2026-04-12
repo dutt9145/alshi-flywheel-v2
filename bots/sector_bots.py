@@ -216,7 +216,8 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxsaud",      # Saudi Pro League
         "kxjlea",      # J-League (Japan)
         "kxuclt",      # UEFA Champions League
-        "kxfifa",      # FIFA
+        "kxfifa",      # FIFA (World Cup)  
+        "kxdensuperliga",  # Danish Superliga         
 
         # ── Cricket ───────────────────────────────────────────────────────
         # v11.3: kxcba was missing → cricket bled into weather AND crypto.
@@ -291,6 +292,8 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxucl",
         # Turkish Super Lig
         "kxsuperlig",
+        # Danish Superliga soccer
+        "kxdensuperliga",
         # Egyptian Premier League
         "kxegypl",
         # ITF tennis (women + men)

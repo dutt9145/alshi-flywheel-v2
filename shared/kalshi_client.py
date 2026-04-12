@@ -1,15 +1,20 @@
 """
-shared/kalshi_client.py  (v11 — server-side MVE exclusion)
+shared/kalshi_client.py  (v12 — fix resolution ingestion)
+
+Changes vs v11:
+  1. get_resolved_markets(): Changed from min_close_ts to min_settled_ts.
+     The old filter missed markets that closed before the cutoff but settled
+     after. This was causing weather markets (and potentially others) to never
+     resolve — they close at end of day but settle the next morning.
+  2. Added debug logging for weather tickers in settled batch.
+  3. get_latest_outcome_ts() renamed return semantics to match min_settled_ts.
+  4. Added get_market() method to fetch a single market by ticker.
 
 Changes vs v10:
   1. get_markets() now passes multivariate=exclude to the Kalshi API,
-     filtering out all MVE parlay/combo markets server-side. This is the
-     proper fix — Kalshi added this filter parameter specifically for this.
-     Previously the API returned 8,000+ MVE parlays that buried all
-     single-game markets, making the bot unable to find anything to trade.
+     filtering out all MVE parlay/combo markets server-side.
   2. get_all_open_markets() reverted to simple 40-page pagination since
-     MVE filtering now happens server-side. No client-side filtering needed.
-  3. All methods present and accounted for.
+     MVE filtering now happens server-side.
 """
 
 import base64
@@ -39,7 +44,6 @@ _MAX_RETRIES = 3
 _INGESTION_LOOKBACK = timedelta(hours=2)
 
 # The path prefix expected by the trading API in signatures.
-# trading-api.kalshi.com requires the full path in the signature string.
 _API_PATH_PREFIX = "/trade-api/v2"
 
 
@@ -182,9 +186,7 @@ class KalshiClient:
         Fetch markets from Kalshi API.
 
         FIX v11: Added multivariate=exclude filter to skip MVE parlay/combo
-        markets server-side. Kalshi returns 8,000+ MVE parlays by default
-        that bury single-game markets. This filter ensures only single-leg
-        binary markets are returned.
+        markets server-side.
         """
         params = {"status": status, "limit": limit}
         if exclude_mve:
@@ -193,11 +195,23 @@ class KalshiClient:
             params["cursor"] = cursor
         return self._get("/markets", params=params)
 
+    def get_market(self, ticker: str) -> dict:
+        """
+        Fetch a single market by ticker.
+
+        v12: Added for debugging resolution issues.
+        """
+        try:
+            resp = self._get(f"/markets/{ticker}")
+            return resp.get("market", {})
+        except Exception as e:
+            logger.error("get_market(%s) failed: %s", ticker, e)
+            return {}
+
     def get_all_open_markets(self, page_sleep_sec: float = 0.25) -> list:
         """
         Fetch all open single-game markets with pagination.
-        MVE parlays are excluded server-side via the multivariate=exclude
-        filter in get_markets().
+        MVE parlays are excluded server-side via mve_filter=exclude.
         """
         markets, cursor, page = [], None, 0
         max_pages = 40
@@ -225,8 +239,8 @@ class KalshiClient:
 
     def get_resolved_markets(
         self,
-        max_pages:    int = 350,
-        min_close_ts: Optional[datetime] = None,
+        max_pages:      int = 350,
+        min_settled_ts: Optional[datetime] = None,
     ) -> list:
         """
         Fetch settled markets from Kalshi.
@@ -236,16 +250,24 @@ class KalshiClient:
         max_pages : int
             Maximum pages to fetch (100 markets each).
             Default 350 = up to 35,000 markets (for full first-run history).
-        min_close_ts : datetime, optional
+        min_settled_ts : datetime, optional
             UTC-aware datetime cutoff. Pass the result of get_latest_outcome_ts()
             for incremental ingestion.
+
+        v12 FIX: Changed from min_close_ts to min_settled_ts.
+        The old filter missed markets that closed before the cutoff but settled
+        after — e.g., weather markets that close at midnight but settle at 6am.
         """
         markets, cursor, page = [], None, 0
 
+        # Weather ticker prefixes for debug logging
+        _WEATHER_PREFIXES = ("KXTEMP", "KXLOWT", "KXHIGH", "KXWTHR", "KXRAIN", "KXSNOW")
+
         while page < max_pages:
             params = {"status": "settled", "limit": 100}
-            if min_close_ts:
-                params["min_close_ts"] = int(min_close_ts.timestamp())
+            if min_settled_ts:
+                # v12: Use min_settled_ts instead of min_close_ts
+                params["min_settled_ts"] = int(min_settled_ts.timestamp())
             if cursor:
                 params["cursor"] = cursor
 
@@ -265,37 +287,40 @@ class KalshiClient:
             markets.extend(clean)
             page += 1
 
+            # v12: Debug log weather tickers
+            weather_in_batch = [
+                m.get("ticker", "") for m in clean
+                if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
+            ]
+            if weather_in_batch:
+                logger.info(
+                    "Resolved markets — page %d: %d weather tickers found: %s",
+                    page, len(weather_in_batch), weather_in_batch[:5],
+                )
+
             logger.info(
                 "Resolved markets — page %d: %d settled, %d with clean result (%d total)",
                 page, len(batch), len(clean), len(markets),
             )
 
-            if min_close_ts and batch:
-                for check_market in [batch[0], batch[-1]]:
-                    close_str = check_market.get("close_time", "")
-                    close_dt  = _parse_kalshi_ts(close_str)
-                    if close_dt and close_dt < min_close_ts:
-                        logger.info(
-                            "Client-side cutoff reached at page %d — "
-                            "stopping incremental ingestion",
-                            page,
-                        )
-                        break
-                else:
-                    cursor = resp.get("cursor")
-                    if not cursor or len(batch) < 100:
-                        break
-                    time.sleep(1.0)
-                    continue
-                break
-
+            # v12: Simplified pagination — just follow cursor until exhausted
+            # The min_settled_ts filter handles the cutoff server-side
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
                 break
 
             time.sleep(1.0)
 
-        logger.info("get_resolved_markets complete — %d total clean results", len(markets))
+        # v12: Summary debug for weather
+        all_weather = [
+            m.get("ticker", "") for m in markets
+            if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
+        ]
+        logger.info(
+            "get_resolved_markets complete — %d total clean results, %d weather tickers: %s",
+            len(markets), len(all_weather), all_weather[:10],
+        )
+
         return markets
 
     def get_latest_outcome_ts(self) -> Optional[datetime]:
@@ -303,6 +328,8 @@ class KalshiClient:
         Query outcomes table for most recent logged_at timestamp.
         Returns a UTC-aware datetime with a 2-hour lookback buffer,
         or None if no outcomes exist yet (triggers full history fetch).
+
+        v12: Renamed semantically to match min_settled_ts usage.
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
