@@ -1,5 +1,9 @@
 """
-bots/sector_bots.py  (v11.8 — T20/entertainment leak fixes + prefix sync)
+bots/sector_bots.py  (v12 — NBA feature logging + MLB feature logging)
+
+Changes vs v11.8:
+  - Added NBA feature logging in _try_nba_player_prop() (mirrors MLB)
+  - Both MLB and NBA now log features for Phase 2 logreg training
 
 Changes vs v11.5:
   Bug fixes:
@@ -113,6 +117,12 @@ from shared.nba_stats_fetcher import (
     fetch_player_rolling as nba_fetch_player_rolling,
 )
 from shared.nba_props_model import predict_nba_prop
+
+# ── v12: NBA feature logging for logreg training ────────────────────────────
+from shared.nba_logistic_model import (
+    extract_features as nba_extract_features,
+    log_features as nba_log_features,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1640,7 +1650,7 @@ class SportsBot(BaseBot):
         return None
 
     # ─────────────────────────────────────────────────────────────────────
-    # v11.6: NBA PLAYER PROP ROUTING
+    # v11.6 + v12: NBA PLAYER PROP ROUTING + FEATURE LOGGING
     # ─────────────────────────────────────────────────────────────────────
 
     def _try_nba_player_prop(self, market: dict):
@@ -1650,6 +1660,8 @@ class SportsBot(BaseBot):
           handled=False → couldn't process, fall through to base class
           handled=True, signal=None → processed but edge too small, skip
           handled=True, signal=BotSignal → processed, emit signal
+
+        v12: Now logs features for logreg training (mirrors MLB pipeline).
         """
         ticker = market.get("ticker", "")
         if not ticker.upper().startswith("KXNBA"):
@@ -1661,12 +1673,12 @@ class SportsBot(BaseBot):
 
         parsed = parse_nba_ticker(ticker)
         if parsed is None:
-            logger.info("[sports/nba] PARSE FAIL: %s", ticker)
+            logger.debug("[sports/nba] PARSE FAIL: %s", ticker)
             return False, None
 
         team_info = NBA_TEAMS_MAP.get(parsed.player_team_code)
         if not team_info:
-            logger.info("[sports/nba] unknown team: %s in %s", parsed.player_team_code, ticker)
+            logger.debug("[sports/nba] unknown team: %s in %s", parsed.player_team_code, ticker)
             return False, None
         team_id = team_info[0]
 
@@ -1690,7 +1702,7 @@ class SportsBot(BaseBot):
 
         prediction = predict_nba_prop(parsed, season, rolling)
         if not prediction:
-            logger.info("[sports/nba] MODEL FAIL for %s %s ≥%d",
+            logger.debug("[sports/nba] MODEL FAIL for %s %s ≥%d",
                          player.full_name, parsed.prop_code, parsed.threshold)
             return False, None
 
@@ -1701,7 +1713,20 @@ class SportsBot(BaseBot):
         edge        = abs(our_prob - market_prob)
         direction   = "YES" if our_prob > market_prob else "NO"
 
-        logger.info(
+        # v12: Log features for logistic regression training data
+        try:
+            nba_features = nba_extract_features(
+                parsed=parsed,
+                season_stats=season,
+                rolling_stats=rolling,
+                poisson_prob=our_prob,
+                market_prob=market_prob,
+            )
+            nba_log_features(nba_features)
+        except Exception as e:
+            logger.debug("[sports/nba] feature logging failed: %s", e)
+
+        logger.debug(
             "[sports/nba] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
             ticker, player.full_name, our_prob, market_prob,
             our_prob - market_prob, direction, prediction.confidence,
