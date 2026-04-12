@@ -1,5 +1,10 @@
 """
-shared/nba_stats_fetcher.py  (v9 — use /overview endpoint)
+shared/nba_stats_fetcher.py  (v9.1 — Jr/Sr suffix handling)
+
+v9.1 changes
+------------
+- Strip Jr/Sr/II/III/IV/V suffixes from player names during roster loading and lookup
+- Fixes Wendell Carter Jr. and similar players not being found
 
 v9 changes
 ----------
@@ -39,6 +44,9 @@ _API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "")
 # v9: Use /overview for stats
 _ESPN_ROSTER_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 _ESPN_STATS_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba"
+
+# v9.1: Name suffixes to strip
+_NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV", "V"})
 
 if _API_KEY:
     logger.info("[nba_stats] BDL API key loaded (%d chars) — available as fallback", len(_API_KEY))
@@ -106,6 +114,31 @@ _stats_cache:    dict[int, PlayerStats] = {}
 _rolling_cache:  dict[int, RollingStats] = {}
 _stats_ts:       float = 0.0
 _STATS_TTL       = 3600
+
+
+# ── Helper functions ───────────────────────────────────────────────────────────
+
+def _strip_name_suffix(name_parts: list[str]) -> list[str]:
+    """
+    Remove Jr/Sr/II/III/IV/V suffixes from name parts.
+    Handles both separate tokens ("CARTER", "JR") and joined ("CARTERJR").
+    """
+    if not name_parts or len(name_parts) < 2:
+        return name_parts
+    
+    # Case 1: Suffix is separate token — ["WENDELL", "CARTER", "JR"]
+    if name_parts[-1] in _NAME_SUFFIXES:
+        return name_parts[:-1]
+    
+    # Case 2: Suffix joined to last name — ["WENDELL", "CARTERJR"]
+    last = name_parts[-1]
+    for suf in ("III", "JR", "SR", "II", "IV", "V"):  # III before II to match longest first
+        if last.endswith(suf) and len(last) > len(suf) + 1:
+            name_parts = name_parts.copy()
+            name_parts[-1] = last[:-len(suf)]
+            return name_parts
+    
+    return name_parts
 
 
 def _check_roster_cache():
@@ -197,6 +230,8 @@ def _parse_minutes(min_str) -> float:
         return 0.0
 
 
+# ── Roster loading ─────────────────────────────────────────────────────────────
+
 def _espn_load_team_roster(team_code: str) -> list[NBAPlayer]:
     espn_id = _ESPN_TEAM_IDS.get(team_code)
     if not espn_id:
@@ -240,6 +275,8 @@ def _espn_ensure_team_loaded(team_code: str):
         name_parts = norm_name.split()
         if len(name_parts) < 2:
             continue
+        # v9.1: Strip Jr/Sr/III suffixes before building cache keys
+        name_parts = _strip_name_suffix(name_parts)
         first_initial = name_parts[0][0]
         last_name = name_parts[-1]
         _player_cache[f"{first_initial}-{last_name}-{p.jersey}"] = p
@@ -249,10 +286,19 @@ def _espn_ensure_team_loaded(team_code: str):
     logger.info("[nba_stats] ESPN roster loaded: %s (%d players)", team_code, len(players))
 
 
+# ── Player lookup ──────────────────────────────────────────────────────────────
+
 def lookup_player(team_id: int, first_initial: str, last_name: str, jersey: str, team_code: str = "") -> Optional[NBAPlayer]:
     target_first = first_initial.upper()
     target_last = _normalize(last_name)
     target_jersey = str(jersey).lstrip("0") or "0"
+    
+    # v9.1: Strip Jr/Sr/III suffixes from lookup target
+    for suf in ("III", "JR", "SR", "II", "IV", "V"):
+        if target_last.endswith(suf) and len(target_last) > len(suf):
+            target_last = target_last[:-len(suf)]
+            break
+    
     if team_code:
         _espn_ensure_team_loaded(team_code)
     key_exact = f"{target_first}-{target_last}-{target_jersey}"
@@ -273,6 +319,8 @@ def lookup_player(team_id: int, first_initial: str, last_name: str, jersey: str,
             parts = norm.split()
             if len(parts) < 2:
                 continue
+            # v9.1: Also strip suffix when doing fallback comparison
+            parts = _strip_name_suffix(parts)
             if parts[0][0] == target_first and parts[-1] == target_last:
                 _player_cache[key_exact] = p
                 return p
@@ -310,6 +358,8 @@ def _bdl_lookup_player(team_id: int, first_initial: str, last_name: str, jersey:
             best = NBAPlayer(player_id=int(p_id), full_name=f"{p.get('first_name', '')} {p.get('last_name', '')}", team_id=team_id, jersey=p_jersey, source="bdl")
     return best
 
+
+# ── Stats fetching ─────────────────────────────────────────────────────────────
 
 def _espn_fetch_overview(player_id: int) -> Optional[PlayerStats]:
     """v9: Fetch stats from /overview endpoint."""
@@ -394,6 +444,8 @@ def _bridge_espn_to_bdl(espn_player_id: int) -> Optional[int]:
     if len(name_parts) < 2:
         _espn_to_bdl[espn_player_id] = None
         return None
+    # v9.1: Strip suffix before BDL lookup
+    name_parts = _strip_name_suffix([p.upper() for p in name_parts])
     last_name = name_parts[-1]
     first_initial = name_parts[0][0].upper()
     data = _bdl_get("players", {"search": last_name, "per_page": 25})
@@ -434,6 +486,8 @@ def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
         _stats_cache[player_id] = stats
     return stats
 
+
+# ── Rolling stats ──────────────────────────────────────────────────────────────
 
 def _espn_fetch_gamelog(player_id: int, n_games: int = 10) -> Optional[RollingStats]:
     url = f"{_ESPN_STATS_BASE}/athletes/{player_id}/gamelog"
@@ -524,22 +578,3 @@ def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingS
     if rolling:
         _rolling_cache[player_id] = rolling
     return rolling
-
-
-# ── Jr/Sr/III suffix handling (v9.1 patch) ─────────────────────────────────────
-_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
-
-
-def _strip_suffix(name_parts: list[str]) -> list[str]:
-    """Remove Jr/Sr/II/III/IV suffixes from name parts."""
-    if not name_parts:
-        return name_parts
-    if name_parts[-1] in _NAME_SUFFIXES:
-        return name_parts[:-1]
-    # Handle "CARTERJR" as single token
-    last = name_parts[-1]
-    for suf in ("JR", "SR", "III", "II", "IV"):
-        if last.endswith(suf) and len(last) > len(suf):
-            name_parts[-1] = last[:-len(suf)]
-            break
-    return name_parts
