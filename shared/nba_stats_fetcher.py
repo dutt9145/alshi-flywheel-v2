@@ -567,8 +567,69 @@ def _bdl_fetch_stats(player_id: int) -> Optional[PlayerStats]:
     )
 
 
+
+# ── ESPN→BDL ID bridge ────────────────────────────────────────────────────────
+# ESPN roster gives us player names; BDL needs its own IDs for stats.
+# This cache maps ESPN player_id → BDL player_id so we only search once.
+_espn_to_bdl: dict[int, Optional[int]] = {}
+
+
+def _bridge_espn_to_bdl(espn_player_id: int) -> Optional[int]:
+    """
+    Given an ESPN player ID, find the corresponding BDL player ID
+    by searching BDL with the player's name from the ESPN roster cache.
+    """
+    if espn_player_id in _espn_to_bdl:
+        return _espn_to_bdl[espn_player_id]
+
+    if not _API_KEY:
+        _espn_to_bdl[espn_player_id] = None
+        return None
+
+    # Find the player's name from ESPN cache
+    player_name = None
+    for p in _player_cache.values():
+        if p.player_id == espn_player_id:
+            player_name = p.full_name
+            break
+
+    if not player_name:
+        _espn_to_bdl[espn_player_id] = None
+        return None
+
+    # Search BDL by last name
+    name_parts = player_name.split()
+    if len(name_parts) < 2:
+        _espn_to_bdl[espn_player_id] = None
+        return None
+
+    last_name = name_parts[-1]
+    first_initial = name_parts[0][0].upper()
+
+    data = _bdl_get("players", {"search": last_name, "per_page": 25})
+    if not data:
+        _espn_to_bdl[espn_player_id] = None
+        return None
+
+    for p in data.get("data", []):
+        p_first = _normalize(p.get("first_name", ""))
+        p_last  = _normalize(p.get("last_name", ""))
+        if p_first and p_first[0] == first_initial and p_last == _normalize(last_name):
+            bdl_id = int(p.get("id", 0))
+            if bdl_id:
+                _espn_to_bdl[espn_player_id] = bdl_id
+                logger.debug("[nba_stats] Bridge: %s → ESPN %d → BDL %d",
+                             player_name, espn_player_id, bdl_id)
+                return bdl_id
+
+    logger.debug("[nba_stats] Bridge failed: %s (ESPN %d) not found in BDL",
+                 player_name, espn_player_id)
+    _espn_to_bdl[espn_player_id] = None
+    return None
+
+
 def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
-    """Fetch season averages. ESPN first, BDL fallback."""
+    """Fetch season averages. Bridges ESPN→BDL when needed."""
     _check_stats_cache()
     if player_id in _stats_cache:
         return _stats_cache[player_id]
@@ -583,17 +644,16 @@ def fetch_player_stats(player_id: int) -> Optional[PlayerStats]:
     stats: Optional[PlayerStats] = None
 
     if source == "espn":
-        stats = _espn_fetch_stats(player_id)
-        if not stats:
-            # ESPN failed — don't try BDL with ESPN ID (wrong ID space)
-            logger.info("[nba_stats] ESPN stats failed for player %d", player_id)
-            return None
+        # ESPN stats endpoint doesn't work (404) — bridge to BDL
+        bdl_id = _bridge_espn_to_bdl(player_id)
+        if bdl_id:
+            stats = _bdl_fetch_stats(bdl_id)
     else:
-        # BDL player — use BDL stats
+        # BDL player — use BDL stats directly
         stats = _bdl_fetch_stats(player_id)
 
     if stats:
-        logger.debug("[nba_stats] %d: %dG %.1fppg %.1frpg %.1fapg (via %s)",
+        logger.debug("[nba_stats] %d: %dG %.1fppg %.1frpg %.1fapg (via %s→bdl)",
                      player_id, stats.games_played, stats.points_pg,
                      stats.rebounds_pg, stats.assists_pg, source)
         _stats_cache[player_id] = stats
@@ -716,7 +776,7 @@ def _bdl_fetch_rolling(player_id: int, n_games: int = 10) -> Optional[RollingSta
 
 
 def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingStats]:
-    """Fetch last N games rolling stats. ESPN first, BDL fallback."""
+    """Fetch last N games rolling stats. Bridges ESPN→BDL when needed."""
     _check_stats_cache()
     cache_key = player_id
     if cache_key in _rolling_cache:
@@ -731,7 +791,10 @@ def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingS
     rolling: Optional[RollingStats] = None
 
     if source == "espn":
-        rolling = _espn_fetch_gamelog(player_id, n_games)
+        # Bridge to BDL for rolling stats (ESPN gamelog may also 404)
+        bdl_id = _bridge_espn_to_bdl(player_id)
+        if bdl_id:
+            rolling = _bdl_fetch_rolling(bdl_id, n_games)
     else:
         rolling = _bdl_fetch_rolling(player_id, n_games)
 

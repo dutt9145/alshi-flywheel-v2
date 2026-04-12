@@ -40,6 +40,11 @@ _CORR_SKIP_SUBSTRINGS = (
     "seasonhr",     # Season-long HR totals
 )
 
+# ── v2.1: Price extremes that crash Kelly sizing ───────────────────────────────
+# Markets priced ≤ this or ≥ (100 - this) are fully decided — no edge exists
+# and Kelly divides by ~0 causing float division by zero.
+_EXTREME_PRICE_CENTS = 2
+
 
 @dataclass
 class CorrSignal:
@@ -177,6 +182,9 @@ class CorrelationEngine:
 
         v2: Skips unmodelable markets (MENTION, Survivor, etc.) that
         previously crashed the orchestrator when passed to kelly_sizer.
+
+        v2.1: Skips extreme-priced markets (≤2¢ or ≥98¢) that cause
+        float division by zero in Kelly sizing.
         """
         # Group markets by event, skipping unmodelable ones
         groups: dict[str, list[dict]] = {}
@@ -190,6 +198,12 @@ class CorrelationEngine:
             price = _get_yes_price(market)
             if price == 0:
                 continue
+
+            # v2.1: skip extreme-priced markets — fully decided, no edge,
+            # and Kelly divides by ~0 causing float division by zero
+            if price <= _EXTREME_PRICE_CENTS or price >= (100 - _EXTREME_PRICE_CENTS):
+                continue
+
             group = _event_group(market)
             if not group:
                 continue
