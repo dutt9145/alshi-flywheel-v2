@@ -524,3 +524,22 @@ def fetch_player_rolling(player_id: int, n_games: int = 10) -> Optional[RollingS
     if rolling:
         _rolling_cache[player_id] = rolling
     return rolling
+
+
+# ── Jr/Sr/III suffix handling (v9.1 patch) ─────────────────────────────────────
+_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+
+
+def _strip_suffix(name_parts: list[str]) -> list[str]:
+    """Remove Jr/Sr/II/III/IV suffixes from name parts."""
+    if not name_parts:
+        return name_parts
+    if name_parts[-1] in _NAME_SUFFIXES:
+        return name_parts[:-1]
+    # Handle "CARTERJR" as single token
+    last = name_parts[-1]
+    for suf in ("JR", "SR", "III", "II", "IV"):
+        if last.endswith(suf) and len(last) > len(suf):
+            name_parts[-1] = last[:-len(suf)]
+            break
+    return name_parts
