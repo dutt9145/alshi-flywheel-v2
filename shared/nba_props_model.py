@@ -105,7 +105,7 @@ def predict_nba_prop(
             confidence=round(base_confidence, 2),
             rationale=(
                 f"season={season_ppg:.1f}ppg | "
-                f"rolling={rolling_ppg:.1f if rolling_ppg else 'N/A'}ppg | "
+                f"rolling={f'{rolling_ppg:.1f}' if rolling_ppg is not None else 'N/A'}ppg | "
                 f"λ={lam:.1f} → P(≥{threshold})={prob:.3f}"
             ),
         )
@@ -123,7 +123,7 @@ def predict_nba_prop(
             confidence=round(base_confidence, 2),
             rationale=(
                 f"season={season_rpg:.1f}rpg | "
-                f"rolling={rolling_rpg:.1f if rolling_rpg else 'N/A'}rpg | "
+                f"rolling={f'{rolling_rpg:.1f}' if rolling_rpg is not None else 'N/A'}rpg | "
                 f"λ={lam:.1f} → P(≥{threshold})={prob:.3f}"
             ),
         )
@@ -141,7 +141,7 @@ def predict_nba_prop(
             confidence=round(base_confidence, 2),
             rationale=(
                 f"season={season_apg:.1f}apg | "
-                f"rolling={rolling_apg:.1f if rolling_apg else 'N/A'}apg | "
+                f"rolling={f'{rolling_apg:.1f}' if rolling_apg is not None else 'N/A'}apg | "
                 f"λ={lam:.1f} → P(≥{threshold})={prob:.3f}"
             ),
         )
@@ -159,7 +159,7 @@ def predict_nba_prop(
             confidence=round(base_confidence, 2),
             rationale=(
                 f"season={season_3pm:.1f} 3pm/g | "
-                f"rolling={rolling_3pm:.1f if rolling_3pm else 'N/A'} | "
+                f"rolling={f'{rolling_3pm:.1f}' if rolling_3pm is not None else 'N/A'} | "
                 f"λ={lam:.1f} → P(≥{threshold})={prob:.3f}"
             ),
         )
