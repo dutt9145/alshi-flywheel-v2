@@ -1,7 +1,15 @@
 """
-bots/sector_bots.py  (v12 — NBA feature logging + MLB feature logging)
+bots/sector_bots.py  (v12.1 — KXARTISTSTREAM routing fix)
 
-Changes vs v11.8:
+Changes vs v12:
+  - REMOVED "kxartiststream" from SPORTS_PREFIXES
+    It was blocking GlobalEventsBot from claiming Spotify artist streaming
+    markets. Now only in ENTERTAINMENT_PREFIXES where it belongs.
+    Flow: all bots reject via _is_entertainment_market() → GlobalEventsBot
+    claims via _is_entertainment_market() check → evaluate() returns None.
+  - Added "kxartiststream" to GlobalEventsBot.KEYWORDS for redundancy.
+
+Changes vs v11.8 (carried forward from v12):
   - Added NBA feature logging in _try_nba_player_prop() (mirrors MLB)
   - Both MLB and NBA now log features for Phase 2 logreg training
 
@@ -168,6 +176,9 @@ def _has_sports_prefix(market: dict) -> bool:
     economics/politics/tech bots from claiming the market. If a prefix is here
     but NOT in any bot's KEYWORDS, the market is simply skipped (correct
     behavior for unmodelable markets like Survivor TV show).
+
+    v12.1: REMOVED kxartiststream — it belongs in ENTERTAINMENT_PREFIXES only.
+    Having it here blocked GlobalEventsBot from claiming Spotify streaming.
     """
     SPORTS_PREFIXES = (
         # ── KXMVE family ──────────────────────────────────────────────────
@@ -322,9 +333,9 @@ def _has_sports_prefix(market: dict) -> bool:
         # keywords in episode titles. No bot can model this, so blocking it
         # here causes it to be skipped entirely (correct behavior).
         "kxsurv",      # Survivor TV show mentions
-        # v11.8d: Spotify artist streaming — should route to GlobalEventsBot
-        # but was leaking to weather (NOAA priors on Beatles) and crypto
-        "kxartiststream",
+        # v12.1: REMOVED kxartiststream — now ONLY in ENTERTAINMENT_PREFIXES
+        # so GlobalEventsBot can claim it. Was causing deadlock where no bot
+        # could claim KXARTISTSTREAMS markets.
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -375,6 +386,7 @@ def _is_entertainment_market(market: dict) -> bool:
     them out of crypto/weather/economics.
 
     v11.8: Added kxthevoice, kxfestival.
+    v12.1: kxartiststream is now ONLY here (removed from SPORTS_PREFIXES).
     """
     ENTERTAINMENT_PREFIXES = (
         "kxspotify",     # Spotify chart positions
@@ -1853,6 +1865,7 @@ class GlobalEventsBot(BaseBot):
         "kxemmy",
         "kxgoldenglobe",
         "kxbillboard",
+        "kxartiststream",  # v12.1: Spotify artist streaming
 
         # ── AI / tech launches ──────────────────────────────────────────────
         "kxtech",        # General tech events
