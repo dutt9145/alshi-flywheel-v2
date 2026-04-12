@@ -1,20 +1,18 @@
 """
-shared/kalshi_client.py  (v12 — fix resolution ingestion)
+shared/kalshi_client.py  (v13 — historical markets for archived resolutions)
+
+Changes vs v12:
+  1. Added get_historical_markets() to fetch archived settled markets.
+     Markets older than Kalshi's "historical cutoff" (~30 days) are moved
+     to a separate archive and only accessible via /historical/markets.
+  2. get_resolved_markets() now also queries historical endpoint and merges
+     results, ensuring old weather/sports/etc. markets get resolved.
+  3. Added get_historical_cutoff() to check when markets are archived.
 
 Changes vs v11:
   1. get_resolved_markets(): Changed from min_close_ts to min_settled_ts.
-     The old filter missed markets that closed before the cutoff but settled
-     after. This was causing weather markets (and potentially others) to never
-     resolve — they close at end of day but settle the next morning.
   2. Added debug logging for weather tickers in settled batch.
-  3. get_latest_outcome_ts() renamed return semantics to match min_settled_ts.
-  4. Added get_market() method to fetch a single market by ticker.
-
-Changes vs v10:
-  1. get_markets() now passes multivariate=exclude to the Kalshi API,
-     filtering out all MVE parlay/combo markets server-side.
-  2. get_all_open_markets() reverted to simple 40-page pagination since
-     MVE filtering now happens server-side.
+  3. Added get_market() method to fetch a single market by ticker.
 """
 
 import base64
@@ -40,11 +38,14 @@ _RATE_LIMIT_BACKOFF_SEC = 60
 _MAX_RETRIES = 3
 
 # How far back to look beyond the most recent logged outcome.
-# 2 hours catches any markets that resolved but weren't ingested in the last cycle.
-_INGESTION_LOOKBACK = timedelta(days=7)  # v12: temporarily 7 days for backfill, revert to hours=2 after
+# v13: Set to 7 days for backfill, revert to 2 hours after.
+_INGESTION_LOOKBACK = timedelta(days=7)
 
 # The path prefix expected by the trading API in signatures.
 _API_PATH_PREFIX = "/trade-api/v2"
+
+# Weather ticker prefixes for debug logging
+_WEATHER_PREFIXES = ("KXTEMP", "KXLOWT", "KXHIGH", "KXWTHR", "KXRAIN", "KXSNOW")
 
 
 def _load_private_key():
@@ -184,9 +185,6 @@ class KalshiClient:
     ) -> dict:
         """
         Fetch markets from Kalshi API.
-
-        FIX v11: Added multivariate=exclude filter to skip MVE parlay/combo
-        markets server-side.
         """
         params = {"status": status, "limit": limit}
         if exclude_mve:
@@ -198,8 +196,6 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         """
         Fetch a single market by ticker.
-
-        v12: Added for debugging resolution issues.
         """
         try:
             resp = self._get(f"/markets/{ticker}")
@@ -211,7 +207,6 @@ class KalshiClient:
     def get_all_open_markets(self, page_sleep_sec: float = 0.25) -> list:
         """
         Fetch all open single-game markets with pagination.
-        MVE parlays are excluded server-side via mve_filter=exclude.
         """
         markets, cursor, page = [], None, 0
         max_pages = 40
@@ -237,36 +232,159 @@ class KalshiClient:
 
         return markets
 
+    # ── Historical markets (archived) ──────────────────────────────────────────
+
+    def get_historical_cutoff(self) -> Optional[datetime]:
+        """
+        Get the cutoff timestamp for historical data.
+        Markets settled before this are in the historical archive.
+        """
+        try:
+            resp = self._get("/historical/cutoff-timestamps")
+            # Response format: {"cutoff_timestamps": {"markets": "2026-03-01T00:00:00Z", ...}}
+            cutoffs = resp.get("cutoff_timestamps", {})
+            markets_cutoff = cutoffs.get("markets")
+            if markets_cutoff:
+                return _parse_kalshi_ts(markets_cutoff)
+        except Exception as e:
+            logger.warning("get_historical_cutoff failed: %s", e)
+        return None
+
+    def get_historical_markets(
+        self,
+        tickers: Optional[list[str]] = None,
+        min_close_ts: Optional[datetime] = None,
+        max_pages: int = 50,
+    ) -> list:
+        """
+        Fetch archived/historical markets from Kalshi.
+
+        Parameters
+        ----------
+        tickers : list[str], optional
+            Specific tickers to fetch. If None, fetches all historical.
+        min_close_ts : datetime, optional
+            Only fetch markets that closed after this time.
+        max_pages : int
+            Maximum pages to fetch (100 markets each).
+
+        Returns
+        -------
+        list
+            List of market dicts with result field.
+        """
+        markets, cursor, page = [], None, 0
+
+        while page < max_pages:
+            params = {"limit": 100}
+            if tickers:
+                # API accepts comma-separated tickers
+                params["tickers"] = ",".join(tickers[:100])  # Max 100 per request
+            if min_close_ts:
+                params["min_close_ts"] = int(min_close_ts.timestamp())
+            if cursor:
+                params["cursor"] = cursor
+
+            try:
+                resp = self._get("/historical/markets", params=params)
+            except Exception as e:
+                logger.error("get_historical_markets page %d failed: %s", page + 1, e)
+                break
+
+            batch = resp.get("markets", [])
+            # Filter to those with clean results
+            clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
+            markets.extend(clean)
+            page += 1
+
+            # Log weather tickers found
+            weather_in_batch = [
+                m.get("ticker", "") for m in clean
+                if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
+            ]
+            if weather_in_batch:
+                logger.info(
+                    "Historical markets — page %d: %d weather tickers: %s",
+                    page, len(weather_in_batch), weather_in_batch[:5],
+                )
+
+            logger.info(
+                "Historical markets — page %d: %d total, %d with result (%d cumulative)",
+                page, len(batch), len(clean), len(markets),
+            )
+
+            # If fetching specific tickers, one page is enough
+            if tickers:
+                break
+
+            cursor = resp.get("cursor")
+            if not cursor or len(batch) < 100:
+                break
+
+            time.sleep(0.5)
+
+        logger.info("get_historical_markets complete — %d total results", len(markets))
+        return markets
+
+    def get_historical_by_tickers(self, tickers: list[str]) -> list:
+        """
+        Fetch specific tickers from historical archive.
+        Batches requests to handle large ticker lists.
+        """
+        all_markets = []
+        batch_size = 50  # Kalshi may limit ticker list length
+
+        for i in range(0, len(tickers), batch_size):
+            batch_tickers = tickers[i:i + batch_size]
+            try:
+                params = {"tickers": ",".join(batch_tickers)}
+                resp = self._get("/historical/markets", params=params)
+                batch = resp.get("markets", [])
+                clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
+                all_markets.extend(clean)
+                logger.info(
+                    "Historical batch %d-%d: %d/%d tickers resolved",
+                    i, i + len(batch_tickers), len(clean), len(batch_tickers),
+                )
+            except Exception as e:
+                logger.error("get_historical_by_tickers batch %d failed: %s", i, e)
+
+            time.sleep(0.25)
+
+        return all_markets
+
+    # ── Resolution ingestion ───────────────────────────────────────────────────
+
     def get_resolved_markets(
         self,
         max_pages:      int = 350,
         min_settled_ts: Optional[datetime] = None,
+        include_historical: bool = True,
     ) -> list:
         """
-        Fetch settled markets from Kalshi.
+        Fetch settled markets from Kalshi — both recent and historical.
 
         Parameters
         ----------
         max_pages : int
-            Maximum pages to fetch (100 markets each).
-            Default 350 = up to 35,000 markets (for full first-run history).
+            Maximum pages to fetch from regular endpoint.
         min_settled_ts : datetime, optional
-            UTC-aware datetime cutoff. Pass the result of get_latest_outcome_ts()
-            for incremental ingestion.
+            UTC-aware datetime cutoff for incremental ingestion.
+        include_historical : bool
+            If True, also query /historical/markets for archived settlements.
 
-        v12 FIX: Changed from min_close_ts to min_settled_ts.
-        The old filter missed markets that closed before the cutoff but settled
-        after — e.g., weather markets that close at midnight but settle at 6am.
+        Returns
+        -------
+        list
+            Combined list of settled markets with result field.
         """
         markets, cursor, page = [], None, 0
+        seen_tickers = set()
 
-        # Weather ticker prefixes for debug logging
-        _WEATHER_PREFIXES = ("KXTEMP", "KXLOWT", "KXHIGH", "KXWTHR", "KXRAIN", "KXSNOW")
-
+        # ── Phase 1: Regular /markets?status=settled ──────────────────────────
         while page < max_pages:
             params = {"status": "settled", "limit": 100}
             if min_settled_ts:
-                # v12: Use min_settled_ts instead of min_close_ts
                 params["min_settled_ts"] = int(min_settled_ts.timestamp())
             if cursor:
                 params["cursor"] = cursor
@@ -285,9 +403,11 @@ class KalshiClient:
 
             clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
             markets.extend(clean)
+            for m in clean:
+                seen_tickers.add(m.get("ticker", ""))
             page += 1
 
-            # v12: Debug log weather tickers
+            # Debug log weather tickers
             weather_in_batch = [
                 m.get("ticker", "") for m in clean
                 if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
@@ -303,33 +423,70 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
-            # v12: Simplified pagination — just follow cursor until exhausted
-            # The min_settled_ts filter handles the cutoff server-side
             cursor = resp.get("cursor")
             if not cursor or len(batch) < 100:
                 break
 
             time.sleep(1.0)
 
-        # v12: Summary debug for weather
+        # Summary for phase 1
         all_weather = [
             m.get("ticker", "") for m in markets
             if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
         ]
         logger.info(
-            "get_resolved_markets complete — %d total clean results, %d weather tickers: %s",
+            "get_resolved_markets phase 1 complete — %d results, %d weather: %s",
             len(markets), len(all_weather), all_weather[:10],
         )
 
+        # ── Phase 2: Historical /historical/markets ───────────────────────────
+        if include_historical:
+            logger.info("Checking historical archive for older settlements...")
+            try:
+                # Get historical markets from the lookback period
+                historical_cutoff = None
+                if min_settled_ts:
+                    # Look back further in historical
+                    historical_cutoff = min_settled_ts - timedelta(days=30)
+
+                historical = self.get_historical_markets(
+                    min_close_ts=historical_cutoff,
+                    max_pages=20,
+                )
+
+                # Add any we haven't seen
+                new_from_historical = 0
+                for m in historical:
+                    ticker = m.get("ticker", "")
+                    if ticker and ticker not in seen_tickers:
+                        markets.append(m)
+                        seen_tickers.add(ticker)
+                        new_from_historical += 1
+
+                historical_weather = [
+                    m.get("ticker", "") for m in historical
+                    if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
+                ]
+                logger.info(
+                    "Historical phase: %d total, %d new, %d weather: %s",
+                    len(historical), new_from_historical,
+                    len(historical_weather), historical_weather[:10],
+                )
+
+            except Exception as e:
+                logger.error("Historical markets fetch failed: %s", e)
+
+        logger.info(
+            "get_resolved_markets complete — %d total combined results",
+            len(markets),
+        )
         return markets
 
     def get_latest_outcome_ts(self) -> Optional[datetime]:
         """
         Query outcomes table for most recent logged_at timestamp.
-        Returns a UTC-aware datetime with a 2-hour lookback buffer,
+        Returns a UTC-aware datetime with lookback buffer,
         or None if no outcomes exist yet (triggers full history fetch).
-
-        v12: Renamed semantically to match min_settled_ts usage.
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
