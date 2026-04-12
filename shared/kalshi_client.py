@@ -39,7 +39,7 @@ _MAX_RETRIES = 3
 
 # How far back to look beyond the most recent logged outcome.
 # v13: Set to 7 days for backfill, revert to 2 hours after.
-_INGESTION_LOOKBACK = timedelta(days=7)
+_INGESTION_LOOKBACK = timedelta(hours=2)
 
 # The path prefix expected by the trading API in signatures.
 _API_PATH_PREFIX = "/trade-api/v2"
