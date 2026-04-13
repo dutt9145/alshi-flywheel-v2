@@ -20,6 +20,9 @@ Changes vs v12.1:
       KXMVECBC  4530 signals, 0 resolved, 0.32 conf — futures noise
   - SportsBot: Added _detect_sport_code() helper.
   - SportsBot: Modified evaluate() to apply scaling and blocklist.
+  - Fixed KXNEXTNBACOACH-MIL26 misclassified as WEATHER (matched "milwaukee").
+    Added "kxnext" to SPORTS_PREFIXES, WeatherBot._NON_WEATHER_BLOCKLIST,
+    and SportsBot.KEYWORDS.
 
 Changes vs v12:
   - REMOVED "kxartiststream" from SPORTS_PREFIXES
@@ -350,6 +353,10 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxkbl",
         # K League (Korean soccer)
         "kxkleague",
+
+        # v12.2: "Next X" prediction markets (coaching hires, etc.)
+        # KXNEXTNBACOACH-MIL26 was matching WeatherBot "milwaukee" keyword
+        "kxnext",
 
         # ── Entertainment / unmodelable (block from all sector bots) ──────
         # v11.3: Survivor TV show (429 signals) matched WeatherBot via city
@@ -851,6 +858,8 @@ class WeatherBot(BaseBot):
         "kxkbl",           # KBL Korean basketball
         "kxkleague",       # K League Korean soccer
         "kxartiststream",  # Spotify streaming (entertainment)
+        # v12.2: "Next X" prediction markets (coaching hires, etc.)
+        "kxnext",          # KXNEXTNBACOACH matched "milwaukee" city keyword
     )
 
     KEYWORDS = [
@@ -1519,6 +1528,8 @@ class SportsBot(BaseBot):
         "kxjbleague",      # J.B.League (Japanese basketball)
         "kxkbl",           # KBL (Korean basketball)
         "kxkleague",       # K League (Korean soccer)
+        # v12.2: "Next X" prediction markets
+        "kxnext",          # KXNEXTNBACOACH, etc.
     ]
 
     LEAGUE_MAP = {
