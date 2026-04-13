@@ -10,19 +10,25 @@ Given a parsed MLBTicker, this module provides:
        → MLB Stats API player ID + canonical name
 
   2. fetch_batter_stats(player_id)
-       → season batting stats (avg, obp, slg, PA, games)
+       → season batting stats (avg, obp, slg, PA, games, bat_hand)
 
   3. fetch_batter_gamelog(player_id, n_games=10)
        → last N games hit/AB/HR totals for rolling average
 
   4. fetch_pitcher_stats(player_id)
-       → season pitching stats (k/9, ip, era)
+       → season pitching stats (k/9, ip, era, hand)
 
   5. fetch_probable_pitcher(game_date, home_team_id, away_team_id, against_team_id)
        → opposing pitcher ID and hand (L/R)
 
   6. PARK_FACTORS
        → dict mapping venue_id → multiplicative run/HR factors
+
+v12.2 changes:
+  - BatterSeasonStats now includes bat_hand (L/R/S) for platoon splits
+  - PitcherSeasonStats now includes hand (L/R) for platoon splits
+  - fetch_batter_stats() fetches bat_hand from /people endpoint
+  - fetch_pitcher_stats() fetches hand from /people endpoint
 
 Player matching handles Kalshi's diacritic stripping:
   Kalshi:   JRAMREZ11  →  first="J", last="RAMREZ", jersey=11
@@ -253,6 +259,7 @@ class BatterSeasonStats:
     obp:          float
     slg:          float
     ops:          float
+    bat_hand:     str = "R"   # v12.2: L/R/S for platoon splits
 
 
 def fetch_batter_stats(player_id: int, season: Optional[int] = None) -> Optional[BatterSeasonStats]:
@@ -271,6 +278,16 @@ def fetch_batter_stats(player_id: int, season: Optional[int] = None) -> Optional
         if not splits:
             return None
         stat = splits[0]["stat"]
+        
+        # v12.2: Fetch batter handedness for platoon splits
+        bat_hand = "R"
+        try:
+            people_data = _get(f"{BASE}/people/{player_id}", {}, ttl=86400)
+            if people_data:
+                bat_hand = people_data["people"][0].get("batSide", {}).get("code", "R")
+        except (KeyError, IndexError):
+            pass
+        
         return BatterSeasonStats(
             player_id  = player_id,
             games      = int(stat.get("gamesPlayed", 0)),
@@ -286,6 +303,7 @@ def fetch_batter_stats(player_id: int, season: Optional[int] = None) -> Optional
             obp        = float(stat.get("obp") or 0),
             slg        = float(stat.get("slg") or 0),
             ops        = float(stat.get("ops") or 0),
+            bat_hand   = bat_hand,
         )
     except (KeyError, IndexError, ValueError) as e:
         logger.debug("batter stats parse failed for %d: %s", player_id, e)
@@ -364,6 +382,7 @@ class PitcherSeasonStats:
     era:          float
     whip:         float
     k_per_9:      float
+    hand:         str = "R"   # v12.2: L/R for platoon splits
 
 
 def fetch_pitcher_stats(player_id: int, season: Optional[int] = None) -> Optional[PitcherSeasonStats]:
@@ -384,6 +403,16 @@ def fetch_pitcher_stats(player_id: int, season: Optional[int] = None) -> Optiona
         stat = splits[0]["stat"]
         ip = float(stat.get("inningsPitched") or 0)
         ks = int(stat.get("strikeOuts", 0))
+        
+        # v12.2: Fetch pitcher handedness for platoon splits
+        hand = "R"
+        try:
+            people_data = _get(f"{BASE}/people/{player_id}", {}, ttl=86400)
+            if people_data:
+                hand = people_data["people"][0].get("pitchHand", {}).get("code", "R")
+        except (KeyError, IndexError):
+            pass
+        
         return PitcherSeasonStats(
             player_id    = player_id,
             games        = int(stat.get("gamesPlayed", 0)),
@@ -395,6 +424,7 @@ def fetch_pitcher_stats(player_id: int, season: Optional[int] = None) -> Optiona
             era          = float(stat.get("era") or 0),
             whip         = float(stat.get("whip") or 0),
             k_per_9      = (ks * 9 / ip) if ip > 0 else 0.0,
+            hand         = hand,
         )
     except (KeyError, IndexError, ValueError) as e:
         logger.debug("pitcher stats parse failed for %d: %s", player_id, e)
@@ -498,7 +528,7 @@ PARK_FACTORS = {
 # Add this function to the END of shared/mlb_stats_fetcher.py
 # Also add 'fetch_opposing_pitcher' to any __all__ if present.
 
-def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional["PitcherSeasonStats"]:
+def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional[PitcherSeasonStats]:
     """Fetch probable pitcher stats for a given team on a given date.
 
     Uses MLB Stats API schedule endpoint with probablePitcher hydration.
@@ -538,8 +568,9 @@ def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional["P
                     pitcher_stats = fetch_pitcher_stats(pp["id"])
                     if pitcher_stats:
                         logger.info(
-                            "[mlb_stats] opposing pitcher: %s (K/9=%.1f, %.0fIP)",
+                            "[mlb_stats] opposing pitcher: %s (%s) K/9=%.1f, %.0fIP",
                             pp.get("fullName", "?"),
+                            pitcher_stats.hand,
                             pitcher_stats.k_per_9,
                             pitcher_stats.innings,
                         )
@@ -553,8 +584,8 @@ def fetch_opposing_pitcher(game_date: str, opponent_team_id: int) -> Optional["P
 # ── Historical stats-as-of-date (v11.7) ──────────────────────────────────────
 
 def fetch_batter_stats_as_of(
-    player_id: int, as_of_date: "date",
-) -> "Optional[BatterSeasonStats]":
+    player_id: int, as_of_date: date,
+) -> Optional[BatterSeasonStats]:
     """Season batting stats through a specific date (for backtesting).
 
     Uses MLB Stats API's endDate parameter to get stats only through
@@ -586,6 +617,16 @@ def fetch_batter_stats_as_of(
         if not splits:
             return None
         stat = splits[0]["stat"]
+        
+        # v12.2: Fetch batter handedness for platoon splits
+        bat_hand = "R"
+        try:
+            people_data = _get(f"{BASE}/people/{player_id}", {}, ttl=86400)
+            if people_data:
+                bat_hand = people_data["people"][0].get("batSide", {}).get("code", "R")
+        except (KeyError, IndexError):
+            pass
+        
         return BatterSeasonStats(
             player_id  = player_id,
             games      = int(stat.get("gamesPlayed", 0)),
@@ -601,6 +642,7 @@ def fetch_batter_stats_as_of(
             obp        = float(stat.get("obp") or 0),
             slg        = float(stat.get("slg") or 0),
             ops        = float(stat.get("ops") or 0),
+            bat_hand   = bat_hand,
         )
     except (KeyError, IndexError, ValueError) as e:
         logger.debug("historical batter stats parse failed for %d as of %s: %s",
@@ -609,8 +651,8 @@ def fetch_batter_stats_as_of(
 
 
 def fetch_batter_rolling_as_of(
-    player_id: int, as_of_date: "date", n_games: int = 10,
-) -> "Optional[BatterRollingStats]":
+    player_id: int, as_of_date: date, n_games: int = 10,
+) -> Optional[BatterRollingStats]:
     """Rolling stats over the last N games before a specific date.
 
     Uses the gameLog endpoint and filters to games on or before as_of_date.
@@ -711,7 +753,8 @@ if __name__ == "__main__":
                 print(f"   → 2026 so far: {stats.games}G  "
                       f".{int(stats.avg*1000):03d}/.{int(stats.obp*1000):03d}/"
                       f".{int(stats.slg*1000):03d}  "
-                      f"{stats.hits}H {stats.home_runs}HR {stats.plate_apps}PA")
+                      f"{stats.hits}H {stats.home_runs}HR {stats.plate_apps}PA "
+                      f"bat_hand={stats.bat_hand}")
         else:
             print(f"✗ {team_code} {first}. {last} #{jersey}")
             if result:
@@ -724,5 +767,3 @@ if __name__ == "__main__":
     print("=" * 78)
 
     sys.exit(0 if passes >= len(TESTS) - 1 else 1)  # allow 1 miss for early-season rosters
-
-    

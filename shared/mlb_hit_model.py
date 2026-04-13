@@ -22,6 +22,7 @@ Adjustments applied to base rates (in order):
      (hits are less park-dependent than runs).
   3. Pitcher quality — higher K/9 opposing pitcher reduces batter AVG.
      Empirical rule of thumb: each K/9 above league avg reduces AVG by ~0.6%.
+  4. v12.2: Platoon splits — LHB vs LHP get -8%, RHB vs LHP get +8%, etc.
 
 None of these are ML — they're closed-form probability calculations with
 defensible priors. The entire point is to be differentiated and explainable.
@@ -167,6 +168,40 @@ def _pitcher_adjustment(pitcher_k9: Optional[float]) -> float:
     return max(0.85, min(1.10, factor))
 
 
+# ── Platoon split adjustments (v12.2) ────────────────────────────────────────
+# Source: Historical MLB split data (2015-2024)
+#
+# RHB vs LHP: +8% (batter advantage — sees ball better from opposite side)
+# LHB vs RHP: +8% (batter advantage)
+# RHB vs RHP: -5% (pitcher advantage, same-side)
+# LHB vs LHP: -8% (pitcher advantage, most extreme — LHP are specialists)
+# Switch hitters: slight advantage (they always bat from platoon side)
+
+PLATOON_ADJUSTMENTS = {
+    # (batter_hand, pitcher_hand) → multiplier on batter AVG/SLG
+    ("R", "L"): 1.08,   # RHB vs LHP — batter advantage
+    ("L", "R"): 1.08,   # LHB vs RHP — batter advantage
+    ("R", "R"): 0.95,   # RHB vs RHP — pitcher advantage
+    ("L", "L"): 0.92,   # LHB vs LHP — pitcher advantage (strongest)
+    ("S", "L"): 1.04,   # Switch vs LHP — slight advantage (bats R)
+    ("S", "R"): 1.04,   # Switch vs RHP — slight advantage (bats L)
+}
+
+
+def _platoon_adjustment(batter_hand: Optional[str], pitcher_hand: Optional[str]) -> float:
+    """Multiplicative adjustment based on batter/pitcher handedness matchup.
+
+    Returns 1.0 if either hand is unknown.
+    """
+    if not batter_hand or not pitcher_hand:
+        return 1.0
+
+    bh = batter_hand.upper()
+    ph = pitcher_hand.upper()
+
+    return PLATOON_ADJUSTMENTS.get((bh, ph), 1.0)
+
+
 # ── Model prediction dataclass ───────────────────────────────────────────────
 
 @dataclass
@@ -211,12 +246,17 @@ def predict_hits(
     park_factor  = PARK_FACTORS.get(home_team_id, 1.00) if home_team_id else 1.00
     park_hit_factor = math.sqrt(park_factor)
 
-    # Pitcher adjustment
+    # Pitcher K/9 adjustment
     pitcher_k9 = pitcher_stats.k_per_9 if pitcher_stats else None
     pitcher_factor = _pitcher_adjustment(pitcher_k9)
 
+    # v12.2: Platoon adjustment based on batter/pitcher handedness
+    batter_hand = getattr(batter_season, 'bat_hand', None) if batter_season else None
+    pitcher_hand = getattr(pitcher_stats, 'hand', None) if pitcher_stats else None
+    platoon_factor = _platoon_adjustment(batter_hand, pitcher_hand)
+
     # Final adjusted AVG
-    adj_avg = blended_avg * park_hit_factor * pitcher_factor
+    adj_avg = blended_avg * park_hit_factor * pitcher_factor * platoon_factor
     adj_avg = max(0.05, min(0.50, adj_avg))  # sanity floor/ceiling
 
     # P(≥ threshold hits) from Binomial(n=AB, p=adj_avg)
@@ -229,20 +269,28 @@ def predict_hits(
         0.6 * sample_confidence + 0.4 * edge_confidence
     )
 
+    # Build rationale string
     rationale = (
         f"{ticker.player_display} | "
         f"season AVG={season_avg:.3f} (n={sample_pa}PA) | "
-        f"rolling={rolling_avg:.3f} | " if rolling_avg else f"rolling=n/a | "
     )
-    rationale += (
-        f"park={park_hit_factor:.2f} | "
-        f"pitcher K/9={pitcher_k9:.1f} adj={pitcher_factor:.2f} | "
-        if pitcher_k9 else "pitcher=unknown | "
-    )
+    if rolling_avg:
+        rationale += f"rolling={rolling_avg:.3f} | "
+    else:
+        rationale += "rolling=n/a | "
+    rationale += f"park={park_hit_factor:.2f} | "
+    if pitcher_k9:
+        rationale += f"pitcher K/9={pitcher_k9:.1f} adj={pitcher_factor:.2f} | "
+    else:
+        rationale += "pitcher=unknown | "
+    # v12.2: Add platoon info to rationale
+    if batter_hand and pitcher_hand:
+        rationale += f"platoon={batter_hand}v{pitcher_hand} adj={platoon_factor:.2f} | "
     rationale += f"adj_AVG={adj_avg:.3f} → P(≥{ticker.threshold} hits in {DEFAULT_EXPECTED_AB}AB)={prob:.3f}"
 
+    # v12.2: Add platoon_factor to feature vector
     features = np.array([
-        blended_avg, adj_avg, park_hit_factor, pitcher_factor,
+        blended_avg, adj_avg, park_hit_factor, pitcher_factor, platoon_factor,
         float(ticker.threshold), float(sample_pa),
     ])
 
@@ -293,7 +341,12 @@ def predict_total_bases(
     pitcher_k9 = pitcher_stats.k_per_9 if pitcher_stats else None
     pitcher_factor = _pitcher_adjustment(pitcher_k9)
 
-    adj_slg = blended_slg * park_tb_factor * pitcher_factor
+    # v12.2: Platoon adjustment
+    batter_hand = getattr(batter_season, 'bat_hand', None) if batter_season else None
+    pitcher_hand = getattr(pitcher_stats, 'hand', None) if pitcher_stats else None
+    platoon_factor = _platoon_adjustment(batter_hand, pitcher_hand)
+
+    adj_slg = blended_slg * park_tb_factor * pitcher_factor * platoon_factor
     adj_slg = max(0.10, min(1.00, adj_slg))
 
     lam = DEFAULT_EXPECTED_AB * adj_slg
@@ -309,11 +362,14 @@ def predict_total_bases(
         f"{ticker.player_display} | "
         f"season SLG={season_slg:.3f} (n={sample_pa}PA) | "
         f"park={park_tb_factor:.2f} pitcher_adj={pitcher_factor:.2f} | "
-        f"λ={lam:.2f} → P(≥{ticker.threshold} TB)={prob:.3f}"
     )
+    if batter_hand and pitcher_hand:
+        rationale += f"platoon={batter_hand}v{pitcher_hand} adj={platoon_factor:.2f} | "
+    rationale += f"λ={lam:.2f} → P(≥{ticker.threshold} TB)={prob:.3f}"
 
+    # v12.2: Add platoon_factor to feature vector
     features = np.array([
-        blended_slg, adj_slg, park_tb_factor, pitcher_factor,
+        blended_slg, adj_slg, park_tb_factor, pitcher_factor, platoon_factor,
         float(ticker.threshold), float(sample_pa),
     ])
 
@@ -355,14 +411,24 @@ def predict_home_runs(
 
     home_team_id = ticker.home_team_id
     park_factor  = PARK_FACTORS.get(home_team_id, 1.00) if home_team_id else 1.00
-    # HRs are heavily park-dependent
-    park_hr_factor = park_factor
+    # HRs are heavily park-dependent — use factor^1.2 for stronger effect
+    park_hr_factor = park_factor ** 1.2
 
     pitcher_k9 = pitcher_stats.k_per_9 if pitcher_stats else None
     # Pitcher K/9 is a weaker proxy for HR suppression — use half the effect
     pitcher_factor = 1.0 + 0.5 * (_pitcher_adjustment(pitcher_k9) - 1.0)
 
-    adj_hr_rate = blended_hr_rate * park_hr_factor * pitcher_factor
+    # v12.2: Platoon adjustment — HR effect is ~30% stronger than AVG effect
+    batter_hand = getattr(batter_season, 'bat_hand', None) if batter_season else None
+    pitcher_hand = getattr(pitcher_stats, 'hand', None) if pitcher_stats else None
+    base_platoon = _platoon_adjustment(batter_hand, pitcher_hand)
+    # Amplify platoon effect for HRs (power is more platoon-sensitive than contact)
+    if base_platoon != 1.0:
+        platoon_factor = 1.0 + (base_platoon - 1.0) * 1.3
+    else:
+        platoon_factor = 1.0
+
+    adj_hr_rate = blended_hr_rate * park_hr_factor * pitcher_factor * platoon_factor
     adj_hr_rate = max(0.001, min(0.20, adj_hr_rate))
 
     # Binomial over PAs (not ABs) since walks don't produce HRs but we use PA as trials
@@ -379,11 +445,14 @@ def predict_home_runs(
         f"{ticker.player_display} | "
         f"HR/PA={blended_hr_rate:.4f} (n={sample_pa}PA) | "
         f"park={park_hr_factor:.2f} | "
-        f"adj_rate={adj_hr_rate:.4f} → P(≥{ticker.threshold} HR in {n_trials}PA)={prob:.3f}"
     )
+    if batter_hand and pitcher_hand:
+        rationale += f"platoon={batter_hand}v{pitcher_hand} adj={platoon_factor:.2f} | "
+    rationale += f"adj_rate={adj_hr_rate:.4f} → P(≥{ticker.threshold} HR in {n_trials}PA)={prob:.3f}"
 
+    # v12.2: Add platoon_factor to feature vector
     features = np.array([
-        blended_hr_rate, adj_hr_rate, park_hr_factor, pitcher_factor,
+        blended_hr_rate, adj_hr_rate, park_hr_factor, pitcher_factor, platoon_factor,
         float(ticker.threshold), float(sample_pa),
     ])
 
@@ -481,10 +550,28 @@ if __name__ == "__main__":
     from shared.kalshi_ticker_parser import MLB_TEAMS
 
     print("=" * 78)
-    print("MLB hit-rate model — end-to-end self-test")
+    print("MLB hit-rate model — end-to-end self-test (v12.2 with platoon splits)")
     print("=" * 78)
 
+    # Test platoon adjustment function
+    print("\n── Platoon adjustment verification ──")
+    test_cases = [
+        ("R", "L", 1.08, "RHB vs LHP"),
+        ("L", "R", 1.08, "LHB vs RHP"),
+        ("R", "R", 0.95, "RHB vs RHP"),
+        ("L", "L", 0.92, "LHB vs LHP"),
+        ("S", "L", 1.04, "Switch vs LHP"),
+        ("S", "R", 1.04, "Switch vs RHP"),
+        (None, "R", 1.00, "Unknown batter"),
+        ("R", None, 1.00, "Unknown pitcher"),
+    ]
+    for bh, ph, expected, desc in test_cases:
+        result = _platoon_adjustment(bh, ph)
+        status = "✓" if abs(result - expected) < 0.001 else "✗"
+        print(f"  {status} {desc}: {result:.2f} (expected {expected:.2f})")
+
     # Walk a few tickers through the entire pipeline
+    print("\n── End-to-end ticker tests ──")
     TICKERS = [
         "KXMLBHIT-26APR092140COLSD-SDFTATIS23-1",   # ≥1 hit — should be ~0.65
         "KXMLBHIT-26APR092140COLSD-SDFTATIS23-2",   # ≥2 hits — should be ~0.25

@@ -28,6 +28,8 @@ Changes vs v12.1:
   - Fixed KXLPGATOUR leaking to WEATHER and KXUECLGAME leaking to WEATHER.
     Added "kxlpga" and "kxuecl" to SPORTS_PREFIXES, WeatherBot._NON_WEATHER_BLOCKLIST,
     SportsBot.KEYWORDS, and SportsBot.LEAGUE_MAP.
+  - MLB platoon splits: Updated logging to show batter hand vs pitcher hand
+    for debugging platoon adjustments (actual model changes in mlb_hit_model.py).
 
 Changes vs v12:
   - REMOVED "kxartiststream" from SPORTS_PREFIXES
@@ -1765,9 +1767,13 @@ class SportsBot(BaseBot):
                     if game_date:
                         opp_pitcher_stats = fetch_opposing_pitcher(game_date, opp_team_info[0])
                         if opp_pitcher_stats:
+                            # v12.2: Log pitcher hand for platoon debugging
                             logger.debug(
-                                "[sports/mlb] %s facing pitcher K/9=%.1f",
-                                player.full_name, opp_pitcher_stats.k_per_9,
+                                "[sports/mlb] %s (%s) facing pitcher (%s) K/9=%.1f",
+                                player.full_name,
+                                getattr(season, 'bat_hand', '?'),
+                                getattr(opp_pitcher_stats, 'hand', '?'),
+                                opp_pitcher_stats.k_per_9,
                             )
             except Exception as e:
                 logger.debug("[sports/mlb] probable pitcher lookup failed: %s", e)
