@@ -23,6 +23,8 @@ Changes vs v12.1:
   - Fixed KXNEXTNBACOACH-MIL26 misclassified as WEATHER (matched "milwaukee").
     Added "kxnext" to SPORTS_PREFIXES, WeatherBot._NON_WEATHER_BLOCKLIST,
     and SportsBot.KEYWORDS.
+  - Fixed KXHIGHTDAL/KXHIGHTDC leaking to ECONOMICS (matched "dallas"/"dc").
+    Added weather prefix guard to EconomicsBot.is_relevant().
 
 Changes vs v12:
   - REMOVED "kxartiststream" from SPORTS_PREFIXES
@@ -519,6 +521,14 @@ class EconomicsBot(BaseBot):
             return False
         if _has_sports_prefix(market):
             return False
+        
+        # v12.2: Reject weather temperature markets (KXHIGHTDAL matched "dallas")
+        et = market.get("event_ticker", "").lower()
+        tk = market.get("ticker", "").lower()
+        weather_prefixes = ("kxhight", "kxlowt", "kxtemp", "kxchll", "kxdens", "kxwthr", "kxhurr", "kxsnow", "kxrain")
+        if any(et.startswith(p) or tk.startswith(p) for p in weather_prefixes):
+            return False
+        
         return _search_fields(market, self.KEYWORDS)
 
     def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
