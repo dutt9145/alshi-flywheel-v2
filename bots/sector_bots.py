@@ -25,6 +25,9 @@ Changes vs v12.1:
     and SportsBot.KEYWORDS.
   - Fixed KXHIGHTDAL/KXHIGHTDC leaking to ECONOMICS (matched "dallas"/"dc").
     Added weather prefix guard to EconomicsBot.is_relevant().
+  - Fixed KXLPGATOUR leaking to WEATHER and KXUECLGAME leaking to WEATHER.
+    Added "kxlpga" and "kxuecl" to SPORTS_PREFIXES, WeatherBot._NON_WEATHER_BLOCKLIST,
+    SportsBot.KEYWORDS, and SportsBot.LEAGUE_MAP.
 
 Changes vs v12:
   - REMOVED "kxartiststream" from SPORTS_PREFIXES
@@ -221,6 +224,7 @@ def _has_sports_prefix(market: dict) -> bool:
         # ticker substring issues) and weather (golfer city names).
         # kxowga was missing → bled into economics.
         "kxgolf", "kxpga", "kxowga",
+        "kxlpga",      # v12.2: LPGA Tour (was leaking to weather)
 
         # ── International soccer ──────────────────────────────────────────
         # v11.3: ALL of these were missing. Argentine soccer (kxarg) bled
@@ -241,6 +245,7 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxsaud",      # Saudi Pro League
         "kxjlea",      # J-League (Japan)
         "kxuclt",      # UEFA Champions League
+        "kxuecl",      # v12.2: UEFA Europa Conference League (was leaking to weather)
         "kxfifa",      # FIFA (World Cup)  
         "kxdensuperliga",  # Danish Superliga         
 
@@ -870,6 +875,9 @@ class WeatherBot(BaseBot):
         "kxartiststream",  # Spotify streaming (entertainment)
         # v12.2: "Next X" prediction markets (coaching hires, etc.)
         "kxnext",          # KXNEXTNBACOACH matched "milwaukee" city keyword
+        # v12.2: Golf and UEFA leaks
+        "kxlpga",          # LPGA Tour golf
+        "kxuecl",          # UEFA Europa Conference League
     )
 
     KEYWORDS = [
@@ -1407,6 +1415,7 @@ class SportsBot(BaseBot):
         "kxsaud",          # Saudi Pro League
         "kxjlea",          # J-League
         "kxuclt",          # UEFA Champions League
+        "kxuecl",          # v12.2: UEFA Europa Conference League
         "kxfifa",          # FIFA
         "kxintl",          # International sports
         "kxalea",          # A-League (Australia)
@@ -1414,6 +1423,7 @@ class SportsBot(BaseBot):
 
         # ── Golf — v11.3 ──────────────────────────────────────────────────
         "kxpga",           # PGA Tour
+        "kxlpga",          # v12.2: LPGA Tour
         "kxowga",          # Golf (was leaking into economics)
 
         # ── Cricket — v11.3 ───────────────────────────────────────────────
@@ -1573,12 +1583,14 @@ class SportsBot(BaseBot):
         "kxsaud": "SAUDI",
         "kxjlea": "JLEAGUE",
         "kxuclt": "UCL",
+        "kxuecl": "UECL",  # v12.2: UEFA Europa Conference League
         "kxfifa": "FIFA",
         "kxintl": "INTL",
         "kxalea": "ALEAGUE",
         "kxafl":  "AFL",
         # Golf
         "kxpga":  "PGA",
+        "kxlpga": "LPGA",  # v12.2
         "kxowga": "PGA",
         # Cricket
         "kxcba":  "CRICKET",
