@@ -1,5 +1,25 @@
 """
-bots/sector_bots.py  (v12.1 — KXARTISTSTREAM routing fix)
+bots/sector_bots.py  (v12.2 — Sports per-sport confidence scaling)
+
+Changes vs v12.1:
+  - SportsBot: Added SPORT_CONFIDENCE_SCALE dict for per-sport calibration.
+    Based on resolved Brier scores:
+      NCAAMB 0.1159 → 1.00 (keep full)
+      LALIGA 0.0343 → 1.00
+      CS2    0.2141 → 0.85
+      MLB    0.2267 → 0.75 (was 0.918 avg_conf, now ~0.69)
+      NBA    0.2960 → 0.55 (worst major category)
+      VALORANT 0.2495 → 0.65
+      LOL    0.2521 → 0.65
+      TENNIS 0.2607 → 0.60
+  - SportsBot: Added SPORT_BLOCKLIST for leagues with catastrophic Brier:
+      KXBELGIA  0.5662
+      KXJBLEAG  0.4262
+      KXACBGAM  0.6045
+      KXMVENBA  0.3243
+      KXMVECBC  4530 signals, 0 resolved, 0.32 conf — futures noise
+  - SportsBot: Added _detect_sport_code() helper.
+  - SportsBot: Modified evaluate() to apply scaling and blocklist.
 
 Changes vs v12:
   - REMOVED "kxartiststream" from SPORTS_PREFIXES
@@ -1272,6 +1292,8 @@ class SportsBot(BaseBot):
 
     v11.3: Added all international soccer, cricket, basketball, golf, hockey,
     track & field, and A-League prefixes to KEYWORDS and LEAGUE_MAP.
+
+    v12.2: Added per-sport confidence scaling based on resolved Brier scores.
     """
 
     # ── Structural market blocklist ────────────────────────────────────────────
@@ -1282,6 +1304,55 @@ class SportsBot(BaseBot):
         "kxmvesportsmultigameextended",
         "kxmvesportsmultigame",
         "kxmvesportsmulti",
+    )
+
+    # ── v12.2: Per-sport confidence scaling based on historical Brier scores ───
+    # Derived from resolved signals query 2026-04-13:
+    #   NCAAMB: 0.1159 (7 resolved) → keep full confidence
+    #   LALIGA: 0.0343 (2 resolved) → keep full
+    #   CS2:    0.2141 (4 resolved) → minor scale
+    #   MLB:    0.2267 (86 resolved) → was 0.918 avg_conf, scale to ~0.69
+    #   NBA:    0.2960 (12 resolved) → worst major, significant haircut
+    #   VALORANT: 0.2495 (16 resolved)
+    #   LOL:    0.2521 (6 resolved)
+    #   TENNIS: 0.2607 (7 resolved)
+    SPORT_CONFIDENCE_SCALE = {
+        # ── Strong performers (Brier < 0.15) ──────────────────────────────
+        "NCAAMB": 1.00,     # 0.1159 Brier — excellent
+        "LALIGA": 1.00,     # 0.0343 Brier (small sample)
+        "ECUL":   1.00,     # 0.0362 Brier (small sample)
+        "SOCCER": 0.95,     # 0.1525 Brier (1 resolved)
+
+        # ── Decent performers (Brier 0.15-0.22) ───────────────────────────
+        "ALEAGU": 0.90,     # 0.2160 Brier
+        "CS2":    0.85,     # 0.2141 Brier
+
+        # ── Volume drivers needing calibration (Brier 0.22-0.30) ──────────
+        "MLB":      0.75,   # 0.2267 Brier, 86 resolved — highest volume
+        "VALORANT": 0.65,   # 0.2495 Brier
+        "LOL":      0.65,   # 0.2521 Brier
+        "NCAABB":   0.65,   # 0.2559 Brier (KXNCAABB)
+        "TENNIS":   0.60,   # 0.2607 Brier
+        "BUNDES":   0.60,   # 0.2654 Brier
+        "NCAAWB":   0.60,   # 0.2667 Brier (KXNCAAWB)
+        "NBA":      0.55,   # 0.2960 Brier — worst major category
+
+        # ── Unproven / low sample (conservative) ──────────────────────────
+        "NHL":      0.60,
+        "NFL":      0.60,
+        "MMA":      0.50,
+        "GOLF":     0.50,
+        "PGA":      0.50,
+    }
+
+    # ── v12.2: Blocklist for catastrophic Brier (> 0.40) or noise markets ──────
+    # These markets should not generate signals at all.
+    SPORT_BLOCKLIST = (
+        "kxbelgia",   # 0.5662 Brier — Belgian league garbage
+        "kxjbleag",   # 0.4262 Brier — J.B.League
+        "kxacbgam",   # 0.6045 Brier — ACB basketball
+        "kxmvenba",   # 0.3243 Brier — MVE NBA (structural issue)
+        "kxmvecbc",   # 4530 signals, 0 resolved, 0.32 conf — futures noise
     )
 
     KEYWORDS = [
@@ -1515,6 +1586,77 @@ class SportsBot(BaseBot):
         return "sports"
 
     # ─────────────────────────────────────────────────────────────────────
+    # v12.2: SPORT DETECTION AND CONFIDENCE SCALING
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _detect_sport_code(self, ticker: str) -> str:
+        """Extract sport code from ticker for confidence scaling.
+
+        Maps ticker prefixes to sport codes used in SPORT_CONFIDENCE_SCALE.
+        Returns uppercase sport code or "OTHER" if not recognized.
+        """
+        tk = ticker.upper()
+
+        # Direct prefix mappings (order matters — more specific first)
+        prefix_map = [
+            ("KXMLB", "MLB"),
+            ("KXNBA", "NBA"),
+            ("KXNFL", "NFL"),
+            ("KXNHL", "NHL"),
+            ("KXNCAAMB", "NCAAMB"),
+            ("KXNCAAWB", "NCAAWB"),
+            ("KXNCAABB", "NCAABB"),
+            ("KXNCAA", "NCAAMB"),  # Default NCAA to men's basketball
+            ("KXVALORANT", "VALORANT"),
+            ("KXLOL", "LOL"),
+            ("KXCS2", "CS2"),
+            ("KXCSGO", "CS2"),
+            ("KXATP", "TENNIS"),
+            ("KXWTA", "TENNIS"),
+            ("KXTENNIS", "TENNIS"),
+            ("KXLALI", "LALIGA"),
+            ("KXLALIGA", "LALIGA"),
+            ("KXBUND", "BUNDES"),
+            ("KXBUNDES", "BUNDES"),
+            ("KXSERI", "SERIEA"),
+            ("KXEPL", "EPL"),
+            ("KXSOCCER", "SOCCER"),
+            ("KXECUL", "ECUL"),
+            ("KXALEA", "ALEAGU"),
+            ("KXPGA", "PGA"),
+            ("KXGOLF", "GOLF"),
+            ("KXUFC", "MMA"),
+            ("KXMMA", "MMA"),
+            ("KXMVENBA", "MVENBA"),  # For blocklist detection
+            ("KXMVECBC", "MVECBC"),  # For blocklist detection
+        ]
+
+        for prefix, code in prefix_map:
+            if tk.startswith(prefix):
+                return code
+
+        return "OTHER"
+
+    def _is_blocklisted_sport(self, ticker: str) -> bool:
+        """Check if ticker matches any blocklisted sport prefix."""
+        tk = ticker.lower()
+        return any(tk.startswith(prefix) for prefix in self.SPORT_BLOCKLIST)
+
+    def _scale_confidence(self, ticker: str, raw_conf: float) -> float:
+        """Apply per-sport confidence scaling based on historical Brier.
+
+        Returns 0.0 for blocklisted sports (will be filtered by min_confidence).
+        Returns scaled confidence for known sports.
+        Returns raw_conf * 0.50 for unknown sports (conservative default).
+        """
+        if self._is_blocklisted_sport(ticker):
+            return 0.0
+
+        sport_code = self._detect_sport_code(ticker)
+        scale = self.SPORT_CONFIDENCE_SCALE.get(sport_code, 0.50)
+        return raw_conf * scale
+
+    # ─────────────────────────────────────────────────────────────────────
     # v11.4: MLB PLAYER PROP ROUTING
     # ─────────────────────────────────────────────────────────────────────
 
@@ -1636,10 +1778,16 @@ class SportsBot(BaseBot):
         if edge < MIN_EDGE_PCT:
             return True, None
 
+        # v12.2: Apply per-sport confidence scaling
+        scaled_conf = self._scale_confidence(ticker, prediction.confidence)
+        if scaled_conf <= 0.0:
+            logger.debug("[sports] %s blocklisted", ticker)
+            return True, None
+
         return True, BotSignal(
             sector      = self.sector_name,
             prob        = our_prob,
-            confidence  = prediction.confidence,
+            confidence  = scaled_conf,
             market_prob = market_prob,
             brier_score = 0.10,
         )
@@ -1651,7 +1799,16 @@ class SportsBot(BaseBot):
         If neither model can handle the market, return None instead of
         falling through to the flat-prior BayesianPolyModel which produces
         garbage our_p=0.452 on every unmodeled sport.
+
+        v12.2: Added blocklist check at the top to skip garbage leagues.
         """
+        ticker = market.get("ticker", "")
+
+        # v12.2: Check blocklist first — don't waste cycles on garbage leagues
+        if self._is_blocklisted_sport(ticker):
+            logger.debug("[sports] %s blocklisted (catastrophic Brier)", ticker)
+            return None
+
         handled, signal = self._try_mlb_player_prop(market)
         if handled:
             return signal
@@ -1750,10 +1907,16 @@ class SportsBot(BaseBot):
         if edge < MIN_EDGE_PCT:
             return True, None
 
+        # v12.2: Apply per-sport confidence scaling
+        scaled_conf = self._scale_confidence(ticker, prediction.confidence)
+        if scaled_conf <= 0.0:
+            logger.debug("[sports] %s blocklisted", ticker)
+            return True, None
+
         return True, BotSignal(
             sector      = self.sector_name,
             prob        = our_prob,
-            confidence  = prediction.confidence,
+            confidence  = scaled_conf,
             market_prob = market_prob,
             brier_score = 0.10,
         )
