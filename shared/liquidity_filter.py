@@ -70,6 +70,23 @@ class LiquidityFilter:
             "max_spread_pct": 0.15,
             "min_volume_24h": 50,
         },
+        # v12.5: Economics/financial markets typically have wider spreads
+        "economics": {
+            "max_spread_cents": 12,
+            "max_spread_pct": 0.25,
+            "min_volume_24h": 25,
+        },
+        "financial_markets": {
+            "max_spread_cents": 10,
+            "max_spread_pct": 0.20,
+            "min_volume_24h": 30,
+        },
+        # Default for unknown sectors — more permissive to avoid false skips
+        "unknown": {
+            "max_spread_cents": 12,
+            "max_spread_pct": 0.25,
+            "min_volume_24h": 20,
+        },
     }
     
     def __init__(

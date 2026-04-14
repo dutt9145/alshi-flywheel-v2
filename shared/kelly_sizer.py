@@ -103,19 +103,40 @@ def parse_expiry_time(market: dict) -> Optional[datetime]:
     Extract expiry/close time from a Kalshi market dict.
     
     Tries various field names that Kalshi might use.
+    Handles: datetime objects, ISO strings, epoch timestamps.
     """
     if market is None:
         return None
         
-    for field in ["close_time", "expiration_time", "end_date_time", "settle_time", "end_time"]:
+    for field in ["close_time", "expiration_time", "expected_expiration_time", "end_date_time", "settle_time", "end_time"]:
         raw = market.get(field)
         if raw:
             try:
                 if isinstance(raw, datetime):
                     return raw
-                # Try ISO format
+                    
+                # v3.1: Handle epoch timestamps (int or float)
+                if isinstance(raw, (int, float)):
+                    # Kalshi uses milliseconds for some fields
+                    if raw > 1e12:  # Milliseconds
+                        return datetime.fromtimestamp(raw / 1000, tz=timezone.utc)
+                    else:  # Seconds
+                        return datetime.fromtimestamp(raw, tz=timezone.utc)
+                
+                # Try ISO format strings
                 if isinstance(raw, str):
-                    # Handle various ISO formats
+                    # Try fromisoformat first (most robust)
+                    try:
+                        # Handle Z suffix
+                        clean = raw.replace("Z", "+00:00")
+                        dt = datetime.fromisoformat(clean)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt
+                    except ValueError:
+                        pass
+                    
+                    # Fall back to strptime for non-standard formats
                     for fmt in [
                         "%Y-%m-%dT%H:%M:%SZ",
                         "%Y-%m-%dT%H:%M:%S.%fZ",
@@ -192,6 +213,15 @@ def kelly_stake(
     # v3: Calculate time decay
     if expiry_time is None and market is not None:
         expiry_time = parse_expiry_time(market)
+    
+    # v3.1: Debug log for time decay diagnosis
+    if expiry_time is not None:
+        hours_out = (expiry_time - datetime.now(timezone.utc)).total_seconds() / 3600
+        logger.debug(
+            "[KELLY TIME] expiry=%s hours_out=%.1f",
+            expiry_time.isoformat()[:19], hours_out,
+        )
+    
     td_factor = time_decay_factor(expiry_time)
     
     if td_factor == 0.0:

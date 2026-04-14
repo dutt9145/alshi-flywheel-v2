@@ -323,6 +323,10 @@ class PinnacleReference:
         # Fetch Pinnacle odds
         events = self._fetch_player_props(sport, market)
         if not events:
+            logger.debug(
+                "[PINNACLE] %s: No Odds API data for %s/%s",
+                player_name, sport, market,
+            )
             return SharpCheckResult(
                 passes=True,
                 reason="No Pinnacle data available",
@@ -336,6 +340,10 @@ class PinnacleReference:
         # Find the specific player/line
         line_probs = self._find_player_line(events, player_name, line)
         if not line_probs:
+            logger.debug(
+                "[PINNACLE] %s @ %.1f: not found in %d events",
+                player_name, line, len(events),
+            )
             return SharpCheckResult(
                 passes=True,
                 reason=f"Player/line not found: {player_name} {line}",
@@ -481,10 +489,32 @@ class PinnacleReference:
         
         if ticker_upper.startswith("KXMLB"):
             sport = "mlb"
+            # v19.27: Expanded prop code recognition
+            # Note: TOTAL, F5TOTAL are game markets, not player props — skip Pinnacle
+            if "TOTAL" in ticker_upper or "F5" in ticker_upper:
+                # Game totals — not a player prop, skip Pinnacle
+                return SharpCheckResult(
+                    passes=True,
+                    reason="Game total market (not player prop)",
+                    our_prob=our_prob,
+                    sharp_prob=None,
+                    divergence=None,
+                    confidence_adjustment=1.0,
+                    sharp_direction=None,
+                )
             # Extract prop code: KXMLBPTS -> PTS, KXMLBHR -> HR
-            for code in ["PTS", "HR", "H", "RBI", "R", "TB", "K", "SO", "BB"]:
+            # v19.27: Added KS (strikeouts), HIT (hits), HRR (home runs)
+            for code in ["PTS", "HRR", "HR", "HIT", "H", "RBI", "R", "TB", "KS", "K", "SO", "BB"]:
                 if f"KXMLB{code}" in ticker_upper:
-                    prop_code = code
+                    # Map variant codes to standard
+                    if code == "HRR":
+                        prop_code = "HR"
+                    elif code == "HIT":
+                        prop_code = "H"
+                    elif code == "KS":
+                        prop_code = "K"  # Strikeouts
+                    else:
+                        prop_code = code
                     break
         elif ticker_upper.startswith("KXNBA"):
             sport = "nba"
@@ -494,6 +524,11 @@ class PinnacleReference:
                     break
         
         if not sport or not prop_code:
+            # v19.27: Log when we can't parse the ticker format
+            logger.debug(
+                "[PINNACLE] Can't parse ticker: %s (sport=%s, prop_code=%s)",
+                ticker[:35], sport, prop_code,
+            )
             return SharpCheckResult(
                 passes=True,
                 reason=f"Cannot parse ticker: {ticker[:30]}",
@@ -553,6 +588,12 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
+        
+        # v19.27: Log successful ticker parse for debugging
+        logger.debug(
+            "[PINNACLE] Parsed %s: sport=%s player=%s prop=%s line=%.1f",
+            ticker[:30], sport, player_name, prop_type, line,
+        )
         
         return self.check_player_prop(
             sport=sport,
