@@ -1411,6 +1411,13 @@ class SportsBot(BaseBot):
         "kxnba2hwinner",  # 28 signals — 2nd half winner
         "kxnbagame",      # 134 signals — game props
         "kxnbamention",   # 222 signals — broadcast mentions (unmodelable)
+        # v12.2: Esports — no real model, flat prior
+        "kxvalorant",     # 19 resolved, 0.2404 Brier
+        "kxlol",          # 9 resolved, 0.2272 Brier
+        "kxcs2",          # 4 resolved, 0.21 Brier
+        # v12.2: Bad NCAA — women's and generic college basketball
+        "kxncaawb",       # 10 resolved, 0.2667 Brier — women's
+        "kxncaabb",       # 6 resolved, 0.2559 Brier — generic CBB
     )
 
     KEYWORDS = [
