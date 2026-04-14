@@ -3,6 +3,12 @@ shared/circuit_breaker.py
 
 Daily P&L tracking, circuit breaker halt logic, and real-time bankroll sync.
 
+v2.1 changes
+------------
+- Fix: Use starting_bankroll for loss limit calculation, not synced bankroll
+- In DEMO mode, sync_bankroll() returns 0, which caused 15% of $0 = $0 limit
+- Now starting_bankroll is preserved and used for halt threshold
+
 The circuit breaker does three things:
   1. Tracks realized P&L per calendar day in the daily_pnl table
   2. Halts all new positions if daily loss exceeds CIRCUIT_BREAKER_PCT of bankroll
@@ -105,6 +111,10 @@ class CircuitBreaker:
     ):
         self.client               = kalshi_client
         self.bankroll             = bankroll
+        # v2.1: Preserve starting bankroll for loss limit calculation
+        # sync_bankroll() updates self.bankroll but NOT starting_bankroll
+        # This fixes DEMO mode where get_balance() returns 0
+        self.starting_bankroll    = bankroll
         self.daily_loss_limit_pct = daily_loss_limit_pct
         self._halted              = False
         self._halt_reason: Optional[str] = None
@@ -205,7 +215,10 @@ class CircuitBreaker:
             return
 
         daily_pnl   = float(rows[0]["realized_pnl"])
-        loss_limit  = -(self.bankroll * self.daily_loss_limit_pct)
+        # v2.1: Use starting_bankroll, not synced bankroll
+        # In DEMO mode, sync_bankroll() sets self.bankroll = 0
+        # but starting_bankroll stays at the initial value ($1000)
+        loss_limit  = -(self.starting_bankroll * self.daily_loss_limit_pct)
 
         if daily_pnl <= loss_limit:
             reason = (
@@ -232,12 +245,20 @@ class CircuitBreaker:
         Returns the updated bankroll. Falls back to stored value on error.
 
         Call this before every trade sizing — not just at 2am retrain.
+        
+        Note: This updates self.bankroll for trade sizing, but does NOT
+        update starting_bankroll which is used for loss limit calculation.
         """
         try:
-            balance       = self.client.get_balance()
-            self.bankroll = balance
-            logger.debug("Bankroll synced: $%.2f", balance)
-            return balance
+            balance = self.client.get_balance()
+            # v2.1: Only update bankroll if we got a real value
+            # In DEMO mode, balance may be 0 — don't update
+            if balance > 0:
+                self.bankroll = balance
+                logger.debug("Bankroll synced: $%.2f", balance)
+            else:
+                logger.debug("Bankroll sync returned $0, keeping $%.2f", self.bankroll)
+            return self.bankroll
         except Exception as e:
             logger.warning("Bankroll sync failed, using last known: $%.2f — %s",
                            self.bankroll, e)
