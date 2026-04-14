@@ -1418,6 +1418,11 @@ class SportsBot(BaseBot):
         # v12.2: Bad NCAA — women's and generic college basketball
         "kxncaawb",       # 10 resolved, 0.2667 Brier — women's
         "kxncaabb",       # 6 resolved, 0.2559 Brier — generic CBB
+        # v12.2: Tennis and soccer without real models
+        "kxatpchall",     # 5 resolved, 0.2648 Brier — ATP challenger
+        "kxatpsetwi",     # 2 resolved, 0.2503 Brier — ATP set winner
+        "kxbundesli",     # 4 resolved, 0.2654 Brier — Bundesliga
+        "kxaleagueg",     # 3 resolved, 0.2862 Brier — A-League games
     )
 
     KEYWORDS = [
