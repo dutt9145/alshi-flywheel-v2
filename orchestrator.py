@@ -1,5 +1,11 @@
 """
-orchestrator.py  (v19.23 — Liquidity filter, time-decay Kelly, correlation tracker)
+orchestrator.py  (v19.24 — Pinnacle sharp line reference)
+
+Changes vs v19.23:
+  1. Pinnacle sharp line check: Before executing sports trades, compare our
+     probability to Pinnacle's line via Odds API. Skip if divergence > 10%,
+     reduce confidence if > 5%, boost if aligned within 3%.
+  2. Integrated into _execute_trade for MLB/NBA player props.
 
 Changes vs v19.22:
   1. Liquidity filter: Skip thin/illiquid markets (spread > 8¢ or volume < 100).
@@ -92,9 +98,10 @@ from shared.correlation_engine import CorrelationEngine
 from shared.correlation_tracker import CorrelationTracker  # v19.23: Enhanced correlation
 from shared.fade_scanner import FadeScanner
 from shared.kalshi_client import KalshiClient
-from shared.kelly_sizer import kelly_stake, no_kelly_stake, parse_expiry_time  # v19.23: time-decay
+from shared.kelly_sizer import kelly_stake, no_kelly_stake  # v3: time-decay built-in
 from shared.liquidity_filter import LiquidityFilter  # v19.23: Liquidity filter
 from shared.news_signal import NewsSignal
+from shared.pinnacle_reference import PinnacleReference  # v19.24: Sharp line comparison
 from shared.resolution_timer import ResolutionTimer
 from shared.sharp_detector import SharpDetector
 from bots.sector_bots import all_bots
@@ -589,6 +596,12 @@ class FlywheelOrchestrator:
         # v19.23: Liquidity filter + enhanced correlation tracker
         self.liquidity_filter = LiquidityFilter(enabled=True)
         self.correlation_tracker = CorrelationTracker()
+        
+        # v19.24: Pinnacle sharp line reference
+        self.pinnacle = PinnacleReference(
+            api_key=os.getenv("ODDS_API_KEY", ""),
+            enabled=True,
+        )
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
@@ -1020,7 +1033,36 @@ class FlywheelOrchestrator:
                 lead_sector, resolved_count, (kf / KELLY_FRACTION) * 100,
             )
 
+        # v19.24: Pinnacle sharp line check (sports only)
+        pinnacle_adj = 1.0
+        if lead_sector == "sports" and not fade:
+            sharp_check = self.pinnacle.check_from_kalshi_ticker(
+                ticker=ticker,
+                our_prob=consensus.avg_prob,
+                our_direction=consensus.direction,
+            )
+            
+            if not sharp_check.passes:
+                logger.info(
+                    "PINNACLE VETO %s: %s (our=%.1f%% sharp=%.1f%% div=%+.1f%%)",
+                    ticker[:40], sharp_check.reason,
+                    consensus.avg_prob * 100,
+                    (sharp_check.sharp_prob or 0) * 100,
+                    (sharp_check.divergence or 0) * 100,
+                )
+                return
+            
+            pinnacle_adj = sharp_check.confidence_adjustment
+            if pinnacle_adj != 1.0:
+                logger.info(
+                    "[PINNACLE] %s: %s → conf adj %.2f",
+                    ticker[:35], sharp_check.reason, pinnacle_adj,
+                )
+
         sector_exp = self._exposure.get(lead_sector, 0.0)
+
+        # v19.24: Apply Pinnacle confidence adjustment to drawdown factor
+        effective_drawdown = drawdown_factor * pinnacle_adj
 
         # v19.23: Pass market dict for time-decay Kelly
         if consensus.direction == "YES":
@@ -1031,7 +1073,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,
+                drawdown_factor = effective_drawdown,  # v19.24: includes Pinnacle adj
                 market          = market,  # v19.23: time-decay
             )
             side = "yes"
@@ -1043,7 +1085,7 @@ class FlywheelOrchestrator:
                 sector          = lead_sector,
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
-                drawdown_factor = drawdown_factor,
+                drawdown_factor = effective_drawdown,  # v19.24: includes Pinnacle adj
                 market          = market,  # v19.23: time-decay
             )
             side = "no"
@@ -1503,7 +1545,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.23 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.24 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
