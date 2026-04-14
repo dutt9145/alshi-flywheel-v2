@@ -1,5 +1,13 @@
 """
-orchestrator.py  (v19.24 — Pinnacle sharp line reference)
+orchestrator.py  (v19.25 — Lineup checker + Weather ensemble)
+
+Changes vs v19.24:
+  1. Lineup checker: Before MLB/NBA player prop trades, verify the player is
+     actually in the starting lineup (MLB) or not injured/out (NBA). Skip if
+     player is scratched, on IL, or listed as OUT/DOUBTFUL.
+  2. Weather ensemble: Cross-check NOAA with Open-Meteo. When models agree
+     (within 2°F) → boost confidence. When they diverge (>5°F) → reduce
+     confidence. Integrated into weather sector trades.
 
 Changes vs v19.23:
   1. Pinnacle sharp line check: Before executing sports trades, compare our
@@ -99,11 +107,13 @@ from shared.correlation_tracker import CorrelationTracker  # v19.23: Enhanced co
 from shared.fade_scanner import FadeScanner
 from shared.kalshi_client import KalshiClient
 from shared.kelly_sizer import kelly_stake, no_kelly_stake  # v3: time-decay built-in
+from shared.lineup_checker import LineupChecker  # v19.25: Verify player in lineup
 from shared.liquidity_filter import LiquidityFilter  # v19.23: Liquidity filter
 from shared.news_signal import NewsSignal
 from shared.pinnacle_reference import PinnacleReference  # v19.24: Sharp line comparison
 from shared.resolution_timer import ResolutionTimer
 from shared.sharp_detector import SharpDetector
+from shared.weather_ensemble import WeatherEnsemble  # v19.25: NOAA + Open-Meteo
 from bots.sector_bots import all_bots
 
 # v19.17: Going-live safety + tracking
@@ -602,6 +612,10 @@ class FlywheelOrchestrator:
             api_key=os.getenv("ODDS_API_KEY", ""),
             enabled=True,
         )
+        
+        # v19.25: Lineup checker + weather ensemble
+        self.lineup_checker = LineupChecker(enabled=True)
+        self.weather_ensemble = WeatherEnsemble(enabled=True)
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
@@ -1057,6 +1071,25 @@ class FlywheelOrchestrator:
                 logger.info(
                     "[PINNACLE] %s: %s → conf adj %.2f",
                     ticker[:35], sharp_check.reason, pinnacle_adj,
+                )
+
+        # v19.25: Lineup checker (sports player props only)
+        if lead_sector == "sports" and not fade:
+            lineup_check = self.lineup_checker.check_from_kalshi_ticker(ticker)
+            
+            if not lineup_check.is_active:
+                logger.info(
+                    "LINEUP VETO %s: %s (status=%s)",
+                    ticker[:40], lineup_check.reason, lineup_check.status,
+                )
+                return
+            
+            if lineup_check.status == "questionable":
+                # Player is questionable — reduce confidence
+                pinnacle_adj *= 0.7
+                logger.info(
+                    "[LINEUP] %s: %s → additional conf penalty",
+                    ticker[:35], lineup_check.reason,
                 )
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
@@ -1545,7 +1578,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.24 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.25 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
