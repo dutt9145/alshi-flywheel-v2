@@ -1,5 +1,10 @@
 """
-shared/nba_stats_fetcher.py  (v9.1 — Jr/Sr suffix handling)
+shared/nba_stats_fetcher.py  (v9.2 — Jr./Sr. period handling fix)
+
+v9.2 changes
+------------
+- Fix: Strip trailing periods before suffix matching (JR. → JR)
+- Fixes Kelly Oubre Jr., Wendell Carter Jr. not being found
 
 v9.1 changes
 ------------
@@ -122,16 +127,19 @@ def _strip_name_suffix(name_parts: list[str]) -> list[str]:
     """
     Remove Jr/Sr/II/III/IV/V suffixes from name parts.
     Handles both separate tokens ("CARTER", "JR") and joined ("CARTERJR").
+    v9.2: Also handles periods (JR. → JR)
     """
     if not name_parts or len(name_parts) < 2:
         return name_parts
     
-    # Case 1: Suffix is separate token — ["WENDELL", "CARTER", "JR"]
-    if name_parts[-1] in _NAME_SUFFIXES:
+    # v9.2: Strip trailing periods before suffix matching
+    last = name_parts[-1].rstrip('.')
+    
+    # Case 1: Suffix is separate token — ["WENDELL", "CARTER", "JR"] or "JR."
+    if last in _NAME_SUFFIXES:
         return name_parts[:-1]
     
     # Case 2: Suffix joined to last name — ["WENDELL", "CARTERJR"]
-    last = name_parts[-1]
     for suf in ("III", "JR", "SR", "II", "IV", "V"):  # III before II to match longest first
         if last.endswith(suf) and len(last) > len(suf) + 1:
             name_parts = name_parts.copy()
