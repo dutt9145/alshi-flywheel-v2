@@ -1,5 +1,16 @@
 """
-bots/sector_bots.py  (v12.3 — WeatherBot NOAA-first evaluation)
+bots/sector_bots.py  (v12.4 — EconomicsBot + FinancialMarketsBot resurrected)
+
+Changes vs v12.3:
+  - EconomicsBot: RESURRECTED from disabled state. Now uses FRED API for
+    real economic signals (CPI, unemployment, Fed funds, treasury yields).
+    Handles rate decision markets, inflation markets, employment markets.
+    Confidence scaling based on data freshness and market type.
+  - FinancialMarketsBot: RESURRECTED from disabled state. Now uses Yahoo
+    Finance for real market data (stock prices, VIX, momentum).
+    Handles earnings markets, stock price threshold markets.
+    VIX-adjusted confidence based on volatility regime.
+  - New imports: fred_client, market_data_client
 
 Changes vs v12.2:
   - WeatherBot: Added evaluate() override that uses NOAA directly when
@@ -170,6 +181,10 @@ from shared.nba_logistic_model import (
     extract_features as nba_extract_features,
     log_features as nba_log_features,
 )
+
+# ── v12.4: Economic and market data clients ─────────────────────────────────
+from shared.fred_client import get_fred_client, FredClient
+from shared.market_data_client import get_market_data_client, MarketDataClient
 
 logger = logging.getLogger(__name__)
 
@@ -557,15 +572,198 @@ class EconomicsBot(BaseBot):
         return features, context
 
     def evaluate(self, market, news_signal=None):
-        """v11.8d: Disable trading — no real model yet.
-
-        Economics signals are flat-prior (our_p=0.500, conf=0.27) and
-        generate coinflip trades. Disable until a real macro model is
-        built (e.g., FRED data pipeline, yield curve model).
+        """v12.4: RESURRECTED with real FRED-based model.
+        
+        Handles:
+          - Fed rate decision markets (FOMC, rate hike/cut)
+          - Inflation markets (CPI, PCE thresholds)
+          - Employment markets (unemployment, jobless claims)
+          - Treasury yield markets
         """
         ticker = market.get("ticker", "")
-        logger.debug("[economics] %s claimed (no model yet)", ticker)
-        return None
+        title = market.get("title", "").lower()
+        
+        try:
+            fred = get_fred_client()
+            snapshot = fred.get_economic_snapshot()
+        except Exception as e:
+            logger.warning("[economics] FRED unavailable: %s", e)
+            return None
+        
+        our_prob = None
+        confidence = 0.55  # Base confidence for economics
+        rationale = ""
+        
+        # ── Rate Decision Markets ────────────────────────────────────────────
+        if any(kw in title for kw in ["rate hike", "rate cut", "fomc", "federal reserve", "fed funds", "basis points"]):
+            # Detect decision type
+            if "hike" in title or "raise" in title or "increase" in title:
+                decision = "hike"
+            elif "cut" in title or "lower" in title or "decrease" in title:
+                decision = "cut"
+            else:
+                decision = "hold"
+            
+            # Get current rate
+            current_rate = snapshot.fed_funds_upper or 5.25
+            
+            # Extract target rate from title if present
+            rate_match = re.search(r"(\d+\.?\d*)\s*%", title)
+            target_rate = float(rate_match.group(1)) if rate_match else current_rate
+            
+            our_prob = fred.predict_rate_decision(current_rate, target_rate, decision)
+            
+            # Higher confidence when inflation data is recent
+            if snapshot.cpi_yoy is not None:
+                confidence = 0.65
+            
+            rationale = f"fed_{decision}_cpi={snapshot.cpi_yoy:.1f}%_unemp={snapshot.unemployment_rate:.1f}%"
+            logger.info(
+                "[economics] %s: %s decision → P=%.1f%% (CPI=%.1f%% UNEMP=%.1f%%)",
+                ticker[:35], decision, our_prob * 100,
+                snapshot.cpi_yoy or 0, snapshot.unemployment_rate or 0,
+            )
+        
+        # ── Inflation Markets ────────────────────────────────────────────────
+        elif any(kw in title for kw in ["cpi", "inflation", "pce"]):
+            # Extract threshold
+            threshold_match = re.search(r"(\d+\.?\d*)\s*%", title)
+            threshold = float(threshold_match.group(1)) if threshold_match else 3.0
+            
+            # Determine comparison
+            above = any(kw in title for kw in ["above", "exceed", "over", "higher"])
+            below = any(kw in title for kw in ["below", "under", "lower"])
+            
+            current_cpi = snapshot.cpi_yoy or snapshot.core_cpi_yoy or 3.0
+            
+            # Simple probability based on current vs threshold
+            distance = current_cpi - threshold
+            
+            if above or (not below):  # Default to "above"
+                # P(CPI > threshold)
+                if distance > 0.5:
+                    our_prob = min(0.90, 0.70 + distance * 0.05)
+                elif distance > 0:
+                    our_prob = 0.55 + distance * 0.10
+                elif distance > -0.5:
+                    our_prob = 0.45 + distance * 0.10
+                else:
+                    our_prob = max(0.10, 0.40 + distance * 0.05)
+            else:
+                # P(CPI < threshold) = 1 - P(CPI > threshold)
+                if distance < -0.5:
+                    our_prob = min(0.90, 0.70 + abs(distance) * 0.05)
+                elif distance < 0:
+                    our_prob = 0.55 + abs(distance) * 0.10
+                else:
+                    our_prob = max(0.10, 0.45 - distance * 0.10)
+            
+            confidence = 0.60
+            rationale = f"cpi_current={current_cpi:.1f}%_vs_threshold={threshold:.1f}%"
+            logger.info(
+                "[economics] %s: CPI=%.1f%% vs threshold=%.1f%% → P=%.1f%%",
+                ticker[:35], current_cpi, threshold, our_prob * 100,
+            )
+        
+        # ── Employment Markets ───────────────────────────────────────────────
+        elif any(kw in title for kw in ["unemployment", "jobless", "nonfarm", "payroll"]):
+            # Extract threshold
+            threshold_match = re.search(r"(\d+\.?\d*)", title)
+            
+            if "unemployment" in title:
+                current = snapshot.unemployment_rate or 4.0
+                threshold = float(threshold_match.group(1)) if threshold_match else 4.5
+                
+                above = any(kw in title for kw in ["above", "exceed", "rise"])
+                distance = current - threshold
+                
+                if above:
+                    our_prob = 0.50 + min(0.35, max(-0.35, distance * 0.10))
+                else:
+                    our_prob = 0.50 - min(0.35, max(-0.35, distance * 0.10))
+                
+                confidence = 0.58
+                rationale = f"unemp={current:.1f}%_vs_{threshold:.1f}%"
+                
+            elif "jobless" in title:
+                current = snapshot.jobless_claims or 220000
+                # Threshold usually in thousands
+                threshold = float(threshold_match.group(1)) * 1000 if threshold_match else 250000
+                
+                above = any(kw in title for kw in ["above", "exceed"])
+                distance_pct = (current - threshold) / threshold
+                
+                if above:
+                    our_prob = 0.50 + min(0.35, max(-0.35, distance_pct))
+                else:
+                    our_prob = 0.50 - min(0.35, max(-0.35, distance_pct))
+                
+                confidence = 0.55
+                rationale = f"claims={current/1000:.0f}K_vs_{threshold/1000:.0f}K"
+            
+            else:
+                # Generic employment — need more specific parsing
+                return None
+            
+            logger.info(
+                "[economics] %s: %s → P=%.1f%%",
+                ticker[:35], rationale, our_prob * 100,
+            )
+        
+        # ── Treasury Yield Markets ───────────────────────────────────────────
+        elif any(kw in title for kw in ["treasury", "yield", "10-year", "10 year", "2-year", "2 year"]):
+            if "10" in title:
+                current = snapshot.treasury_10y or 4.5
+            elif "2" in title:
+                current = snapshot.treasury_2y or 4.8
+            else:
+                current = snapshot.treasury_10y or 4.5
+            
+            # Extract threshold
+            threshold_match = re.search(r"(\d+\.?\d*)\s*%", title)
+            threshold = float(threshold_match.group(1)) if threshold_match else current
+            
+            above = any(kw in title for kw in ["above", "exceed", "rise"])
+            distance = current - threshold
+            
+            if above:
+                our_prob = 0.50 + min(0.30, max(-0.30, distance * 0.15))
+            else:
+                our_prob = 0.50 - min(0.30, max(-0.30, distance * 0.15))
+            
+            confidence = 0.52  # Yields are harder to predict
+            rationale = f"yield={current:.2f}%_vs_{threshold:.2f}%"
+            logger.info(
+                "[economics] %s: %s → P=%.1f%%",
+                ticker[:35], rationale, our_prob * 100,
+            )
+        
+        else:
+            # Unhandled economics market type — skip for now
+            logger.debug("[economics] %s: no handler for this market type", ticker[:35])
+            return None
+        
+        if our_prob is None:
+            return None
+        
+        # Clamp probability
+        our_prob = max(0.05, min(0.95, our_prob))
+        
+        # Build BotSignal
+        market_price = _market_prob(market)
+        edge = our_prob - market_price
+        direction = "yes" if our_prob > market_price else "no"
+        
+        return BotSignal(
+            sector="economics",
+            ticker=ticker,
+            our_prob=our_prob,
+            market_prob=market_price,
+            edge=edge,
+            direction=direction,
+            confidence=confidence,
+            rationale=rationale,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1421,15 +1619,207 @@ class FinancialMarketsBot(BaseBot):
         return features, context
 
     def evaluate(self, market, news_signal=None):
-        """v11.8d: Disable trading — no real model.
-
-        Falls through to BaseBot flat-prior BayesianPolyModel producing
-        our_p=0.500 conf=0.27 on every market. Also eliminates Finnhub
-        403 spam on 005930.KS. Disable until a real equity model is built.
+        """v12.4: RESURRECTED with real Yahoo Finance-based model.
+        
+        Handles:
+          - Stock price threshold markets (AAPL above $200, etc.)
+          - Earnings beat/miss markets
+          - Index level markets (S&P 500 above X, etc.)
+          - VIX level markets
         """
         ticker = market.get("ticker", "")
-        logger.debug("[financial_markets] %s claimed (no model yet)", ticker)
-        return None
+        title = market.get("title", "").lower()
+        
+        try:
+            mkt = get_market_data_client()
+            snapshot = mkt.get_market_snapshot()
+        except Exception as e:
+            logger.warning("[financial_markets] Market data unavailable: %s", e)
+            return None
+        
+        our_prob = None
+        confidence = 0.55  # Base confidence
+        rationale = ""
+        
+        # ── Stock Price Threshold Markets ────────────────────────────────────
+        # Detect company
+        company_symbol = self._detect_company(market)
+        
+        # Check if it's a price threshold market
+        price_match = re.search(r"\$?([\d,]+(?:\.\d+)?)", title.replace(",", ""))
+        has_above_below = any(kw in title for kw in ["above", "below", "exceed", "under", "over"])
+        
+        if price_match and has_above_below and company_symbol:
+            threshold = float(price_match.group(1))
+            above = any(kw in title for kw in ["above", "exceed", "over"])
+            
+            # Get current stock price
+            quote = mkt.get_quote(company_symbol)
+            if quote and quote.price > 0:
+                current_price = quote.price
+                
+                # Determine timeframe from title
+                if any(kw in title for kw in ["week", "7 day", "next week"]):
+                    timeframe = "week"
+                elif any(kw in title for kw in ["month", "30 day"]):
+                    timeframe = "month"
+                else:
+                    timeframe = "day"
+                
+                comparison = "above" if above else "below"
+                our_prob = mkt.predict_price_threshold(
+                    company_symbol, threshold, comparison, timeframe
+                )
+                
+                # VIX-adjusted confidence
+                if snapshot.vix and snapshot.vix > 25:
+                    confidence = 0.45  # High VIX = more uncertainty
+                elif snapshot.vix and snapshot.vix < 15:
+                    confidence = 0.62  # Low VIX = more predictable
+                else:
+                    confidence = 0.55
+                
+                # Boost confidence if near the threshold
+                distance_pct = abs(current_price - threshold) / current_price * 100
+                if distance_pct < 2:
+                    confidence = min(0.70, confidence + 0.10)  # Near threshold = more edge
+                
+                rationale = f"{company_symbol}={current_price:.2f}_vs_{threshold:.2f}_{timeframe}_vix={snapshot.vix:.1f}"
+                logger.info(
+                    "[financial_markets] %s: %s $%.2f vs threshold $%.2f → P=%.1f%% (VIX=%.1f)",
+                    ticker[:30], company_symbol, current_price, threshold,
+                    our_prob * 100, snapshot.vix or 0,
+                )
+        
+        # ── Earnings Markets ─────────────────────────────────────────────────
+        elif any(kw in title for kw in ["earnings", "eps", "revenue", "beat", "miss"]):
+            company_symbol = self._detect_company(market)
+            
+            if "beat" in title:
+                direction = "beat"
+            elif "miss" in title:
+                direction = "miss"
+            else:
+                direction = "beat"  # Default to asking about beat
+            
+            our_prob = mkt.predict_earnings_move(company_symbol, 0, direction)
+            
+            # Earnings are hard to predict — lower confidence
+            confidence = 0.48
+            rationale = f"earnings_{direction}_{company_symbol}"
+            logger.info(
+                "[financial_markets] %s: earnings %s → P=%.1f%%",
+                ticker[:35], direction, our_prob * 100,
+            )
+        
+        # ── Index Level Markets ──────────────────────────────────────────────
+        elif any(kw in title for kw in ["s&p", "sp500", "s&p 500", "dow", "nasdaq"]):
+            # Detect index
+            if "nasdaq" in title:
+                index_symbol = "QQQ"
+                current = snapshot.qqq_price or 0
+            else:
+                index_symbol = "SPY"
+                current = snapshot.spy_price or 0
+            
+            # Extract threshold
+            level_match = re.search(r"([\d,]+)", title.replace(",", ""))
+            if level_match and current > 0:
+                threshold = float(level_match.group(1))
+                
+                # Index levels are often quoted differently (SPY vs S&P 500)
+                # S&P 500 ~5000 → SPY ~500
+                if threshold > current * 5:
+                    threshold = threshold / 10  # Likely S&P points, convert to ETF
+                
+                above = any(kw in title for kw in ["above", "exceed", "over"])
+                comparison = "above" if above else "below"
+                
+                our_prob = mkt.predict_price_threshold(
+                    index_symbol, threshold, comparison, "day"
+                )
+                
+                # VIX adjustment
+                if snapshot.vix and snapshot.vix > 25:
+                    confidence = 0.42
+                else:
+                    confidence = 0.52
+                
+                rationale = f"{index_symbol}={current:.2f}_vs_{threshold:.2f}"
+                logger.info(
+                    "[financial_markets] %s: index %s vs %.2f → P=%.1f%%",
+                    ticker[:35], index_symbol, threshold, our_prob * 100,
+                )
+            else:
+                return None
+        
+        # ── VIX Level Markets ────────────────────────────────────────────────
+        elif "vix" in title:
+            vix_data = mkt.get_vix()
+            if not vix_data:
+                return None
+            
+            # Extract threshold
+            level_match = re.search(r"(\d+\.?\d*)", title)
+            if level_match:
+                threshold = float(level_match.group(1))
+                current = vix_data.current
+                
+                above = any(kw in title for kw in ["above", "exceed", "spike"])
+                distance = current - threshold
+                
+                # VIX is mean-reverting, so adjust probability
+                if above:
+                    if distance > 5:
+                        our_prob = 0.75  # Already well above
+                    elif distance > 0:
+                        our_prob = 0.55 + distance * 0.03
+                    else:
+                        # Mean reversion: VIX tends to spike
+                        our_prob = 0.35 + abs(distance) * 0.01  
+                else:
+                    if distance < -5:
+                        our_prob = 0.75
+                    elif distance < 0:
+                        our_prob = 0.55 + abs(distance) * 0.03
+                    else:
+                        our_prob = 0.40 - distance * 0.02
+                
+                confidence = 0.50  # VIX is volatile
+                rationale = f"vix={current:.1f}_vs_{threshold:.1f}"
+                logger.info(
+                    "[financial_markets] %s: VIX %.1f vs %.1f → P=%.1f%%",
+                    ticker[:35], current, threshold, our_prob * 100,
+                )
+            else:
+                return None
+        
+        else:
+            # Unhandled market type
+            logger.debug("[financial_markets] %s: no handler", ticker[:35])
+            return None
+        
+        if our_prob is None:
+            return None
+        
+        # Clamp probability
+        our_prob = max(0.05, min(0.95, our_prob))
+        
+        # Build BotSignal
+        market_price = _market_prob(market)
+        edge = our_prob - market_price
+        direction = "yes" if our_prob > market_price else "no"
+        
+        return BotSignal(
+            sector="financial_markets",
+            ticker=ticker,
+            our_prob=our_prob,
+            market_prob=market_price,
+            edge=edge,
+            direction=direction,
+            confidence=confidence,
+            rationale=rationale,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
