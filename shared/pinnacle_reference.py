@@ -206,7 +206,7 @@ class PinnacleReference:
             data = resp.json()
             self._set_cache(cache_key, data)
             
-            logger.debug(
+            logger.info(
                 "[PINNACLE] Fetched %d events for %s/%s",
                 len(data), sport_key, market,
             )
@@ -323,7 +323,7 @@ class PinnacleReference:
         # Fetch Pinnacle odds
         events = self._fetch_player_props(sport, market)
         if not events:
-            logger.debug(
+            logger.info(
                 "[PINNACLE] %s: No Odds API data for %s/%s",
                 player_name, sport, market,
             )
@@ -340,7 +340,7 @@ class PinnacleReference:
         # Find the specific player/line
         line_probs = self._find_player_line(events, player_name, line)
         if not line_probs:
-            logger.debug(
+            logger.info(
                 "[PINNACLE] %s @ %.1f: not found in %d events",
                 player_name, line, len(events),
             )
@@ -524,8 +524,8 @@ class PinnacleReference:
                     break
         
         if not sport or not prop_code:
-            # v19.27: Log when we can't parse the ticker format
-            logger.debug(
+            # v1.1: Log at INFO when we can't parse the ticker format
+            logger.info(
                 "[PINNACLE] Can't parse ticker: %s (sport=%s, prop_code=%s)",
                 ticker[:35], sport, prop_code,
             )
@@ -589,9 +589,9 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # v19.27: Log successful ticker parse for debugging
-        logger.debug(
-            "[PINNACLE] Parsed %s: sport=%s player=%s prop=%s line=%.1f",
+        # v1.1: Log successful ticker parse at INFO
+        logger.info(
+            "[PINNACLE] Checking %s: sport=%s player=%s prop=%s line=%.1f",
             ticker[:30], sport, player_name, prop_type, line,
         )
         
