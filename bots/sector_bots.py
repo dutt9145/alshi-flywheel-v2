@@ -1,5 +1,14 @@
 """
-bots/sector_bots.py  (v12.2 — Sports per-sport confidence scaling)
+bots/sector_bots.py  (v12.3 — WeatherBot NOAA-first evaluation)
+
+Changes vs v12.2:
+  - WeatherBot: Added evaluate() override that uses NOAA directly when
+    NOAA confidence >= 0.60, bypassing the poisoned Bayesian model.
+    The Bayesian prior was pushed to ~3% by duplicate signals and
+    misattributed outcomes, causing our_p=0.069 when NOAA said P(YES)=0.93.
+    Now NOAA-confident markets get our_p=noaa_prior directly.
+  - WeatherBot: When NOAA is unavailable or low confidence, returns None
+    instead of falling back to poisoned Bayesian model.
 
 Changes vs v12.1:
   - SportsBot: Added SPORT_CONFIDENCE_SCALE dict for per-sport calibration.
@@ -106,7 +115,7 @@ from typing import Optional
 
 import numpy as np
 
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, _market_prob
 from shared.data_fetchers import (
     fetch_economics_features, fetch_crypto_features, fetch_politics_features,
     fetch_weather_features, fetch_tech_features, fetch_sports_features,
@@ -843,6 +852,9 @@ class WeatherBot(BaseBot):
     keywords and getting NOAA priors applied to sports markets.
 
     v11.8: Added kxt20, kxhighinfl, kxfestival, kxthevoice.
+    
+    v12.3: Added evaluate() override that uses NOAA directly when NOAA
+    confidence >= 0.60, bypassing the poisoned Bayesian model.
     """
 
     # ── Non-weather prefix blocklist — defense in depth ────────────────────────
@@ -1230,6 +1242,51 @@ class WeatherBot(BaseBot):
             context["noaa_summary"]    = "skipped during ingestion"
 
         return features, context
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # v12.3: NOAA-FIRST EVALUATION — bypasses poisoned Bayesian model
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def evaluate(self, market, news_signal=None):
+        """v12.3: NOAA-first evaluation — bypass Bayesian model when NOAA is confident.
+        
+        The Bayesian model prior was poisoned to ~3% by duplicate signals and
+        misattributed outcomes. Use NOAA directly when NOAA confidence >= 0.60
+        (covers temp_high, temp_low, precip, snow markets).
+        
+        This ensures P(YES)=0.93 from NOAA becomes our_p=0.93, not our_p=0.069.
+        """
+        if not self.is_relevant(market):
+            return None
+        
+        ticker = market.get("ticker", "")
+        
+        # Try NOAA first
+        noaa = self._get_noaa_prior(market)
+        
+        if noaa and noaa.get("confidence", 0) >= 0.60:
+            # NOAA is confident — use it directly, bypass Bayesian model
+            our_prob    = noaa["prior_yes"]
+            market_prob = _market_prob(market)
+            confidence  = noaa["confidence"]
+            
+            logger.info(
+                "[weather/NOAA] %s | %s | our_p=%.3f mkt_p=%.3f conf=%.2f | %s",
+                ticker, noaa.get("city", "?"), our_prob, market_prob,
+                confidence, noaa.get("noaa_summary", ""),
+            )
+            
+            return BotSignal(
+                sector      = self.sector_name,
+                prob        = our_prob,
+                confidence  = confidence,
+                market_prob = market_prob,
+                brier_score = 0.15,  # Conservative until calibrated
+            )
+        
+        # NOAA unavailable or low confidence — skip instead of using poisoned Bayesian
+        logger.debug("[weather] %s — NOAA unavailable/low conf, skipping", ticker)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1721,14 +1778,9 @@ class SportsBot(BaseBot):
     # ─────────────────────────────────────────────────────────────────────
 
     def _detect_sport_code(self, ticker: str) -> str:
-        """Extract sport code from ticker for confidence scaling.
-
-        Maps ticker prefixes to sport codes used in SPORT_CONFIDENCE_SCALE.
-        Returns uppercase sport code or "OTHER" if not recognized.
-        """
+        """Extract sport code from ticker for confidence scaling."""
         tk = ticker.upper()
 
-        # Direct prefix mappings (order matters — more specific first)
         prefix_map = [
             ("KXMLB", "MLB"),
             ("KXNBA", "NBA"),
@@ -1737,7 +1789,7 @@ class SportsBot(BaseBot):
             ("KXNCAAMB", "NCAAMB"),
             ("KXNCAAWB", "NCAAWB"),
             ("KXNCAABB", "NCAABB"),
-            ("KXNCAA", "NCAAMB"),  # Default NCAA to men's basketball
+            ("KXNCAA", "NCAAMB"),
             ("KXVALORANT", "VALORANT"),
             ("KXLOL", "LOL"),
             ("KXCS2", "CS2"),
@@ -1758,8 +1810,8 @@ class SportsBot(BaseBot):
             ("KXGOLF", "GOLF"),
             ("KXUFC", "MMA"),
             ("KXMMA", "MMA"),
-            ("KXMVENBA", "MVENBA"),  # For blocklist detection
-            ("KXMVECBC", "MVECBC"),  # For blocklist detection
+            ("KXMVENBA", "MVENBA"),
+            ("KXMVECBC", "MVECBC"),
         ]
 
         for prefix, code in prefix_map:
@@ -1774,12 +1826,7 @@ class SportsBot(BaseBot):
         return any(tk.startswith(prefix) for prefix in self.SPORT_BLOCKLIST)
 
     def _scale_confidence(self, ticker: str, raw_conf: float) -> float:
-        """Apply per-sport confidence scaling based on historical Brier.
-
-        Returns 0.0 for blocklisted sports (will be filtered by min_confidence).
-        Returns scaled confidence for known sports.
-        Returns raw_conf * 0.50 for unknown sports (conservative default).
-        """
+        """Apply per-sport confidence scaling based on historical Brier."""
         if self._is_blocklisted_sport(ticker):
             return 0.0
 
@@ -1792,23 +1839,11 @@ class SportsBot(BaseBot):
     # ─────────────────────────────────────────────────────────────────────
 
     def _try_mlb_player_prop(self, market: dict):
-        """Route MLB player prop markets through the new hit-rate model.
-
-        Returns a tuple (handled, signal):
-          handled=False → couldn't process, caller should fall through to base class
-          handled=True, signal=None → processed successfully but edge too small, SKIP
-          handled=True, signal=BotSignal → processed successfully, emit signal
-
-        The critical invariant: once we successfully compute a prediction, we
-        NEVER fall through to the flat-prior base class path. A "no edge"
-        answer from a real model is still correct; substituting a flat prior
-        for it would corrupt the signal.
-        """
+        """Route MLB player prop markets through the new hit-rate model."""
         ticker = market.get("ticker", "")
         if not ticker.startswith("KXMLB"):
             return False, None
 
-        # Game-level MLB markets (TOTAL, SPREAD, F5, futures) → base class path
         if is_mlb_non_player_prop_market(ticker):
             return False, None
 
@@ -1831,12 +1866,9 @@ class SportsBot(BaseBot):
                          parsed.player_jersey, parsed.player_team_code)
             return False, None
 
-        # Fetch stats — different path for batters vs pitchers
-        # v11.8: Set home_team_id so the model can look up park factors
         home_team_info = MLB_TEAMS.get(parsed.home_team_code)
         parsed.home_team_id = home_team_info[0] if home_team_info else None
 
-        # v12: Init variables for both branches (needed for feature logging)
         season = rolling = pitcher = opp_pitcher_stats = None
 
         if parsed.prop_code == "KS":
@@ -1850,20 +1882,16 @@ class SportsBot(BaseBot):
                 return False, None
             rolling = fetch_batter_rolling(player.player_id, n_games=10)
 
-            # v11.7: Wire opposing pitcher context into batter predictions
             try:
-                # Determine opponent team
                 opp_code = (parsed.away_team_code
                             if parsed.player_team_code == parsed.home_team_code
                             else parsed.home_team_code)
                 opp_team_info = MLB_TEAMS.get(opp_code)
                 if opp_team_info:
-                    # Extract game date from ticker: KXMLB...-26APR092140COLSD-...
                     game_date = _extract_mlb_game_date(ticker)
                     if game_date:
                         opp_pitcher_stats = fetch_opposing_pitcher(game_date, opp_team_info[0])
                         if opp_pitcher_stats:
-                            # v12.2: Log pitcher hand for platoon debugging
                             logger.debug(
                                 "[sports/mlb] %s (%s) facing pitcher (%s) K/9=%.1f",
                                 player.full_name,
@@ -1879,14 +1907,11 @@ class SportsBot(BaseBot):
         if not prediction:
             return False, None
 
-        # ── We have a valid model prediction — COMMIT to it ──────────────
-        from bots.base_bot import _market_prob
         market_prob = _market_prob(market)
         our_prob    = prediction.prob_yes
         edge        = abs(our_prob - market_prob)
         direction   = "YES" if our_prob > market_prob else "NO"
 
-        # v12: Log features for logistic regression training data
         try:
             from shared.mlb_stats_fetcher import PARK_FACTORS
             _park = PARK_FACTORS.get(parsed.home_team_id, 1.0) if parsed.home_team_id else 1.0
@@ -1899,21 +1924,17 @@ class SportsBot(BaseBot):
             if _fv:
                 mlb_log_features(ticker, player.full_name, _fv, our_prob)
         except Exception:
-            pass  # never block trading on logging failure
+            pass
 
-        # v11.8d: Changed from INFO to DEBUG to reduce Railway log volume.
         logger.debug(
             "[sports/mlb] %s | %s | our_p=%.3f mkt_p=%.3f edge=%+.3f dir=%s conf=%.2f",
             ticker, player.full_name, our_prob, market_prob,
             our_prob - market_prob, direction, prediction.confidence,
         )
 
-        # Below edge threshold: return (handled, None) so we skip cleanly
-        # without falling through to the flat-prior path.
         if edge < MIN_EDGE_PCT:
             return True, None
 
-        # v12.2: Apply per-sport confidence scaling
         scaled_conf = self._scale_confidence(ticker, prediction.confidence)
         if scaled_conf <= 0.0:
             logger.debug("[sports] %s blocklisted", ticker)
@@ -1928,18 +1949,9 @@ class SportsBot(BaseBot):
         )
 
     def evaluate(self, market, news_signal=None):
-        """Override BaseBot.evaluate() to try player prop models first.
-
-        Order: MLB → NBA → silence.
-        If neither model can handle the market, return None instead of
-        falling through to the flat-prior BayesianPolyModel which produces
-        garbage our_p=0.452 on every unmodeled sport.
-
-        v12.2: Added blocklist check at the top to skip garbage leagues.
-        """
+        """Override BaseBot.evaluate() to try player prop models first."""
         ticker = market.get("ticker", "")
 
-        # v12.2: Check blocklist first — don't waste cycles on garbage leagues
         if self._is_blocklisted_sport(ticker):
             logger.debug("[sports] %s blocklisted (catastrophic Brier)", ticker)
             return None
@@ -1952,8 +1964,6 @@ class SportsBot(BaseBot):
         if handled:
             return signal
 
-        # v11.7: No model for this market → stay silent.
-        # Don't fall through to base class flat prior.
         return None
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1961,20 +1971,11 @@ class SportsBot(BaseBot):
     # ─────────────────────────────────────────────────────────────────────
 
     def _try_nba_player_prop(self, market: dict):
-        """Route NBA player prop markets through the Poisson/Binomial model.
-
-        Same (handled, signal) tuple pattern as MLB:
-          handled=False → couldn't process, fall through to base class
-          handled=True, signal=None → processed but edge too small, skip
-          handled=True, signal=BotSignal → processed, emit signal
-
-        v12: Now logs features for logreg training (mirrors MLB pipeline).
-        """
+        """Route NBA player prop markets through the Poisson/Binomial model."""
         ticker = market.get("ticker", "")
         if not ticker.upper().startswith("KXNBA"):
             return False, None
 
-        # Game-level NBA markets → base class path
         if is_nba_non_player_prop_market(ticker):
             return False, None
 
@@ -2013,14 +2014,11 @@ class SportsBot(BaseBot):
                          player.full_name, parsed.prop_code, parsed.threshold)
             return False, None
 
-        # ── We have a valid model prediction — COMMIT to it ──────────────
-        from bots.base_bot import _market_prob
         market_prob = _market_prob(market)
         our_prob    = prediction.prob_yes
         edge        = abs(our_prob - market_prob)
         direction   = "YES" if our_prob > market_prob else "NO"
 
-        # v12: Log features for logistic regression training data
         try:
             nba_features = nba_extract_features(
                 parsed=parsed,
@@ -2042,7 +2040,6 @@ class SportsBot(BaseBot):
         if edge < MIN_EDGE_PCT:
             return True, None
 
-        # v12.2: Apply per-sport confidence scaling
         scaled_conf = self._scale_confidence(ticker, prediction.confidence)
         if scaled_conf <= 0.0:
             logger.debug("[sports] %s blocklisted", ticker)
@@ -2059,7 +2056,6 @@ class SportsBot(BaseBot):
     # ─────────────────────────────────────────────────────────────────────
 
     def is_relevant(self, market: dict) -> bool:
-        # ── v11.5 guards ──────────────────────────────────────────────────
         if _is_unmodelable_market(market):
             return False
         if _is_entertainment_market(market):

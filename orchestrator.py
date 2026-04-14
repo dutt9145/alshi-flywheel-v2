@@ -1,5 +1,12 @@
 """
-orchestrator.py  (v19.21 — Correlation engine sports-only gate)
+orchestrator.py  (v19.22 — Database-side signal dedupe)
+
+Changes vs v19.21:
+  1. _evaluate_market: Replaced in-memory dedupe guard with database check.
+     In-memory dict (_last_bot_probs) reset on every container restart,
+     causing 10+ duplicate signals per ticker. Now checks signals table
+     directly before inserting.
+  2. _signal_exists_in_db: New helper function for dedupe check.
 
 Changes vs v19.20:
   1. _execute_correlations: Added sports-only sector gate. Politics/economics
@@ -253,6 +260,7 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       ), "politics"),
     (("kxhurr", "kxtemp", "kxrain", "kxsnow", "kxweather",
       "kxnoaa", "kxclimate", "kxlowt", "kxchll", "kxdens",
+      "kxhight",  # v19.22: Was missing — KXHIGHTDAL, KXHIGHTDC, etc.
       ), "weather"),
     (("kxai", "kxtech", "kxfed", "kxcpi", "kxgdp",
       "kxjobs", "kxrate", "kxinfl", "kxwti", "kxpayroll",
@@ -267,6 +275,22 @@ def _infer_sector_from_ticker(ticker: str) -> str:
         if any(tk.startswith(p) for p in prefixes):
             return sector
     return "economics"
+
+
+# ── v19.22: Database-side signal dedupe ────────────────────────────────────────
+def _signal_exists_in_db(ticker: str) -> bool:
+    """Check if a signal already exists for this ticker.
+    
+    v19.22: Database-side dedupe guard. Survives container restarts unlike
+    the in-memory _last_bot_probs dict which reset on every Railway deploy,
+    causing 10+ duplicate signals per ticker and poisoning the Bayesian model.
+    """
+    p = _ph()
+    rows = _query_signals(
+        f"SELECT 1 FROM signals WHERE ticker = {p} LIMIT 1",
+        (ticker,),
+    )
+    return len(rows) > 0
 
 
 # ── Connection pool ────────────────────────────────────────────────────────────
@@ -872,11 +896,11 @@ class FlywheelOrchestrator:
             )
             return
 
-        # v19.18: Only log signal once per ticker — prevents 40k duplicate
-        # signals from the same market being re-evaluated every scan cycle.
-        # _last_bot_probs persists across scans (cleared on nightly retrain),
-        # so a market only gets logged the first time it's seen each day.
-        if not _already_seen:
+        # v19.22: Database-side dedupe — survives container restarts.
+        # The in-memory _last_bot_probs dict was resetting on every Railway
+        # deploy, causing 10+ duplicate signals per ticker and poisoning
+        # the Bayesian model (especially weather).
+        if not _already_seen and not _signal_exists_in_db(ticker):
             try:
                 log_signal(
                     ticker      = ticker,
@@ -1431,7 +1455,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.21 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.22 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
