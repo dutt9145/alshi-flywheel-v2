@@ -1,13 +1,20 @@
 """
-pinnacle_reference.py (v1.6 — More Events Coverage)
+pinnacle_reference.py (v1.10 — MLB/NBA Only + Smart Event Matching)
 
-Changes vs v1.5:
-  1. Increased max_events from 5 to 12 to cover more games
-     - MLB has ~15 games/day, NBA has ~5-10 games/day
-     - 12 events should catch most relevant games
+Changes vs v1.9:
+  1. MLB/NBA ONLY: Explicitly skips all other sports (NFL, NHL, etc.)
+     to save API calls on sports we don't trade props on.
 
-Changes vs v1.4:
-  1. Player props require two-step API approach
+Changes vs v1.8:
+  1. SMART EVENT MATCHING: Extract game teams from Kalshi ticker
+     and query ONLY the matching event (1 API call instead of 30)
+  2. Added team code mappings for MLB and NBA
+  3. Added _extract_game_teams() to parse ticker game info
+  4. Added _find_event_id() to find matching event by teams
+  5. Modified _fetch_player_props() to accept optional game_teams filter
+
+API call reduction: ~97% fewer calls (1 vs 30)
+Free tier (500 req/mo) should now be sufficient.
 
 Sharp line comparison using Pinnacle odds via The Odds API.
 """
@@ -92,12 +99,95 @@ def _normalize_kalshi_player(kalshi_name: str) -> str:
     return kalshi_name.upper().strip()
 
 
+# ── Team Code Mappings ────────────────────────────────────────────────────────
+
+# Kalshi 3-letter codes → Odds API team name substring for matching
+MLB_TEAM_CODES = {
+    "ARI": ["Arizona Diamondbacks", "Diamondbacks"],
+    "ATL": ["Atlanta Braves", "Braves"],
+    "BAL": ["Baltimore Orioles", "Orioles"],
+    "BOS": ["Boston Red Sox", "Red Sox"],
+    "CHC": ["Chicago Cubs", "Cubs"],
+    "CWS": ["Chicago White Sox", "White Sox"],
+    "CHW": ["Chicago White Sox", "White Sox"],  # Alternate code
+    "CIN": ["Cincinnati Reds", "Reds"],
+    "CLE": ["Cleveland Guardians", "Guardians"],
+    "COL": ["Colorado Rockies", "Rockies"],
+    "DET": ["Detroit Tigers", "Tigers"],
+    "HOU": ["Houston Astros", "Astros"],
+    "KC": ["Kansas City Royals", "Royals"],
+    "KCR": ["Kansas City Royals", "Royals"],  # Alternate
+    "LAA": ["Los Angeles Angels", "LA Angels", "Angels"],
+    "LAD": ["Los Angeles Dodgers", "LA Dodgers", "Dodgers"],
+    "MIA": ["Miami Marlins", "Marlins"],
+    "MIL": ["Milwaukee Brewers", "Brewers"],
+    "MIN": ["Minnesota Twins", "Twins"],
+    "NYM": ["New York Mets", "NY Mets", "Mets"],
+    "NYY": ["New York Yankees", "NY Yankees", "Yankees"],
+    "OAK": ["Oakland Athletics", "Athletics", "A's"],
+    "PHI": ["Philadelphia Phillies", "Phillies"],
+    "PIT": ["Pittsburgh Pirates", "Pirates"],
+    "SD": ["San Diego Padres", "Padres"],
+    "SDP": ["San Diego Padres", "Padres"],  # Alternate
+    "SF": ["San Francisco Giants", "Giants"],
+    "SFG": ["San Francisco Giants", "Giants"],  # Alternate
+    "SEA": ["Seattle Mariners", "Mariners"],
+    "STL": ["St. Louis Cardinals", "Cardinals"],
+    "TB": ["Tampa Bay Rays", "Rays"],
+    "TBR": ["Tampa Bay Rays", "Rays"],  # Alternate
+    "TEX": ["Texas Rangers", "Rangers"],
+    "TOR": ["Toronto Blue Jays", "Blue Jays"],
+    "WSH": ["Washington Nationals", "Nationals"],
+    "WAS": ["Washington Nationals", "Nationals"],  # Alternate
+}
+
+NBA_TEAM_CODES = {
+    "ATL": ["Atlanta Hawks", "Hawks"],
+    "BOS": ["Boston Celtics", "Celtics"],
+    "BKN": ["Brooklyn Nets", "Nets"],
+    "BRK": ["Brooklyn Nets", "Nets"],  # Alternate
+    "CHA": ["Charlotte Hornets", "Hornets"],
+    "CHI": ["Chicago Bulls", "Bulls"],
+    "CLE": ["Cleveland Cavaliers", "Cavaliers", "Cavs"],
+    "DAL": ["Dallas Mavericks", "Mavericks", "Mavs"],
+    "DEN": ["Denver Nuggets", "Nuggets"],
+    "DET": ["Detroit Pistons", "Pistons"],
+    "GSW": ["Golden State Warriors", "Warriors"],
+    "GS": ["Golden State Warriors", "Warriors"],  # Alternate
+    "HOU": ["Houston Rockets", "Rockets"],
+    "IND": ["Indiana Pacers", "Pacers"],
+    "LAC": ["Los Angeles Clippers", "LA Clippers", "Clippers"],
+    "LAL": ["Los Angeles Lakers", "LA Lakers", "Lakers"],
+    "MEM": ["Memphis Grizzlies", "Grizzlies"],
+    "MIA": ["Miami Heat", "Heat"],
+    "MIL": ["Milwaukee Bucks", "Bucks"],
+    "MIN": ["Minnesota Timberwolves", "Timberwolves", "Wolves"],
+    "NOP": ["New Orleans Pelicans", "Pelicans"],
+    "NO": ["New Orleans Pelicans", "Pelicans"],  # Alternate
+    "NYK": ["New York Knicks", "NY Knicks", "Knicks"],
+    "OKC": ["Oklahoma City Thunder", "Thunder"],
+    "ORL": ["Orlando Magic", "Magic"],
+    "PHI": ["Philadelphia 76ers", "76ers", "Sixers"],
+    "PHX": ["Phoenix Suns", "Suns"],
+    "POR": ["Portland Trail Blazers", "Trail Blazers", "Blazers"],
+    "SAC": ["Sacramento Kings", "Kings"],
+    "SAS": ["San Antonio Spurs", "Spurs"],
+    "SA": ["San Antonio Spurs", "Spurs"],  # Alternate
+    "TOR": ["Toronto Raptors", "Raptors"],
+    "UTA": ["Utah Jazz", "Jazz"],
+    "WAS": ["Washington Wizards", "Wizards"],
+}
+
+
 class PinnacleReference:
     """
     Compare our probabilities to Pinnacle sharp lines.
     
     Uses The Odds API to fetch Pinnacle odds for MLB/NBA player props
     and game lines.
+    
+    v1.9: Smart event matching — extracts game teams from Kalshi ticker
+    and queries only the matching event. 97% API call reduction.
     """
     
     # Odds API endpoints
@@ -212,13 +302,130 @@ class PinnacleReference:
         """Cache data with timestamp."""
         self._cache[cache_key] = (time.time(), data)
     
+    def _extract_game_teams(
+        self,
+        ticker: str,
+        sport: str,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        v1.9: Extract away and home team codes from Kalshi ticker.
+        
+        Ticker format: KXMLBKS-26APR142010COLHOU-HOUCGORDON61-8
+          - parts[1] = game info = "26APR142010COLHOU"
+          - Last 6 chars = teams = "COLHOU" → ("COL", "HOU")
+        
+        Returns (away_team_code, home_team_code) or None if can't parse.
+        """
+        parts = ticker.upper().split("-")
+        if len(parts) < 2:
+            return None
+        
+        game_info = parts[1]
+        
+        # Teams are the last 6 characters (2x 3-letter codes)
+        # e.g., "26APR142010COLHOU" → "COLHOU"
+        if len(game_info) < 6:
+            return None
+        
+        teams_str = game_info[-6:]
+        
+        # Split into 3-letter codes
+        away_code = teams_str[:3]
+        home_code = teams_str[3:]
+        
+        # Validate codes exist in our mapping
+        team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
+        
+        if away_code not in team_map and home_code not in team_map:
+            # Try 2-letter variants (KC, SF, SD, etc.) — check last 4/5 chars
+            # Format might be KXMLBKS-26APR142010SFSD-... (5 chars for teams)
+            if len(game_info) >= 5:
+                teams_str_alt = game_info[-5:]
+                if len(teams_str_alt) == 5:
+                    # Try 2+3 or 3+2 splits
+                    for split in [(2, 3), (3, 2)]:
+                        away_alt = teams_str_alt[:split[0]]
+                        home_alt = teams_str_alt[split[0]:]
+                        if away_alt in team_map or home_alt in team_map:
+                            away_code, home_code = away_alt, home_alt
+                            break
+            
+            # Still not found? Try 4-char splits
+            if len(game_info) >= 4:
+                teams_str_alt = game_info[-4:]
+                away_alt = teams_str_alt[:2]
+                home_alt = teams_str_alt[2:]
+                if away_alt in team_map and home_alt in team_map:
+                    away_code, home_code = away_alt, home_alt
+        
+        logger.info(
+            "[PINNACLE] v1.9 Extracted teams: %s @ %s from ticker",
+            away_code, home_code,
+        )
+        
+        return (away_code, home_code)
+    
+    def _find_event_id(
+        self,
+        events: List[dict],
+        game_teams: Tuple[str, str],
+        sport: str,
+    ) -> Optional[str]:
+        """
+        v1.9: Find the event ID matching the game teams.
+        
+        Matches Kalshi team codes to Odds API team names.
+        
+        Returns event_id or None if no match.
+        """
+        away_code, home_code = game_teams
+        team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
+        
+        # Get possible team name variants
+        away_names = team_map.get(away_code, [away_code])
+        home_names = team_map.get(home_code, [home_code])
+        
+        for event in events:
+            event_home = event.get("home_team", "")
+            event_away = event.get("away_team", "")
+            
+            # Check if any variant matches
+            away_match = any(
+                name.lower() in event_away.lower() or event_away.lower() in name.lower()
+                for name in away_names
+            )
+            home_match = any(
+                name.lower() in event_home.lower() or event_home.lower() in name.lower()
+                for name in home_names
+            )
+            
+            if away_match and home_match:
+                event_id = event.get("id")
+                logger.info(
+                    "[PINNACLE] v1.9 SMART MATCH: %s @ %s → event %s (%s vs %s)",
+                    away_code, home_code, event_id[:12] if event_id else "?",
+                    event_away, event_home,
+                )
+                return event_id
+        
+        logger.info(
+            "[PINNACLE] v1.9 No event match for %s @ %s in %d events",
+            away_code, home_code, len(events),
+        )
+        return None
+    
     def _fetch_player_props(
         self,
         sport: str,
         market: str,
+        game_teams: Optional[Tuple[str, str]] = None,
     ) -> List[dict]:
         """
         Fetch player prop odds from Odds API.
+        
+        v1.9: SMART EVENT MATCHING
+          - If game_teams provided, query ONLY the matching event (1 API call)
+          - Falls back to limited batch if no match found
         
         v1.5: Player props require a two-step approach:
           1. Get event IDs from /sports/{sport}/events
@@ -231,7 +438,12 @@ class PinnacleReference:
             logger.warning("Unknown sport: %s", sport)
             return []
         
-        cache_key = f"{sport_key}:{market}"
+        # v1.9: Include game_teams in cache key for targeted lookups
+        if game_teams:
+            cache_key = f"{sport_key}:{market}:{game_teams[0]}@{game_teams[1]}"
+        else:
+            cache_key = f"{sport_key}:{market}"
+        
         cached = self._get_cached(cache_key)
         if cached:
             return cached
@@ -258,13 +470,34 @@ class PinnacleReference:
             if not events_list:
                 return []
             
-            # Step 2: Query odds for events (limit to avoid rate limits)
-            # v1.6: Increased from 5 to 12 events to cover more games
+            # v1.9: SMART EVENT MATCHING
+            events_to_query = []
+            
+            if game_teams:
+                # Find the specific event for this game
+                target_event_id = self._find_event_id(events_list, game_teams, sport)
+                if target_event_id:
+                    # Query ONLY this event (1 API call instead of 30!)
+                    events_to_query = [{"id": target_event_id}]
+                    logger.info(
+                        "[PINNACLE] v1.9 SMART MODE: querying 1 event (vs 30 batch)",
+                    )
+                else:
+                    # Fallback: couldn't match teams, query limited batch
+                    events_to_query = events_list[:10]
+                    logger.info(
+                        "[PINNACLE] v1.9 FALLBACK: no team match, querying %d events",
+                        len(events_to_query),
+                    )
+            else:
+                # No game_teams provided, use old batch mode
+                events_to_query = events_list[:30]
+            
+            # Step 2: Query odds for selected events
             all_odds = []
             events_queried = 0
-            max_events = 12  # Covers most daily MLB/NBA games
             
-            for event in events_list[:max_events]:
+            for event in events_to_query:
                 event_id = event.get("id")
                 if not event_id:
                     continue
@@ -401,22 +634,22 @@ class PinnacleReference:
                         elif outcome_name == "UNDER":
                             return (1.0 - prob, prob)
         
-        # v1.3: Log debug info on failure
+        # v1.3: Log debug info when player not found
         if pinnacle_names_seen:
             logger.info(
-                "[PINNACLE] DEBUG %s: Looking for normalized=%s in %d events. "
-                "Sample Pinnacle names: %s → normalized: %s",
-                player_name, kalshi_normalized, len(events),
-                pinnacle_names_seen[:3],
-                [_normalize_to_kalshi_format(n) for n in pinnacle_names_seen[:3]],
+                "[PINNACLE] DEBUG %s: Not found. Sample Pinnacle names: %s",
+                kalshi_normalized, pinnacle_names_seen[:5],
             )
         else:
             logger.info(
                 "[PINNACLE] DEBUG %s: No player outcomes found in %d events",
-                player_name, len(events),
+                kalshi_normalized, len(events),
             )
         
         return None
+    
+    # v1.10: Only check Pinnacle for these sports (saves API calls)
+    SUPPORTED_SPORTS = {"mlb", "nba"}
     
     def check_player_prop(
         self,
@@ -426,21 +659,38 @@ class PinnacleReference:
         line: float,
         our_prob: float,
         our_direction: str = "OVER",
+        game_teams: Optional[Tuple[str, str]] = None,
     ) -> SharpCheckResult:
         """
-        Check our player prop probability against Pinnacle's line.
+        Check a player prop against Pinnacle sharp line.
+        
+        v1.9: Accepts optional game_teams for smart event matching.
+        v1.10: MLB and NBA only — skips other sports to save API calls.
         
         Args:
-            sport: "mlb", "nba", "nfl", "nhl"
-            player_name: Player's name (Kalshi format like "YALVAREZ" or full name)
-            prop_type: One of PROP_MARKETS keys
-            line: The prop line (e.g., 1.5 for over/under 1.5 hits)
-            our_prob: Our estimated P(OVER)
-            our_direction: "OVER" or "UNDER" — which side we're betting
+            sport: "mlb" or "nba"
+            player_name: Kalshi format player name (e.g., "YALVAREZ")
+            prop_type: Odds API market key (e.g., "pitcher_strikeouts")
+            line: The line value (e.g., 7.5)
+            our_prob: Our probability for the OVER
+            our_direction: "OVER" or "UNDER"
+            game_teams: Optional (away_code, home_code) for smart matching
         
         Returns:
-            SharpCheckResult with pass/fail, confidence adjustment, etc.
+            SharpCheckResult with pass/fail and adjustments
         """
+        # v1.10: MLB/NBA only — skip other sports
+        if sport.lower() not in self.SUPPORTED_SPORTS:
+            return SharpCheckResult(
+                passes=True,
+                reason=f"Pinnacle skipped for {sport} (MLB/NBA only)",
+                our_prob=our_prob,
+                sharp_prob=None,
+                divergence=None,
+                confidence_adjustment=1.0,
+                sharp_direction=None,
+            )
+        
         if not self.enabled:
             return SharpCheckResult(
                 passes=True,
@@ -452,12 +702,12 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # Fetch current odds
-        market_key = self.PROP_MARKETS.get(prop_type)
-        if not market_key:
+        # Map to Odds API market
+        market = self.PROP_MARKETS.get(prop_type)
+        if not market:
             return SharpCheckResult(
                 passes=True,
-                reason=f"Unknown prop type: {prop_type}",
+                reason=f"No Odds API mapping for {prop_type}",
                 our_prob=our_prob,
                 sharp_prob=None,
                 divergence=None,
@@ -465,12 +715,13 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        events = self._fetch_player_props(sport, market_key)
+        # v1.9: Pass game_teams to fetch (smart matching)
+        events = self._fetch_player_props(sport, market, game_teams=game_teams)
+        
         if not events:
-            logger.info("[PINNACLE] No Odds API data for %s/%s", sport, market_key)
             return SharpCheckResult(
                 passes=True,
-                reason="No Pinnacle data available",
+                reason="No Pinnacle odds available",
                 our_prob=our_prob,
                 sharp_prob=None,
                 divergence=None,
@@ -478,17 +729,13 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # Find the player's line
-        result = self._find_player_line(events, player_name, line)
+        # Find player's line
+        odds = self._find_player_line(events, player_name, line)
         
-        if result is None:
-            logger.info(
-                "[PINNACLE] %s @ %.1f: not found in %d events",
-                player_name, line, len(events),
-            )
+        if not odds:
             return SharpCheckResult(
                 passes=True,
-                reason=f"Player {player_name} not found in Pinnacle data",
+                reason=f"Player {player_name} not found in Pinnacle odds",
                 our_prob=our_prob,
                 sharp_prob=None,
                 divergence=None,
@@ -496,10 +743,10 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        over_prob, under_prob = result
+        over_prob, under_prob = odds
         
         # Compare our probability to Pinnacle's
-        if our_direction.upper() == "OVER":
+        if our_direction == "OVER":
             sharp_prob = over_prob
         else:
             sharp_prob = under_prob
@@ -572,6 +819,7 @@ class PinnacleReference:
         line: float,
         our_prob: float,
         our_direction: str = "OVER",
+        game_teams: Optional[Tuple[str, str]] = None,
     ) -> SharpCheckResult:
         """Convenience method for MLB player props."""
         return self.check_player_prop(
@@ -581,6 +829,7 @@ class PinnacleReference:
             line=line,
             our_prob=our_prob,
             our_direction=our_direction,
+            game_teams=game_teams,
         )
     
     def check_nba_player_prop(
@@ -590,6 +839,7 @@ class PinnacleReference:
         line: float,
         our_prob: float,
         our_direction: str = "OVER",
+        game_teams: Optional[Tuple[str, str]] = None,
     ) -> SharpCheckResult:
         """Convenience method for NBA player props."""
         return self.check_player_prop(
@@ -599,6 +849,7 @@ class PinnacleReference:
             line=line,
             our_prob=our_prob,
             our_direction=our_direction,
+            game_teams=game_teams,
         )
     
     def check_from_kalshi_ticker(
@@ -609,6 +860,8 @@ class PinnacleReference:
     ) -> SharpCheckResult:
         """
         Parse a Kalshi ticker and check against Pinnacle.
+        
+        v1.9: Extracts game teams for smart event matching.
         
         Ticker format examples:
             KXMLBPTS-26APR141905LAANYY-NYYAJUDGE99-2
@@ -683,6 +936,9 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
+        # v1.9: Extract game teams for smart matching
+        game_teams = self._extract_game_teams(ticker, sport)
+        
         # Parse player name and line from ticker
         # Format: KXMLBPTS-GAMEINFO-TEAMPLAYER-LINE
         parts = ticker.split("-")
@@ -733,10 +989,11 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # v1.1: Log successful ticker parse at INFO
+        # v1.9: Log with game teams
         logger.info(
-            "[PINNACLE] Checking %s: sport=%s player=%s prop=%s line=%.1f",
+            "[PINNACLE] Checking %s: sport=%s player=%s prop=%s line=%.1f teams=%s",
             ticker[:30], sport, player_name, prop_type, line,
+            f"{game_teams[0]}@{game_teams[1]}" if game_teams else "unknown",
         )
         
         return self.check_player_prop(
@@ -746,6 +1003,7 @@ class PinnacleReference:
             line=line,
             our_prob=our_prob,
             our_direction=our_direction,
+            game_teams=game_teams,
         )
 
 
