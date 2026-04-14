@@ -1,5 +1,10 @@
 """
-pinnacle_reference.py (v1.10 — MLB/NBA Only + Smart Event Matching)
+pinnacle_reference.py (v1.11 — Fixed Team Extraction)
+
+Changes vs v1.10:
+  1. FIXED: Team extraction now handles 2-letter codes (TB, SF, KC, AZ, etc.)
+     - Was grabbing "0TB" instead of "TB" from "26APR141940TBCWS"
+     - Now tries all valid splits (2+2, 2+3, 3+2, 3+3) and validates both codes
 
 Changes vs v1.9:
   1. MLB/NBA ONLY: Explicitly skips all other sports (NFL, NHL, etc.)
@@ -309,10 +314,11 @@ class PinnacleReference:
     ) -> Optional[Tuple[str, str]]:
         """
         v1.9: Extract away and home team codes from Kalshi ticker.
+        v1.10: Fixed to handle 2-letter codes (TB, SF, KC, AZ, etc.)
         
-        Ticker format: KXMLBKS-26APR142010COLHOU-HOUCGORDON61-8
-          - parts[1] = game info = "26APR142010COLHOU"
-          - Last 6 chars = teams = "COLHOU" → ("COL", "HOU")
+        Ticker format: KXMLBKS-26APR141940TBCWS-CWSNSCHULTZ75-8
+          - parts[1] = game info = "26APR141940TBCWS"
+          - Teams are at the END, but can be 2+2, 2+3, 3+2, or 3+3 chars
         
         Returns (away_team_code, home_team_code) or None if can't parse.
         """
@@ -322,48 +328,39 @@ class PinnacleReference:
         
         game_info = parts[1]
         
-        # Teams are the last 6 characters (2x 3-letter codes)
-        # e.g., "26APR142010COLHOU" → "COLHOU"
-        if len(game_info) < 6:
-            return None
+        # Teams are at the end of game_info, after the datetime
+        # Datetime is typically 11-12 chars: "26APR141940" (date + time)
+        # Try extracting teams from the end by testing known team codes
         
-        teams_str = game_info[-6:]
-        
-        # Split into 3-letter codes
-        away_code = teams_str[:3]
-        home_code = teams_str[3:]
-        
-        # Validate codes exist in our mapping
         team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
         
-        if away_code not in team_map and home_code not in team_map:
-            # Try 2-letter variants (KC, SF, SD, etc.) — check last 4/5 chars
-            # Format might be KXMLBKS-26APR142010SFSD-... (5 chars for teams)
-            if len(game_info) >= 5:
-                teams_str_alt = game_info[-5:]
-                if len(teams_str_alt) == 5:
-                    # Try 2+3 or 3+2 splits
-                    for split in [(2, 3), (3, 2)]:
-                        away_alt = teams_str_alt[:split[0]]
-                        home_alt = teams_str_alt[split[0]:]
-                        if away_alt in team_map or home_alt in team_map:
-                            away_code, home_code = away_alt, home_alt
-                            break
+        # Try different team string lengths (4 to 6 chars from the end)
+        # Possible combos: 2+2=4, 2+3=5, 3+2=5, 3+3=6
+        for teams_len in [6, 5, 4]:
+            if len(game_info) < teams_len:
+                continue
             
-            # Still not found? Try 4-char splits
-            if len(game_info) >= 4:
-                teams_str_alt = game_info[-4:]
-                away_alt = teams_str_alt[:2]
-                home_alt = teams_str_alt[2:]
-                if away_alt in team_map and home_alt in team_map:
-                    away_code, home_code = away_alt, home_alt
+            teams_str = game_info[-teams_len:]
+            
+            # Try all possible split points
+            for split_pos in range(2, min(4, teams_len - 1)):
+                away_code = teams_str[:split_pos]
+                home_code = teams_str[split_pos:]
+                
+                # Check if BOTH codes are valid
+                if away_code in team_map and home_code in team_map:
+                    logger.info(
+                        "[PINNACLE] v1.10 Extracted teams: %s @ %s from ticker",
+                        away_code, home_code,
+                    )
+                    return (away_code, home_code)
         
+        # Fallback: couldn't match teams
         logger.info(
-            "[PINNACLE] v1.9 Extracted teams: %s @ %s from ticker",
-            away_code, home_code,
+            "[PINNACLE] v1.10 Could not extract teams from: %s",
+            game_info[-8:] if len(game_info) >= 8 else game_info,
         )
-        
-        return (away_code, home_code)
+        return None
     
     def _find_event_id(
         self,
