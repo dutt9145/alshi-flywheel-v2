@@ -1,5 +1,14 @@
 """
-shared/kelly_sizer.py  (v3 — time-decay Kelly)
+shared/kelly_sizer.py  (v3.2 — time-decay Kelly with INFO logging)
+
+Changes vs v3.1:
+  1. All time-decay diagnostic logs upgraded to INFO level
+  2. Logs when expiry parsing fails (so we can see if market dict is missing fields)
+  3. Logs hours_out even when >24h (so we know time decay is being evaluated)
+
+Changes vs v3:
+  1. Added epoch timestamp support (int/float) for Kalshi API
+  2. Added expected_expiration_time to field list
 
 Changes vs v2:
   1. Added time_decay_factor() — scales Kelly down as expiry approaches
@@ -214,15 +223,34 @@ def kelly_stake(
     if expiry_time is None and market is not None:
         expiry_time = parse_expiry_time(market)
     
-    # v3.1: Debug log for time decay diagnosis
-    if expiry_time is not None:
-        hours_out = (expiry_time - datetime.now(timezone.utc)).total_seconds() / 3600
-        logger.debug(
-            "[KELLY TIME] expiry=%s hours_out=%.1f",
-            expiry_time.isoformat()[:19], hours_out,
-        )
+    # v3.2: INFO-level logging for diagnostics
+    ticker = market.get("ticker", "?") if market else "?"
     
-    td_factor = time_decay_factor(expiry_time)
+    if expiry_time is None:
+        # Log when we can't find expiry - helps debug missing fields
+        if market:
+            available_fields = [k for k in market.keys() if "time" in k.lower() or "expir" in k.lower() or "close" in k.lower() or "end" in k.lower()]
+            logger.info(
+                "[TIME DECAY] %s: No expiry found. Time-related fields: %s",
+                ticker, available_fields or "NONE"
+            )
+        td_factor = 1.0
+    else:
+        hours_out = (expiry_time - datetime.now(timezone.utc)).total_seconds() / 3600
+        td_factor = time_decay_factor(expiry_time)
+        
+        # Always log at INFO level so we can see it's working
+        if td_factor < 1.0:
+            logger.info(
+                "[TIME DECAY] %s: %.1fh to expiry → %.0f%% Kelly",
+                ticker, hours_out, td_factor * 100
+            )
+        elif hours_out < 48:
+            # Log even when no decay, if market is within 48h (so we know it's evaluating)
+            logger.info(
+                "[TIME DECAY] %s: %.1fh to expiry → 100%% Kelly (no decay yet)",
+                ticker, hours_out
+            )
     
     if td_factor == 0.0:
         return {
