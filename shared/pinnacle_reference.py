@@ -1,5 +1,24 @@
 """
-pinnacle_reference.py (v1.0)
+pinnacle_reference.py (v1.3 — Player Name Normalization + Debug Logging)
+
+Changes vs v1.2:
+  1. Added debug logging when player not found - shows:
+     - Sample Pinnacle names from the data
+     - What they normalize to
+     - What we're looking for
+  2. Improved match logging to show normalized form
+
+Changes vs v1.1:
+  1. Added _normalize_to_kalshi_format() to convert Odds API names to Kalshi format
+     - "Yordan Alvarez" → "YALVAREZ"
+     - "Ronald Acuña Jr." → "RACUNA"
+     - "Elly De La Cruz" → "EDELACRUZ"
+  2. Updated _find_player_line() to use normalized comparison
+  3. Falls back to fuzzy matching if normalization doesn't find a match
+
+Changes vs v1.0:
+  1. All diagnostic logs at INFO level
+  2. Expanded MLB prop codes (KS, HIT, HRR)
 
 Sharp line comparison using Pinnacle odds via The Odds API.
 
@@ -10,28 +29,13 @@ sanity check:
   - If Pinnacle agrees (within 5%): Confirmation — proceed
   - If Pinnacle disagrees (>5%): Either skip or fade our signal
   - If Pinnacle strongly disagrees (>10%): Hard skip
-
-Usage:
-    from shared.pinnacle_reference import PinnacleReference
-    
-    pinnacle = PinnacleReference(api_key=ODDS_API_KEY)
-    
-    # For MLB player props
-    check = pinnacle.check_mlb_player_prop(
-        player_name="Aaron Judge",
-        prop_type="batter_hits",
-        line=1.5,
-        our_prob=0.65,  # Our P(over)
-    )
-    
-    if not check.passes:
-        logger.info("PINNACLE VETO: %s", check.reason)
-        return
 """
 
 import logging
 import os
+import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -51,6 +55,61 @@ class SharpCheckResult:
     confidence_adjustment: float  # Multiplier: 1.0 = no change, 0.8 = reduce, 1.1 = boost
     sharp_direction: Optional[str]  # "OVER" or "UNDER" — what sharp money favors
     
+
+def _normalize_to_kalshi_format(full_name: str) -> str:
+    """
+    Convert Odds API full name to Kalshi ticker format.
+    
+    Kalshi format: First initial + remaining name parts joined (no spaces), uppercase
+    
+    Examples:
+        "Yordan Alvarez"      → "YALVAREZ"
+        "Ronald Acuña Jr."    → "RACUNA"
+        "Elly De La Cruz"     → "EDELACRUZ"
+        "Stephen Curry"       → "SCURRY"
+        "José Ramírez"        → "JRAMIREZ"
+        "Shohei Ohtani"       → "SOHTANI"
+        "Paolo Banchero"      → "PBANCHERO"
+        "Matt Olson"          → "MOLSON"
+    """
+    if not full_name:
+        return ""
+    
+    # Strip accents (ñ → n, é → e, í → i, etc.)
+    name = unicodedata.normalize('NFD', full_name)
+    name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
+    
+    # Remove common suffixes
+    for suffix in [' Jr.', ' Jr', ' Sr.', ' Sr', ' III', ' II', ' IV', ' V', '.']:
+        name = name.replace(suffix, '')
+    
+    # Remove any non-alphabetic characters except spaces
+    name = re.sub(r"[^a-zA-Z\s]", "", name)
+    
+    # Split into parts and filter empty
+    parts = [p.strip() for p in name.split() if p.strip()]
+    
+    if not parts:
+        return ""
+    
+    if len(parts) == 1:
+        return parts[0].upper()
+    
+    # First initial + remaining parts joined (no spaces)
+    first_initial = parts[0][0].upper()
+    rest = ''.join(parts[1:]).upper()
+    
+    return first_initial + rest
+
+
+def _normalize_kalshi_player(kalshi_name: str) -> str:
+    """
+    Normalize Kalshi player format for comparison.
+    
+    Already in format like "YALVAREZ", just uppercase and strip.
+    """
+    return kalshi_name.upper().strip()
+
 
 class PinnacleReference:
     """
@@ -127,6 +186,10 @@ class PinnacleReference:
         
         # Cache: (sport, event_id, market) -> (timestamp, odds_data)
         self._cache: Dict[str, Tuple[float, dict]] = {}
+        
+        # v1.2: Player name cache - maps normalized Kalshi name to Odds API description
+        # This avoids repeated normalization and helps with logging
+        self._player_name_cache: Dict[str, str] = {}
         
         # Rate limiting
         self._last_request_time = 0.0
@@ -228,9 +291,21 @@ class PinnacleReference:
         """
         Find Pinnacle's odds for a specific player prop line.
         
+        v1.2: Uses normalized name comparison:
+          1. Normalize Kalshi player name (e.g., "YALVAREZ")
+          2. Normalize each Odds API player name to same format
+          3. Compare normalized forms
+          4. Fall back to fuzzy matching if needed
+        
+        v1.3: Added debug logging to show Pinnacle names being compared
+        
         Returns (over_prob, under_prob) if found, None otherwise.
         """
-        player_lower = player_name.lower().strip()
+        # Normalize the Kalshi player name
+        kalshi_normalized = _normalize_kalshi_player(player_name)
+        
+        # v1.3: Track all Pinnacle names for debug logging
+        pinnacle_names_seen = []
         
         for event in events:
             bookmakers = event.get("bookmakers", [])
@@ -241,13 +316,29 @@ class PinnacleReference:
                 
                 for market in book.get("markets", []):
                     for outcome in market.get("outcomes", []):
-                        outcome_player = outcome.get("description", "").lower().strip()
+                        outcome_player = outcome.get("description", "").strip()
                         
-                        # Fuzzy match player name
-                        if player_lower not in outcome_player and outcome_player not in player_lower:
-                            # Try last name only
-                            player_last = player_lower.split()[-1] if " " in player_lower else player_lower
-                            if player_last not in outcome_player:
+                        if not outcome_player:
+                            continue
+                        
+                        # v1.3: Track names for debug logging (first 10 unique)
+                        if len(pinnacle_names_seen) < 10 and outcome_player not in pinnacle_names_seen:
+                            pinnacle_names_seen.append(outcome_player)
+                        
+                        # v1.2: Normalize Odds API name to Kalshi format
+                        odds_api_normalized = _normalize_to_kalshi_format(outcome_player)
+                        
+                        # Primary: Exact match on normalized names
+                        if kalshi_normalized != odds_api_normalized:
+                            # Secondary: Check if Kalshi name is contained (for partial matches)
+                            # e.g., "CURRY" in "SCURRY" for "S. Curry" abbreviations
+                            if len(kalshi_normalized) > 3:
+                                # Try matching last name portion
+                                kalshi_lastname = kalshi_normalized[1:]  # Remove first initial
+                                odds_lastname = odds_api_normalized[1:] if odds_api_normalized else ""
+                                if kalshi_lastname != odds_lastname:
+                                    continue
+                            else:
                                 continue
                         
                         outcome_line = outcome.get("point")
@@ -266,10 +357,33 @@ class PinnacleReference:
                         
                         prob = self._american_to_prob(price)
                         
+                        # v1.2: Cache successful match and log it
+                        if kalshi_normalized not in self._player_name_cache:
+                            self._player_name_cache[kalshi_normalized] = outcome_player
+                            logger.info(
+                                "[PINNACLE] MATCH: %s → '%s' (normalized: %s)",
+                                kalshi_normalized, outcome_player, odds_api_normalized,
+                            )
+                        
                         if outcome_name == "OVER":
                             return (prob, 1.0 - prob)
                         elif outcome_name == "UNDER":
                             return (1.0 - prob, prob)
+        
+        # v1.3: Log debug info on failure
+        if pinnacle_names_seen:
+            logger.info(
+                "[PINNACLE] DEBUG %s: Looking for normalized=%s in %d events. "
+                "Sample Pinnacle names: %s → normalized: %s",
+                player_name, kalshi_normalized, len(events),
+                pinnacle_names_seen[:3],
+                [_normalize_to_kalshi_format(n) for n in pinnacle_names_seen[:3]],
+            )
+        else:
+            logger.info(
+                "[PINNACLE] DEBUG %s: No player outcomes found in %d events",
+                player_name, len(events),
+            )
         
         return None
     
@@ -287,14 +401,14 @@ class PinnacleReference:
         
         Args:
             sport: "mlb", "nba", "nfl", "nhl"
-            player_name: Player's full name
-            prop_type: Prop type (e.g., "batter_hits", "player_points")
-            line: The line (e.g., 1.5, 24.5)
-            our_prob: Our probability of OVER
+            player_name: Player's name (Kalshi format like "YALVAREZ" or full name)
+            prop_type: One of PROP_MARKETS keys
+            line: The prop line (e.g., 1.5 for over/under 1.5 hits)
+            our_prob: Our estimated P(OVER)
             our_direction: "OVER" or "UNDER" — which side we're betting
-            
+        
         Returns:
-            SharpCheckResult with pass/fail and diagnostics
+            SharpCheckResult with pass/fail, confidence adjustment, etc.
         """
         if not self.enabled:
             return SharpCheckResult(
@@ -307,9 +421,9 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # Map prop type to Odds API market
-        market = self.PROP_MARKETS.get(prop_type) or self.KALSHI_TO_ODDS_API.get(prop_type.upper())
-        if not market:
+        # Fetch current odds
+        market_key = self.PROP_MARKETS.get(prop_type)
+        if not market_key:
             return SharpCheckResult(
                 passes=True,
                 reason=f"Unknown prop type: {prop_type}",
@@ -320,13 +434,9 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # Fetch Pinnacle odds
-        events = self._fetch_player_props(sport, market)
+        events = self._fetch_player_props(sport, market_key)
         if not events:
-            logger.info(
-                "[PINNACLE] %s: No Odds API data for %s/%s",
-                player_name, sport, market,
-            )
+            logger.info("[PINNACLE] No Odds API data for %s/%s", sport, market_key)
             return SharpCheckResult(
                 passes=True,
                 reason="No Pinnacle data available",
@@ -337,16 +447,17 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        # Find the specific player/line
-        line_probs = self._find_player_line(events, player_name, line)
-        if not line_probs:
+        # Find the player's line
+        result = self._find_player_line(events, player_name, line)
+        
+        if result is None:
             logger.info(
                 "[PINNACLE] %s @ %.1f: not found in %d events",
                 player_name, line, len(events),
             )
             return SharpCheckResult(
                 passes=True,
-                reason=f"Player/line not found: {player_name} {line}",
+                reason=f"Player {player_name} not found in Pinnacle data",
                 our_prob=our_prob,
                 sharp_prob=None,
                 divergence=None,
@@ -354,29 +465,31 @@ class PinnacleReference:
                 sharp_direction=None,
             )
         
-        over_prob, under_prob = line_probs
+        over_prob, under_prob = result
         
-        # Determine sharp probability for our direction
+        # Compare our probability to Pinnacle's
         if our_direction.upper() == "OVER":
             sharp_prob = over_prob
         else:
             sharp_prob = under_prob
-            our_prob = 1.0 - our_prob  # Flip to compare apples to apples
         
-        # Calculate divergence (positive = we're higher than sharp)
         divergence = our_prob - sharp_prob
-        
-        # Determine sharp's lean
-        sharp_direction = "OVER" if over_prob > 0.5 else "UNDER"
-        
-        # Decision logic
         abs_div = abs(divergence)
         
+        # Determine sharp direction (what sharp money favors)
+        sharp_direction = "OVER" if over_prob > 0.5 else "UNDER"
+        
+        # Log the comparison
+        logger.info(
+            "[PINNACLE] %s @ %.1f: sharp=%.1f%% ours=%.1f%% div=%+.1f%%",
+            player_name, line, sharp_prob * 100, our_prob * 100, divergence * 100,
+        )
+        
         if abs_div > self.HARD_DIVERGENCE_THRESHOLD:
-            # Hard skip — Pinnacle strongly disagrees
+            # Hard veto — skip this trade
             return SharpCheckResult(
                 passes=False,
-                reason=f"Sharp divergence too high: {divergence:+.1%} (threshold: {self.HARD_DIVERGENCE_THRESHOLD:.0%})",
+                reason=f"Sharp VETO: {divergence:+.1%} divergence",
                 our_prob=our_prob,
                 sharp_prob=sharp_prob,
                 divergence=divergence,
