@@ -1,20 +1,13 @@
 """
-pinnacle_reference.py (v1.5 — Fixed Player Props API)
+pinnacle_reference.py (v1.6 — More Events Coverage)
+
+Changes vs v1.5:
+  1. Increased max_events from 5 to 12 to cover more games
+     - MLB has ~15 games/day, NBA has ~5-10 games/day
+     - 12 events should catch most relevant games
 
 Changes vs v1.4:
-  1. CRITICAL FIX: Player props require two-step API approach:
-     - Step 1: Get event IDs from /sports/{sport}/events  
-     - Step 2: Query /sports/{sport}/events/{event_id}/odds for each event
-     - The /odds endpoint returns 422 for player prop markets
-
-Changes vs v1.3:
-  1. Changed endpoint from /events to /odds (didn't fix it)
-
-Changes vs v1.2:
-  1. Added debug logging when player not found
-
-Changes vs v1.1:
-  1. Added name normalization (Kalshi codes ↔ full names)
+  1. Player props require two-step API approach
 
 Sharp line comparison using Pinnacle odds via The Odds API.
 """
@@ -265,11 +258,11 @@ class PinnacleReference:
             if not events_list:
                 return []
             
-            # Step 2: Query odds for the first few events (limit to avoid rate limits)
-            # We'll query up to 5 events to find player props
+            # Step 2: Query odds for events (limit to avoid rate limits)
+            # v1.6: Increased from 5 to 12 events to cover more games
             all_odds = []
             events_queried = 0
-            max_events = 5  # Limit to avoid API exhaustion
+            max_events = 12  # Covers most daily MLB/NBA games
             
             for event in events_list[:max_events]:
                 event_id = event.get("id")
