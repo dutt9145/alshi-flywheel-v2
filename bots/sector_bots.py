@@ -626,6 +626,9 @@ class CryptoBot(BaseBot):
         "kxbtcd",      # BTC daily targets (not 15M, different dynamics)
         "kxethd",      # ETH daily targets
         "kxsold",      # SOL daily targets
+        # v12.2: 15M markets for volatile altcoins — no edge
+        "kxsol15m",    # 8 resolved, 0.2375 Brier
+        "kxxrp15m",    # 5 resolved, 0.2688 Brier
     )
 
     TITLE_COIN_MAP = {
