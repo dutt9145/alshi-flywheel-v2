@@ -1,5 +1,11 @@
 """
-pinnacle_reference.py (v1.3 — Player Name Normalization + Debug Logging)
+pinnacle_reference.py (v1.4 — Fixed API Endpoint)
+
+Changes vs v1.3:
+  1. CRITICAL FIX: Changed endpoint from /events to /odds
+     - /events only returns game metadata (teams, dates)
+     - /odds returns actual odds including player props
+     - This was why "No player outcomes found" for all queries
 
 Changes vs v1.2:
   1. Added debug logging when player not found - shows:
@@ -254,7 +260,8 @@ class PinnacleReference:
         self._rate_limit()
         
         try:
-            url = f"{self.BASE_URL}/sports/{sport_key}/events"
+            # v1.4: Fixed endpoint — /odds returns odds data, /events only returns metadata
+            url = f"{self.BASE_URL}/sports/{sport_key}/odds"
             params = {
                 "apiKey": self.api_key,
                 "regions": "us",
