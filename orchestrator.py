@@ -1,5 +1,14 @@
 """
-orchestrator.py  (v19.19 — NBA outcome recording for logreg training)
+orchestrator.py  (v19.20 — Politics/random league sector routing fix)
+
+Changes vs v19.19:
+  1. _TICKER_SECTOR_MAP: Added missing politics prefixes that were falling
+     back to economics: kxtrumpact, kxtrumptime, kxmamdanieo, kxleave,
+     kxhormuz, kxca14s, kxpressbriefing.
+  2. _SPORTS_PREFIXES: Added random leagues that were leaking to economics
+     via correlation engine: kxchnsl, kxballerleague, kxapfddh, kxr6,
+     kxhnl, kxelh.
+  3. _TICKER_SECTOR_MAP sports tuple: Synced with _SPORTS_PREFIXES additions.
 
 Changes vs v19.18:
   1. _ingest_resolved_markets: Added NBA player prop outcome recording.
@@ -94,7 +103,7 @@ def _normalize_ticker(ticker: str) -> str:
     return _UUID_SUFFIX_RE.sub('', ticker)
 
 
-# ── Sports prefix guard (v19.18: synced with sector_bots.py v11.8) ─────────
+# ── Sports prefix guard (v19.20: added random leagues) ─────────────────────────
 _SPORTS_PREFIXES = (
     # MVE family
     "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
@@ -149,6 +158,16 @@ _SPORTS_PREFIXES = (
     "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
     # Entertainment (block from sports path, route to GlobalEventsBot)
     "kxartiststream",
+    # v19.20: Random leagues that were leaking to economics via correlation
+    "kxchnsl",        # Chinese Super League
+    "kxballerleague", # Baller League
+    "kxapfddh",       # Unknown league
+    "kxr6",           # Rainbow Six esports (KXR6MAP, KXR6GAME)
+    "kxhnl",          # HNL league
+    "kxelh",          # ELH league
+    "kxtabletennis",  # Table tennis
+    "kxkbogame",      # Korean baseball
+    "kxlnbelite",     # French basketball
 )
 
 
@@ -183,7 +202,7 @@ def _is_blocked_structural_market(ticker: str) -> bool:
 SCAN_PAGE_SLEEP_SEC = 0.25
 
 
-# ── Sector inference from ticker (v19.18: synced with sector_bots.py) ──────
+# ── Sector inference from ticker (v19.20: added politics + random leagues) ────
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
     (("kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
@@ -205,6 +224,9 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxrl", "kxrocketleague", "kxapex", "kxfort", "kxr6g",
       "kxitf", "kxkf", "kxnextag", "kxsurv",
       "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
+      # v19.20: Random leagues that were falling back to economics
+      "kxchnsl", "kxballerleague", "kxapfddh", "kxr6", "kxhnl", "kxelh",
+      "kxtabletennis", "kxkbogame", "kxlnbelite",
       ), "sports"),
     (("kxbtc", "kxeth", "kxsol", "kxcrypto", "kxdefi",
       "kxxrp", "kxdoge", "kxbnb", "kxavax", "kxlink",
@@ -214,13 +236,21 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxpol", "kxvote", "kxapprove",
       "kxswalwell", "kxtrumppardons", "kxtrumpendorse",
       "kxdenmarkpm", "kxisraelpm",
+      # v19.20: Additional politics prefixes (were falling back to economics)
+      "kxtrumpact",      # Trump executive actions
+      "kxtrumptime",     # Trump timing markets
+      "kxmamdanieo",     # Mamdani EO
+      "kxleave",         # KXLEAVECHERFILUS, KXLEAVEGONZALES, KXLEAVEMILLS
+      "kxhormuz",        # Strait of Hormuz geopolitics (KXHORMUZNORM)
+      "kxca14s",         # CA-14 special election (KXCA14SWINNER)
+      "kxpressbriefing", # Press briefing counts
       ), "politics"),
     (("kxhurr", "kxtemp", "kxrain", "kxsnow", "kxweather",
       "kxnoaa", "kxclimate", "kxlowt", "kxchll", "kxdens",
       ), "weather"),
     (("kxai", "kxtech", "kxfed", "kxcpi", "kxgdp",
       "kxjobs", "kxrate", "kxinfl", "kxwti", "kxpayroll",
-      "kxhighinfl",
+      "kxhighinfl", "kxuspspend",
       ), "economics"),
 ]
 
@@ -1386,7 +1416,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.19 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.20 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
