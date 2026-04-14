@@ -1,40 +1,22 @@
 """
-pinnacle_reference.py (v1.4 — Fixed API Endpoint)
+pinnacle_reference.py (v1.5 — Fixed Player Props API)
+
+Changes vs v1.4:
+  1. CRITICAL FIX: Player props require two-step API approach:
+     - Step 1: Get event IDs from /sports/{sport}/events  
+     - Step 2: Query /sports/{sport}/events/{event_id}/odds for each event
+     - The /odds endpoint returns 422 for player prop markets
 
 Changes vs v1.3:
-  1. CRITICAL FIX: Changed endpoint from /events to /odds
-     - /events only returns game metadata (teams, dates)
-     - /odds returns actual odds including player props
-     - This was why "No player outcomes found" for all queries
+  1. Changed endpoint from /events to /odds (didn't fix it)
 
 Changes vs v1.2:
-  1. Added debug logging when player not found - shows:
-     - Sample Pinnacle names from the data
-     - What they normalize to
-     - What we're looking for
-  2. Improved match logging to show normalized form
+  1. Added debug logging when player not found
 
 Changes vs v1.1:
-  1. Added _normalize_to_kalshi_format() to convert Odds API names to Kalshi format
-     - "Yordan Alvarez" → "YALVAREZ"
-     - "Ronald Acuña Jr." → "RACUNA"
-     - "Elly De La Cruz" → "EDELACRUZ"
-  2. Updated _find_player_line() to use normalized comparison
-  3. Falls back to fuzzy matching if normalization doesn't find a match
-
-Changes vs v1.0:
-  1. All diagnostic logs at INFO level
-  2. Expanded MLB prop codes (KS, HIT, HRR)
+  1. Added name normalization (Kalshi codes ↔ full names)
 
 Sharp line comparison using Pinnacle odds via The Odds API.
-
-Pinnacle is the sharpest mainstream book — their lines reflect the true
-market probability better than any model we can build. Use them as a
-sanity check:
-
-  - If Pinnacle agrees (within 5%): Confirmation — proceed
-  - If Pinnacle disagrees (>5%): Either skip or fade our signal
-  - If Pinnacle strongly disagrees (>10%): Hard skip
 """
 
 import logging
@@ -245,6 +227,10 @@ class PinnacleReference:
         """
         Fetch player prop odds from Odds API.
         
+        v1.5: Player props require a two-step approach:
+          1. Get event IDs from /sports/{sport}/events
+          2. Query /sports/{sport}/events/{event_id}/odds for each event
+        
         Returns list of events with player prop odds.
         """
         sport_key = self.SPORT_KEYS.get(sport.lower())
@@ -260,27 +246,72 @@ class PinnacleReference:
         self._rate_limit()
         
         try:
-            # v1.4: Fixed endpoint — /odds returns odds data, /events only returns metadata
-            url = f"{self.BASE_URL}/sports/{sport_key}/odds"
-            params = {
-                "apiKey": self.api_key,
-                "regions": "us",
-                "markets": market,
-                "bookmakers": "pinnacle",
-                "oddsFormat": "american",
-            }
+            # Step 1: Get list of events for this sport
+            events_cache_key = f"{sport_key}:events"
+            events_list = self._get_cached(events_cache_key)
             
-            resp = requests.get(url, params=params, timeout=10)
-            resp.raise_for_status()
+            if not events_list:
+                events_url = f"{self.BASE_URL}/sports/{sport_key}/events"
+                events_resp = requests.get(
+                    events_url,
+                    params={"apiKey": self.api_key},
+                    timeout=10,
+                )
+                events_resp.raise_for_status()
+                events_list = events_resp.json()
+                self._set_cache(events_cache_key, events_list)
+                logger.info("[PINNACLE] Fetched %d events for %s", len(events_list), sport_key)
             
-            data = resp.json()
-            self._set_cache(cache_key, data)
+            if not events_list:
+                return []
             
-            logger.info(
-                "[PINNACLE] Fetched %d events for %s/%s",
-                len(data), sport_key, market,
-            )
-            return data
+            # Step 2: Query odds for the first few events (limit to avoid rate limits)
+            # We'll query up to 5 events to find player props
+            all_odds = []
+            events_queried = 0
+            max_events = 5  # Limit to avoid API exhaustion
+            
+            for event in events_list[:max_events]:
+                event_id = event.get("id")
+                if not event_id:
+                    continue
+                
+                self._rate_limit()
+                events_queried += 1
+                
+                odds_url = f"{self.BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
+                params = {
+                    "apiKey": self.api_key,
+                    "regions": "us",
+                    "markets": market,
+                    "bookmakers": "pinnacle",
+                    "oddsFormat": "american",
+                }
+                
+                try:
+                    odds_resp = requests.get(odds_url, params=params, timeout=10)
+                    if odds_resp.status_code == 200:
+                        odds_data = odds_resp.json()
+                        # The response is a single event with bookmakers
+                        if odds_data and odds_data.get("bookmakers"):
+                            all_odds.append(odds_data)
+                except requests.RequestException:
+                    # Individual event failed, continue to next
+                    continue
+            
+            if all_odds:
+                logger.info(
+                    "[PINNACLE] Fetched odds from %d/%d events for %s/%s",
+                    len(all_odds), events_queried, sport_key, market,
+                )
+            else:
+                logger.info(
+                    "[PINNACLE] No odds found in %d events for %s/%s",
+                    events_queried, sport_key, market,
+                )
+            
+            self._set_cache(cache_key, all_odds)
+            return all_odds
             
         except requests.RequestException as e:
             logger.warning("[PINNACLE] API error: %s", e)
