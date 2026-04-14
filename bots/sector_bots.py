@@ -629,6 +629,9 @@ class CryptoBot(BaseBot):
         # v12.2: 15M markets for volatile altcoins — no edge
         "kxsol15m",    # 8 resolved, 0.2375 Brier
         "kxxrp15m",    # 5 resolved, 0.2688 Brier
+        # v12.2: Random sports leaking to crypto
+        "kxtabletennis",  # Table tennis
+        "kxballerleague", # Baller League soccer
     )
 
     TITLE_COIN_MAP = {
@@ -898,6 +901,15 @@ class WeatherBot(BaseBot):
         # v12.2: Golf and UEFA leaks
         "kxlpga",          # LPGA Tour golf
         "kxuecl",          # UEFA Europa Conference League
+        # v12.2: Random leagues leaking to weather
+        "kxtabletennis",   # Table tennis
+        "kxkbogame",       # Korean baseball
+        "kxlnbelite",      # French basketball (LNB Elite)
+        "kxchnsl",         # Chinese Super League
+        "kxapfddh",        # Unknown league
+        "kxballerleague",  # Baller League soccer
+        "kxitfwmatch",     # ITF women's tennis
+        "kxitfmmatch",     # ITF men's tennis
     )
 
     KEYWORDS = [
@@ -1423,6 +1435,15 @@ class SportsBot(BaseBot):
         "kxatpsetwi",     # 2 resolved, 0.2503 Brier — ATP set winner
         "kxbundesli",     # 4 resolved, 0.2654 Brier — Bundesliga
         "kxaleagueg",     # 3 resolved, 0.2862 Brier — A-League games
+        # v12.2: Random leagues leaking to wrong sectors — blocklist all
+        "kxtabletennis",  # Table tennis — leaking to crypto/weather
+        "kxkbogame",      # Korean baseball — leaking to weather
+        "kxlnbelite",     # French basketball — leaking to weather
+        "kxchnsl",        # Chinese Super League — leaking to weather
+        "kxapfddh",       # Unknown league — leaking to weather
+        "kxballerleague", # Baller League — leaking to crypto
+        "kxitfwmatch",    # ITF women's tennis
+        "kxitfmmatch",    # ITF men's tennis
     )
 
     KEYWORDS = [
