@@ -632,6 +632,15 @@ class CryptoBot(BaseBot):
         # v12.2: Random sports leaking to crypto
         "kxtabletennis",  # Table tennis
         "kxballerleague", # Baller League soccer
+        # v12.2: Politics leaking via NEWS SPIKE
+        "kxleavecherfilus",  # Congress leave (politics)
+        "kxleavegonzales",   # Congress leave (politics)
+        "kxleavemills",      # Congress leave (politics)
+        "kxtrumpact",        # Trump actions (politics)
+        "kxtrumptime",       # Trump timing (politics)
+        "kxmamdanieo",       # Mamdani EO (politics)
+        "kxhormuznorm",      # Hormuz blockade (politics)
+        "kxca14swinner",     # CA-14 special election (politics)
     )
 
     TITLE_COIN_MAP = {
@@ -910,6 +919,15 @@ class WeatherBot(BaseBot):
         "kxballerleague",  # Baller League soccer
         "kxitfwmatch",     # ITF women's tennis
         "kxitfmmatch",     # ITF men's tennis
+        # v12.2: Politics tickers leaking via NEWS SPIKE
+        "kxtrumpact",      # Trump actions (politics)
+        "kxtrumptime",     # Trump timing (politics)
+        "kxmamdanieo",     # Mamdani EO (politics)
+        "kxleavecherfilus",# Congress leave (politics)
+        "kxleavegonzales", # Congress leave (politics)
+        "kxleavemills",    # Congress leave (politics)
+        "kxhormuznorm",    # Hormuz blockade (politics)
+        "kxca14swinner",   # CA-14 special election (politics)
     )
 
     KEYWORDS = [
@@ -1227,6 +1245,18 @@ class FinancialMarketsBot(BaseBot):
     this bot handles company-level financial events.
     """
 
+    # v12.2: Blocklist for random sports/games leaking to financial_markets
+    FINMARKETS_BLOCKLIST = (
+        "kxtabletennis",  # Table tennis
+        "kxballerleague", # Baller League soccer
+        "kxkbogame",      # Korean baseball
+        "kxlnbelite",     # French basketball
+        "kxchnsl",        # Chinese Super League
+        "kxapfddh",       # Unknown league
+        "kxitfwmatch",    # ITF women's tennis
+        "kxitfmmatch",    # ITF men's tennis
+    )
+
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
         "kxaapl", "kxgoog", "kxmsft", "kxamzn", "kxmeta", "kxnvda",
@@ -1305,6 +1335,10 @@ class FinancialMarketsBot(BaseBot):
         if _is_entertainment_market(market):
             return False
         if _has_sports_prefix(market):
+            return False
+        # v12.2: Check blocklist for random sports leaking
+        ticker = market.get("ticker", "").lower()
+        if any(ticker.startswith(bl) for bl in self.FINMARKETS_BLOCKLIST):
             return False
         return _search_fields(market, self.KEYWORDS)
 
