@@ -620,6 +620,14 @@ class CryptoBot(BaseBot):
         "kxbnb": "binancecoin", "kxmatic": "matic-network",
     }
 
+    # v12.2: Blocklist for crypto markets we can't model
+    # KXBTCD = BTC daily price targets — 0.488 Brier on 7 resolved, catastrophic
+    CRYPTO_BLOCKLIST = (
+        "kxbtcd",      # BTC daily targets (not 15M, different dynamics)
+        "kxethd",      # ETH daily targets
+        "kxsold",      # SOL daily targets
+    )
+
     TITLE_COIN_MAP = {
         "btc": "bitcoin",  "bitcoin":  "bitcoin",
         "eth": "ethereum", "ethereum": "ethereum",
@@ -641,6 +649,13 @@ class CryptoBot(BaseBot):
             return False
         if _has_sports_prefix(market):
             return False
+        
+        # v12.2: Blocklist daily target markets (KXBTCD, etc.)
+        et = market.get("event_ticker", "").lower()
+        tk = market.get("ticker", "").lower()
+        if any(et.startswith(p) or tk.startswith(p) for p in self.CRYPTO_BLOCKLIST):
+            return False
+        
         return _search_fields(market, self.KEYWORDS)
 
     def _detect_coin(self, market: dict) -> str:
