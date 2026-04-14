@@ -1397,6 +1397,17 @@ class SportsBot(BaseBot):
         "kxacbgam",   # 0.6045 Brier — ACB basketball
         "kxmvenba",   # 0.3243 Brier — MVE NBA (structural issue)
         "kxmvecbc",   # 4530 signals, 0 resolved, 0.32 conf — futures noise
+        # v12.2: Game-level MLB markets — no real model, flat prior pollution
+        "kxmlbtot",   # 31 resolved, 0.2360 Brier — game totals
+        "kxmlbspr",   # 53 resolved, 0.2210 Brier — game spreads
+        # v12.2: Game-level NBA markets — no real model, flat prior pollution
+        "kxnbatotal",     # 707 signals, 5 resolved, 0.31 Brier
+        "kxnbateamtotal", # 230 signals, 2 resolved
+        "kxnbaspread",    # 695 signals
+        "kxnba1hwinner",  # 29 signals — 1st half winner
+        "kxnba2hwinner",  # 28 signals — 2nd half winner
+        "kxnbagame",      # 134 signals — game props
+        "kxnbamention",   # 222 signals — broadcast mentions (unmodelable)
     )
 
     KEYWORDS = [
