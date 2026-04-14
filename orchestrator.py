@@ -1,5 +1,18 @@
 """
-orchestrator.py  (v19.22 — Database-side signal dedupe)
+orchestrator.py  (v19.23 — Liquidity filter, time-decay Kelly, correlation tracker)
+
+Changes vs v19.22:
+  1. Liquidity filter: Skip thin/illiquid markets (spread > 8¢ or volume < 100).
+     Markets failing liquidity check are logged and skipped before bot evaluation.
+  2. Time-decay Kelly: Scale down position size as expiry approaches.
+     - 24+ hours out: 100% Kelly
+     - 12 hours out: ~75%
+     - 6 hours out: ~55%
+     - 1 hour out: 25%
+     - <15 min out: 0% (no bet)
+  3. Enhanced correlation tracker: Detects same-game/same-player props and
+     discounts Kelly by 1/sqrt(1 + prior_trades). Replaces the simple
+     _scan_player_trades dict with full ticker parsing and group tracking.
 
 Changes vs v19.21:
   1. _evaluate_market: Replaced in-memory dedupe guard with database check.
@@ -76,9 +89,11 @@ from shared.calibration_logger import init_db, log_signal, log_trade, log_outcom
 from shared.circuit_breaker import CircuitBreaker
 from shared.consensus_engine import ConsensusEngine
 from shared.correlation_engine import CorrelationEngine
+from shared.correlation_tracker import CorrelationTracker  # v19.23: Enhanced correlation
 from shared.fade_scanner import FadeScanner
 from shared.kalshi_client import KalshiClient
-from shared.kelly_sizer import kelly_stake, no_kelly_stake
+from shared.kelly_sizer import kelly_stake, no_kelly_stake, parse_expiry_time  # v19.23: time-decay
+from shared.liquidity_filter import LiquidityFilter  # v19.23: Liquidity filter
 from shared.news_signal import NewsSignal
 from shared.resolution_timer import ResolutionTimer
 from shared.sharp_detector import SharpDetector
@@ -569,7 +584,11 @@ class FlywheelOrchestrator:
         # v19.17: Risk manager + Brier tracker + correlation tracking
         self.risk_manager = RiskManager(bankroll=BANKROLL)
         self.brier_tracker = BrierTracker.from_supabase(os.getenv("DATABASE_URL", ""))
-        self._scan_player_trades: dict[str, int] = {}
+        self._scan_player_trades: dict[str, int] = {}  # Legacy, kept for backward compat
+
+        # v19.23: Liquidity filter + enhanced correlation tracker
+        self.liquidity_filter = LiquidityFilter(enabled=True)
+        self.correlation_tracker = CorrelationTracker()
 
     # ── Sector resolved count (cached) ────────────────────────────────────────
 
@@ -839,6 +858,17 @@ class FlywheelOrchestrator:
         if yes_price <= 2 or yes_price >= 98:
             return
 
+        # v19.23: Liquidity filter — skip thin/illiquid markets
+        # Check before any bot evaluation to save compute
+        liq_result = self.liquidity_filter.check(market, sector="unknown")
+        if not liq_result.passes:
+            logger.debug(
+                "LIQUIDITY SKIP %s: %s (spread=%.1f¢ vol=%s)",
+                ticker[:40], liq_result.reason,
+                liq_result.spread_cents or 0, liq_result.volume_24h,
+            )
+            return
+
         self.news.register_market(title)
         sharp_signal = self.sharp.analyze(market)
 
@@ -921,6 +951,7 @@ class FlywheelOrchestrator:
             consensus   = consensus,
             lead_sector = lead_sector,
             arb         = arb,
+            market      = market,  # v19.23: For time-decay Kelly
         )
 
     def _execute_trade(
@@ -932,6 +963,7 @@ class FlywheelOrchestrator:
         lead_sector: str,
         arb,
         fade:        bool = False,
+        market:      dict = None,  # v19.23: For time-decay Kelly
     ) -> None:
         now      = time.monotonic()
         last_ts  = self._recently_traded.get(ticker, 0.0)
@@ -990,6 +1022,7 @@ class FlywheelOrchestrator:
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
+        # v19.23: Pass market dict for time-decay Kelly
         if consensus.direction == "YES":
             sizing = kelly_stake(
                 prob            = consensus.avg_prob,
@@ -999,6 +1032,7 @@ class FlywheelOrchestrator:
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
                 drawdown_factor = drawdown_factor,
+                market          = market,  # v19.23: time-decay
             )
             side = "yes"
         else:
@@ -1010,8 +1044,17 @@ class FlywheelOrchestrator:
                 sector_exposure = sector_exp,
                 live_bankroll   = live_bankroll,
                 drawdown_factor = drawdown_factor,
+                market          = market,  # v19.23: time-decay
             )
             side = "no"
+        
+        # v19.23: Log time-decay if applied
+        td_factor = sizing.get("time_decay", 1.0)
+        if td_factor < 1.0:
+            logger.info(
+                "[TIME DECAY] %s: %.0f%% Kelly (expiry approaching)",
+                ticker[:40], td_factor * 100,
+            )
 
         if in_exploration and sizing["contracts"] > 0:
             exploration_scale = kf / KELLY_FRACTION
@@ -1037,20 +1080,20 @@ class FlywheelOrchestrator:
             logger.info("RISK BLOCKED %s: %s", ticker, reason)
             return
 
-        # v19.17: Same-game prop correlation downscale
-        parts = ticker.split("-")
-        player_game_key = f"{parts[1]}-{parts[2]}" if len(parts) >= 3 and ticker.upper().startswith("KXMLB") else ticker
-        prev_count = self._scan_player_trades.get(player_game_key, 0)
-        if prev_count > 0:
-            scale = 1.0 / math.sqrt(prev_count + 1)
+        # v19.23: Enhanced correlation tracking (replaces v19.17 simple dict)
+        # Detects same-game, same-player props and discounts Kelly accordingly
+        corr_result = self.correlation_tracker.get_discount(ticker)
+        if corr_result.discount < 1.0:
             old_dollars = sizing["dollars"]
-            sizing["dollars"] = round(sizing["dollars"] * scale, 2)
-            sizing["contracts"] = max(1, int(sizing["contracts"] * scale))
+            sizing["dollars"] = round(sizing["dollars"] * corr_result.discount, 2)
+            sizing["contracts"] = max(1, int(sizing["contracts"] * corr_result.discount))
             logger.info(
-                "[CORRELATION] %s: %d prior props → $%.2f × %.2f = $%.2f",
-                player_game_key[:30], prev_count, old_dollars, scale, sizing["dollars"],
+                "[CORRELATION] %s: %s → $%.2f × %.2f = $%.2f",
+                ticker[:35], corr_result.rationale,
+                old_dollars, corr_result.discount, sizing["dollars"],
             )
             if sizing["contracts"] <= 0:
+                logger.info("CORRELATION SKIP %s: discount too steep", ticker[:40])
                 return
 
         client_order_id = str(uuid.uuid4())
@@ -1082,9 +1125,9 @@ class FlywheelOrchestrator:
         self._exposure[lead_sector]     = sector_exp + sizing["dollars"]
         self.bankroll                   = live_bankroll
 
-        # v19.17: Record in risk manager + correlation tracker
+        # v19.23: Record in risk manager + enhanced correlation tracker
         self.risk_manager.record_trade(player_key, lead_sector, sizing["dollars"])
-        self._scan_player_trades[player_game_key] = prev_count + 1
+        self.correlation_tracker.record_trade(ticker, sizing["dollars"])
 
         provisional_loss = -sizing["dollars"]
         with self._sector_pnl_lock:
@@ -1298,7 +1341,10 @@ class FlywheelOrchestrator:
         self.risk_manager.update_daily_pnl(
             self._scan_summary.get("realized_pnl", 0.0)
         )
-        self._scan_player_trades = {}
+        self._scan_player_trades = {}  # Legacy
+        
+        # v19.23: Reset enhanced correlation tracker
+        self.correlation_tracker.reset()
 
         try:
             markets = self.client.get_all_open_markets(
@@ -1440,7 +1486,9 @@ class FlywheelOrchestrator:
         self._resolved_count_cache_ts = 0.0
 
         # v19.17: Reset risk manager + log Brier stats
+        # v19.23: Also reset correlation tracker
         self.risk_manager = RiskManager(bankroll=live_bankroll)
+        self.correlation_tracker.reset()
         for stat in self.brier_tracker.all_stats():
             if stat:
                 logger.info(
@@ -1455,7 +1503,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.22 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.23 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
