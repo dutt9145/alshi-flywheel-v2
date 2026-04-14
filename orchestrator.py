@@ -1,5 +1,11 @@
 """
-orchestrator.py  (v19.20 — Politics/random league sector routing fix)
+orchestrator.py  (v19.21 — Correlation engine sports-only gate)
+
+Changes vs v19.20:
+  1. _execute_correlations: Added sports-only sector gate. Politics/economics
+     ladder markets (KXTRUMPACT thresholds, KXUSPSPEND thresholds, KXHORMUZNORM
+     dates) have legitimate price spreads between rungs — not mispricings.
+     Correlation arb only makes sense for sports spread markets.
 
 Changes vs v19.19:
   1. _TICKER_SECTOR_MAP: Added missing politics prefixes that were falling
@@ -1136,6 +1142,17 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
+            # v19.21: Only trade sports correlations — politics/economics ladders
+            # (KXTRUMPACT thresholds, KXUSPSPEND levels, KXHORMUZNORM dates) have
+            # legitimate price spreads between rungs, not mispricings.
+            inferred_sector = _infer_sector_from_ticker(sig.event_group)
+            if inferred_sector != "sports":
+                logger.debug(
+                    "CORR SKIP (non-sports sector=%s): %s",
+                    inferred_sector, sig.event_group,
+                )
+                continue
+
             if _is_blocked_structural_market(sig.event_group):
                 logger.info(
                     "CORR BLOCKED (uncalibrated structural market): %s",
@@ -1158,8 +1175,6 @@ class FlywheelOrchestrator:
                 )
                 continue
             self._recently_traded[corr_key] = now
-
-            inferred_sector = _infer_sector_from_ticker(sig.event_group)
 
             logger.info(
                 "[CORR TRADE] Legging into %s sector=%s (cheap=%s@%d¢, expensive=%s@%d¢) div=%.1f¢",
@@ -1416,7 +1431,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.20 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.21 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
