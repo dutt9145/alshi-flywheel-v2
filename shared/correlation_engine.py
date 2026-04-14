@@ -1,5 +1,11 @@
 """
-shared/correlation_engine.py  (v2.2 — artiststream skip + extreme price threshold)
+shared/correlation_engine.py  (v2.3 — random league blocklist)
+
+Changes vs v2.2:
+  1. Added random leagues to _CORR_SKIP_SUBSTRINGS to prevent sector leaks:
+     - tabletennis, kbogame, lnbelite, chnsl, apfddh, ballerleague
+     - itfwmatch, itfmatch (high volume, low edge ITF tennis)
+  These were getting routed to 'economics' sector and hitting loss caps.
 
 Changes vs v2.1:
   1. Added "artiststream" to _CORR_SKIP_SUBSTRINGS — prevents spurious
@@ -42,7 +48,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── v2.2: Markets the correlation engine should never touch ────────────────────
+# ── v2.3: Markets the correlation engine should never touch ────────────────────
 # These markets are unmodelable and cause crashes when passed to kelly_sizer.
 # Check is done via substring match on ticker/event_ticker (case-insensitive).
 _CORR_SKIP_SUBSTRINGS = (
@@ -51,6 +57,15 @@ _CORR_SKIP_SUBSTRINGS = (
     "roty",          # Rookie of the Year futures
     "seasonhr",      # Season-long HR totals
     "artiststream",  # v2.2: Spotify artist streaming — no meaningful correlation
+    # v2.3: Random leagues that cause sector leaks (get misclassified as economics)
+    "tabletennis",   # KXTABLETENNIS — table tennis
+    "kbogame",       # KXKBOGAME — Korean baseball
+    "lnbelite",      # KXLNBELITE — French basketball
+    "chnsl",         # KXCHNSL — Chinese Super League
+    "apfddh",        # KXAPFDDH — unknown league
+    "ballerleague",  # KXBALLERLEAGUE — Baller League
+    "itfwmatch",     # KXITFWMATCH — ITF women's tennis (high volume, low edge)
+    "itfmatch",      # KXITFMATCH — ITF men's tennis
 )
 
 # ── v2.2: Price extremes that crash Kelly sizing ───────────────────────────────
@@ -160,7 +175,7 @@ def _event_group(market: dict) -> str:
 
 
 def _should_skip_market(market: dict) -> bool:
-    """v2: Return True if this market should be excluded from correlation analysis."""
+    """v2.3: Return True if this market should be excluded from correlation analysis."""
     ticker_lower = market.get("ticker", "").lower()
     et_lower     = market.get("event_ticker", "").lower()
     return any(s in ticker_lower or s in et_lower for s in _CORR_SKIP_SUBSTRINGS)
@@ -201,12 +216,15 @@ class CorrelationEngine:
         float division by zero in Kelly sizing.
 
         v2.2: Skips artiststream markets, raised extreme threshold to 5¢.
+        
+        v2.3: Skips random leagues (tabletennis, ballerleague, chnsl, etc.)
+        that were getting misclassified as 'economics' sector.
         """
         # Group markets by event, skipping unmodelable ones
         groups: dict[str, list[dict]] = {}
         skipped = 0
         for market in open_markets:
-            # v2: skip unmodelable markets before grouping
+            # v2/v2.3: skip unmodelable markets before grouping
             if _should_skip_market(market):
                 skipped += 1
                 continue
