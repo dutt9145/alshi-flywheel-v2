@@ -1,9 +1,14 @@
 """
-liquidity_filter.py (v1.0)
+liquidity_filter.py (v1.1 — sector auto-detect + logging)
 
 Liquidity filter for market selection. Skip thin/illiquid markets where:
   1. Spread is too wide (execution slippage eats edge)
   2. Volume is too low (hard to exit, stale prices)
+
+v1.1 Changes:
+  - Auto-detect sector from ticker if called with sector="unknown"
+  - INFO-level logging when economics/financial_markets filtered or passed
+  - More permissive thresholds for economics (20¢, 5 vol) and financial_markets (15¢, 10 vol)
 
 Usage:
     from shared.liquidity_filter import LiquidityFilter
@@ -70,16 +75,17 @@ class LiquidityFilter:
             "max_spread_pct": 0.15,
             "min_volume_24h": 50,
         },
-        # v12.5: Economics/financial markets typically have wider spreads
+        # v1.1: Economics/financial markets typically have wider spreads and lower volume
+        # Be very permissive to ensure they're not filtered incorrectly
         "economics": {
-            "max_spread_cents": 12,
-            "max_spread_pct": 0.25,
-            "min_volume_24h": 25,
+            "max_spread_cents": 20,      # Very permissive - economics markets are thin
+            "max_spread_pct": 0.40,      # 40% spread OK
+            "min_volume_24h": 5,         # Just need SOME volume
         },
         "financial_markets": {
-            "max_spread_cents": 10,
-            "max_spread_pct": 0.20,
-            "min_volume_24h": 30,
+            "max_spread_cents": 15,
+            "max_spread_pct": 0.30,
+            "min_volume_24h": 10,
         },
         # Default for unknown sectors — more permissive to avoid false skips
         "unknown": {
@@ -113,19 +119,66 @@ class LiquidityFilter:
             base.update(self.SECTOR_THRESHOLDS[sector])
         return base
     
+    def _detect_sector_from_ticker(self, ticker: str) -> str:
+        """
+        Auto-detect sector from Kalshi ticker prefix.
+        
+        This allows liquidity filtering to use correct thresholds even when
+        the orchestrator doesn't know the sector yet.
+        """
+        if not ticker:
+            return "unknown"
+        
+        t = ticker.upper()
+        
+        # Economics indicators
+        if any(x in t for x in ["KXCPI", "KXPCE", "KXDEC", "KXFED", "KXGDP", "KXJOBLESS", "KXNFP", "KXUNRATE", "KXPPI", "KXRETAIL"]):
+            return "economics"
+        
+        # Financial markets (SPX, NDX, VIX, stocks)
+        if any(x in t for x in ["KXSPX", "KXNDX", "KXVIX", "KXINX", "KXDJIA", "KXRUS"]):
+            return "financial_markets"
+        
+        # Crypto
+        if any(x in t for x in ["KXBTC", "KXETH", "KXSOL", "KXBNB", "KXXRP", "KXDOGE", "KXADA", "KXLTC"]):
+            return "crypto"
+        
+        # Weather
+        if any(x in t for x in ["KXHIGHT", "KXLOWT", "KXPRECIP", "KXSNOW", "KXWIND", "KXHUMID"]):
+            return "weather"
+        
+        # Politics
+        if any(x in t for x in ["KXTRUMP", "KXBIDEN", "KXPOTUS", "KXSENATE", "KXHOUSE", "KXGOV", "KXELECT"]):
+            return "politics"
+        
+        # Sports (many prefixes)
+        if any(x in t for x in ["KXMLB", "KXNBA", "KXNFL", "KXNHL", "KXNCAA", "KXATP", "KXWTA", "KXMMA", 
+                                 "KXUFC", "KXLOL", "KXCS2", "KXVAL", "KXEURO", "KXLALIGA", "KXSERIE",
+                                 "KXBUNDES", "KXLIGUE", "KXUCL", "KXNASCAR", "KXF1", "KXR6"]):
+            return "sports"
+        
+        return "unknown"
+    
     def check(self, market: dict, sector: str = "unknown") -> LiquidityResult:
         """
         Check if market passes liquidity filters.
         
         Args:
             market: Kalshi market dict with price/volume fields
-            sector: Sector name for threshold lookup
+            sector: Sector name for threshold lookup (auto-detected if "unknown")
             
         Returns:
             LiquidityResult with pass/fail and diagnostics
         """
         if not self.enabled:
             return LiquidityResult(passes=True, reason="filter_disabled")
+        
+        # v1.1: Auto-detect sector from ticker if unknown
+        ticker = market.get("ticker", "")
+        if sector == "unknown":
+            sector = self._detect_sector_from_ticker(ticker)
+            if sector != "unknown":
+                logger.debug("[LIQUIDITY] Auto-detected sector=%s for %s", sector, ticker[:30])
         
         thresholds = self._get_thresholds(sector)
         
@@ -175,6 +228,9 @@ class LiquidityFilter:
                 mid_price_cents=mid_cents,
             )
             self.last_result = result
+            # v1.1: Log at INFO for economics/financial to help debug
+            if sector in ("economics", "financial_markets"):
+                logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
             return result
         
         # --- Check 2: Spread as % of mid ---
@@ -190,6 +246,9 @@ class LiquidityFilter:
                     mid_price_cents=mid_cents,
                 )
                 self.last_result = result
+                # v1.1: Log at INFO for economics/financial to help debug
+                if sector in ("economics", "financial_markets"):
+                    logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
                 return result
         
         # --- Check 3: Minimum volume ---
@@ -203,6 +262,9 @@ class LiquidityFilter:
                 mid_price_cents=mid_cents,
             )
             self.last_result = result
+            # v1.1: Log at INFO for economics/financial to help debug
+            if sector in ("economics", "financial_markets"):
+                logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
             return result
         
         # All checks passed
@@ -215,6 +277,14 @@ class LiquidityFilter:
             mid_price_cents=mid_cents,
         )
         self.last_result = result
+        
+        # v1.1: Log when economics/financial markets pass (helps confirm they're getting through)
+        if sector in ("economics", "financial_markets"):
+            logger.info(
+                "[LIQUIDITY PASS] %s sector=%s spread=%.1f¢ vol=%d",
+                ticker[:40], sector, spread_cents, volume_24h
+            )
+        
         return result
     
     def passes(self, market: dict, sector: str = "unknown") -> bool:
