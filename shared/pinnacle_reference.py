@@ -108,7 +108,7 @@ def _normalize_kalshi_player(kalshi_name: str) -> str:
 
 # Kalshi 3-letter codes → Odds API team name substring for matching
 MLB_TEAM_CODES = {
-    "ARI": ["Arizona Diamondbacks", "Diamondbacks"],
+    "AZ": ["Arizona Diamondbacks", "Diamondbacks"],
     "ATL": ["Atlanta Braves", "Braves"],
     "BAL": ["Baltimore Orioles", "Orioles"],
     "BOS": ["Boston Red Sox", "Red Sox"],
