@@ -1,18 +1,17 @@
 """
-shared/kalshi_client.py  (v13 — historical markets for archived resolutions)
+shared/kalshi_client.py  (v14 — resolution debug logging)
+
+Changes vs v13:
+  1. Added DEBUG logging before the yes/no filter to catch markets with
+     non-standard result values (weather, etc.)
+  2. Log sample of ALL resolved tickers to see format differences.
+  3. Log any markets with result values other than yes/no.
 
 Changes vs v12:
   1. Added get_historical_markets() to fetch archived settled markets.
-     Markets older than Kalshi's "historical cutoff" (~30 days) are moved
-     to a separate archive and only accessible via /historical/markets.
   2. get_resolved_markets() now also queries historical endpoint and merges
      results, ensuring old weather/sports/etc. markets get resolved.
   3. Added get_historical_cutoff() to check when markets are archived.
-
-Changes vs v11:
-  1. get_resolved_markets(): Changed from min_close_ts to min_settled_ts.
-  2. Added debug logging for weather tickers in settled batch.
-  3. Added get_market() method to fetch a single market by ticker.
 """
 
 import base64
@@ -38,7 +37,6 @@ _RATE_LIMIT_BACKOFF_SEC = 60
 _MAX_RETRIES = 3
 
 # How far back to look beyond the most recent logged outcome.
-# v13: Set to 7 days for backfill, revert to 2 hours after.
 _INGESTION_LOOKBACK = timedelta(hours=2)
 
 # The path prefix expected by the trading API in signatures.
@@ -46,6 +44,9 @@ _API_PATH_PREFIX = "/trade-api/v2"
 
 # Weather ticker prefixes for debug logging
 _WEATHER_PREFIXES = ("KXTEMP", "KXLOWT", "KXHIGH", "KXWTHR", "KXRAIN", "KXSNOW")
+
+# Sports ticker prefixes for debug logging
+_SPORTS_PREFIXES = ("KXMLB", "KXNBA", "KXNFL", "KXNHL")
 
 
 def _load_private_key():
@@ -241,7 +242,6 @@ class KalshiClient:
         """
         try:
             resp = self._get("/historical/cutoff-timestamps")
-            # Response format: {"cutoff_timestamps": {"markets": "2026-03-01T00:00:00Z", ...}}
             cutoffs = resp.get("cutoff_timestamps", {})
             markets_cutoff = cutoffs.get("markets")
             if markets_cutoff:
@@ -258,28 +258,13 @@ class KalshiClient:
     ) -> list:
         """
         Fetch archived/historical markets from Kalshi.
-
-        Parameters
-        ----------
-        tickers : list[str], optional
-            Specific tickers to fetch. If None, fetches all historical.
-        min_close_ts : datetime, optional
-            Only fetch markets that closed after this time.
-        max_pages : int
-            Maximum pages to fetch (100 markets each).
-
-        Returns
-        -------
-        list
-            List of market dicts with result field.
         """
         markets, cursor, page = [], None, 0
 
         while page < max_pages:
             params = {"limit": 100}
             if tickers:
-                # API accepts comma-separated tickers
-                params["tickers"] = ",".join(tickers[:100])  # Max 100 per request
+                params["tickers"] = ",".join(tickers[:100])
             if min_close_ts:
                 params["min_close_ts"] = int(min_close_ts.timestamp())
             if cursor:
@@ -292,8 +277,39 @@ class KalshiClient:
                 break
 
             batch = resp.get("markets", [])
+            
+            # v14: DEBUG — log ALL result values before filtering
+            if page == 0 and batch:
+                unique_results = list({str(m.get("result", "NONE")) for m in batch[:50]})
+                logger.info("DEBUG historical result values: %s", unique_results)
+            
+            # v14: DEBUG — log weather/sports markets BEFORE yes/no filter
+            weather_raw = [m for m in batch if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)]
+            if weather_raw:
+                logger.info(
+                    "DEBUG HISTORICAL weather RAW (before filter): %s",
+                    [(m.get('ticker','')[:45], m.get('result'), m.get('status')) for m in weather_raw[:5]]
+                )
+            
+            sports_raw = [m for m in batch if m.get("ticker", "").upper().startswith(_SPORTS_PREFIXES)]
+            if sports_raw and page == 0:
+                logger.info(
+                    "DEBUG HISTORICAL sports RAW sample: %s",
+                    [(m.get('ticker','')[:45], m.get('result')) for m in sports_raw[:5]]
+                )
+
             # Filter to those with clean results
             clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
+            
+            # v14: Log markets that were FILTERED OUT (non yes/no results)
+            filtered_out = [m for m in batch if str(m.get("result", "")).lower() not in ("yes", "no")]
+            if filtered_out:
+                non_yesno_results = list({str(m.get("result", "NONE")) for m in filtered_out})
+                logger.info(
+                    "DEBUG HISTORICAL filtered out %d markets with results: %s",
+                    len(filtered_out), non_yesno_results[:10]
+                )
+            
             markets.extend(clean)
             page += 1
 
@@ -313,7 +329,6 @@ class KalshiClient:
                 page, len(batch), len(clean), len(markets),
             )
 
-            # If fetching specific tickers, one page is enough
             if tickers:
                 break
 
@@ -332,7 +347,7 @@ class KalshiClient:
         Batches requests to handle large ticker lists.
         """
         all_markets = []
-        batch_size = 50  # Kalshi may limit ticker list length
+        batch_size = 50
 
         for i in range(0, len(tickers), batch_size):
             batch_tickers = tickers[i:i + batch_size]
@@ -363,20 +378,6 @@ class KalshiClient:
     ) -> list:
         """
         Fetch settled markets from Kalshi — both recent and historical.
-
-        Parameters
-        ----------
-        max_pages : int
-            Maximum pages to fetch from regular endpoint.
-        min_settled_ts : datetime, optional
-            UTC-aware datetime cutoff for incremental ingestion.
-        include_historical : bool
-            If True, also query /historical/markets for archived settlements.
-
-        Returns
-        -------
-        list
-            Combined list of settled markets with result field.
         """
         markets, cursor, page = [], None, 0
         seen_tickers = set()
@@ -397,11 +398,39 @@ class KalshiClient:
 
             batch = resp.get("markets", [])
 
+            # v14: DEBUG — log sample of ALL tickers and results on first page
             if page == 0 and batch:
-                sample_results = list({m.get("result") for m in batch[:20]})
-                logger.info("DEBUG resolved result values sample: %s", sample_results)
+                sample_tickers = [(m.get("ticker", "")[:40], m.get("result")) for m in batch[:10]]
+                logger.info("DEBUG resolved ticker+result sample: %s", sample_tickers)
+                
+                unique_results = list({str(m.get("result", "NONE")) for m in batch})
+                logger.info("DEBUG all unique result values in batch: %s", unique_results)
+
+            # v14: DEBUG — log weather markets BEFORE yes/no filter
+            weather_raw = [m for m in batch if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)]
+            if weather_raw:
+                logger.info(
+                    "DEBUG weather RAW (before filter) page %d: %s",
+                    page + 1,
+                    [(m.get('ticker','')[:45], m.get('result'), m.get('status')) for m in weather_raw[:5]]
+                )
+            
+            # v14: DEBUG — log sports markets BEFORE yes/no filter (first page only)
+            sports_raw = [m for m in batch if m.get("ticker", "").upper().startswith(_SPORTS_PREFIXES)]
+            if sports_raw and page == 0:
+                logger.info(
+                    "DEBUG sports RAW sample: %s",
+                    [(m.get('ticker','')[:45], m.get('result')) for m in sports_raw[:5]]
+                )
 
             clean = [m for m in batch if str(m.get("result", "")).lower() in ("yes", "no")]
+            
+            # v14: Log what got filtered out
+            filtered_out = [m for m in batch if str(m.get("result", "")).lower() not in ("yes", "no")]
+            if filtered_out and page == 0:
+                non_yesno = [(m.get("ticker", "")[:40], m.get("result")) for m in filtered_out[:10]]
+                logger.info("DEBUG filtered out (non yes/no): %s", non_yesno)
+
             markets.extend(clean)
             for m in clean:
                 seen_tickers.add(m.get("ticker", ""))
@@ -434,19 +463,25 @@ class KalshiClient:
             m.get("ticker", "") for m in markets
             if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
         ]
+        all_sports = [
+            m.get("ticker", "") for m in markets
+            if m.get("ticker", "").upper().startswith(_SPORTS_PREFIXES)
+        ]
         logger.info(
-            "get_resolved_markets phase 1 complete — %d results, %d weather: %s",
-            len(markets), len(all_weather), all_weather[:10],
+            "get_resolved_markets phase 1 complete — %d results, %d weather, %d sports",
+            len(markets), len(all_weather), len(all_sports),
         )
+        if all_weather:
+            logger.info("Phase 1 weather sample: %s", all_weather[:5])
+        if all_sports:
+            logger.info("Phase 1 sports sample: %s", all_sports[:5])
 
         # ── Phase 2: Historical /historical/markets ───────────────────────────
         if include_historical:
             logger.info("Checking historical archive for older settlements...")
             try:
-                # Get historical markets from the lookback period
                 historical_cutoff = None
                 if min_settled_ts:
-                    # Look back further in historical
                     historical_cutoff = min_settled_ts - timedelta(days=30)
 
                 historical = self.get_historical_markets(
@@ -454,7 +489,6 @@ class KalshiClient:
                     max_pages=20,
                 )
 
-                # Add any we haven't seen
                 new_from_historical = 0
                 for m in historical:
                     ticker = m.get("ticker", "")
@@ -467,11 +501,17 @@ class KalshiClient:
                     m.get("ticker", "") for m in historical
                     if m.get("ticker", "").upper().startswith(_WEATHER_PREFIXES)
                 ]
+                historical_sports = [
+                    m.get("ticker", "") for m in historical
+                    if m.get("ticker", "").upper().startswith(_SPORTS_PREFIXES)
+                ]
                 logger.info(
-                    "Historical phase: %d total, %d new, %d weather: %s",
+                    "Historical phase: %d total, %d new, %d weather, %d sports",
                     len(historical), new_from_historical,
-                    len(historical_weather), historical_weather[:10],
+                    len(historical_weather), len(historical_sports),
                 )
+                if historical_weather:
+                    logger.info("Historical weather sample: %s", historical_weather[:5])
 
             except Exception as e:
                 logger.error("Historical markets fetch failed: %s", e)
@@ -485,8 +525,6 @@ class KalshiClient:
     def get_latest_outcome_ts(self) -> Optional[datetime]:
         """
         Query outcomes table for most recent logged_at timestamp.
-        Returns a UTC-aware datetime with lookback buffer,
-        or None if no outcomes exist yet (triggers full history fetch).
         """
         import os
         database_url = os.getenv("DATABASE_URL", "")
