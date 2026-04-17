@@ -1374,7 +1374,7 @@ class FlywheelOrchestrator:
             # Politics/economics ladder markets are blocked — their spreads are often
             # legitimate (different deadlines or timeframes, not mispricings).
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector not in ("sports", "weather", "crypto"):
+            if inferred_sector not in ("sports", "weather", "crypto", "financial markets"):
                 logger.debug(
                     "CORR SKIP (sector=%s not in sports/weather/crypto): %s",
                     inferred_sector, sig.event_group,
