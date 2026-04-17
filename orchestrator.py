@@ -1,5 +1,15 @@
 """
-orchestrator.py  (v19.26 — Limit orders + Early exit)
+orchestrator.py  (v19.27 — Signal logging for all trade paths)
+
+Changes vs v19.26:
+  1. _execute_fades: Now calls log_signal() before _execute_trade().
+  2. _execute_correlations: Now calls log_signal() for each leg before _execute_trade().
+  3. _execute_resolution_timing: Now calls log_signal() before _execute_trade().
+  
+  BUG FIX: Resolution ingestion matches against the `signals` table, but fade/
+  correlation/restime trades bypassed signal logging — they called _execute_trade()
+  directly. This caused 174 trades with 0 resolved outcomes because there were no
+  signals to match against. Now all trade paths log signals properly.
 
 Changes vs v19.25:
   1. Limit order execution: Instead of market orders, place limits at mid
@@ -1308,6 +1318,21 @@ class FlywheelOrchestrator:
 
             sector = self._last_bot_sectors.get(fade.ticker, "sports")
 
+            # v19.27: Log signal for fade trade so resolution can match
+            if not _signal_exists_in_db(fade.ticker):
+                try:
+                    log_signal(
+                        ticker      = fade.ticker,
+                        sector      = sector,
+                        our_prob    = mock_consensus.avg_prob,
+                        market_prob = fade.yes_price_cents / 100,
+                        edge        = mock_consensus.avg_edge,
+                        confidence  = mock_consensus.avg_confidence,
+                        direction   = mock_consensus.direction,
+                    )
+                except Exception as e:
+                    logger.warning("log_signal failed for fade trade %s: %s", fade.ticker, e)
+
             self._execute_trade(
                 ticker      = fade.ticker,
                 title       = f"[FADE] {fade.ticker}",
@@ -1386,6 +1411,21 @@ class FlywheelOrchestrator:
                     reject_reason  = "",
                 )
 
+                # v19.27: Log signal for correlation trade so resolution can match
+                if not _signal_exists_in_db(ticker):
+                    try:
+                        log_signal(
+                            ticker      = ticker,
+                            sector      = inferred_sector,
+                            our_prob    = mock_consensus.avg_prob,
+                            market_prob = price / 100,
+                            edge        = mock_consensus.avg_edge,
+                            confidence  = mock_consensus.avg_confidence,
+                            direction   = mock_consensus.direction,
+                        )
+                    except Exception as e:
+                        logger.warning("log_signal failed for corr trade %s: %s", ticker, e)
+
                 self._execute_trade(
                     ticker      = ticker,
                     title       = f"[CORR] {sig.event_group}",
@@ -1427,6 +1467,21 @@ class FlywheelOrchestrator:
                 avg_confidence = sig.confidence,
                 reject_reason  = "",
             )
+
+            # v19.27: Log signal for resolution timing trade so resolution can match
+            if not _signal_exists_in_db(sig.ticker):
+                try:
+                    log_signal(
+                        ticker      = sig.ticker,
+                        sector      = sig.sector,
+                        our_prob    = mock_consensus.avg_prob,
+                        market_prob = sig.yes_price_cents / 100,
+                        edge        = mock_consensus.avg_edge,
+                        confidence  = mock_consensus.avg_confidence,
+                        direction   = mock_consensus.direction,
+                    )
+                except Exception as e:
+                    logger.warning("log_signal failed for restime trade %s: %s", sig.ticker, e)
 
             self._execute_trade(
                 ticker      = sig.ticker,
@@ -1636,7 +1691,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.26 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.27 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
