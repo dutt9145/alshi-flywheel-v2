@@ -1,5 +1,12 @@
 """
-bots/sector_bots.py  (v12.4 — EconomicsBot + FinancialMarketsBot resurrected)
+bots/sector_bots.py  (v12.5 — Lower NOAA confidence threshold)
+
+Changes vs v12.4:
+  - WeatherBot: Lowered NOAA confidence threshold from 0.60 to 0.40.
+    This captures more independent weather signals while correlation
+    engine continues finding high-edge divergences (+29% avg edge).
+    The 60% threshold was too strict — confidence formula is
+    `0.4 + 0.05 * sample_count`, so needed 4+ samples to pass.
 
 Changes vs v12.3:
   - EconomicsBot: RESURRECTED from disabled state. Now uses FRED API for
@@ -1462,8 +1469,10 @@ class WeatherBot(BaseBot):
         # Try NOAA first
         noaa = self._get_noaa_prior(market)
         
-        if noaa and noaa.get("confidence", 0) >= 0.60:
-            # NOAA is confident — use it directly, bypass Bayesian model
+        # v12.5: Lowered threshold from 0.60 to 0.40 to capture more weather signals
+        # Correlation engine finds high-edge trades, but we want independent signals too
+        if noaa and noaa.get("confidence", 0) >= 0.40:
+            # NOAA has signal — use it directly, bypass Bayesian model
             our_prob    = noaa["prior_yes"]
             market_prob = _market_prob(market)
             confidence  = noaa["confidence"]
@@ -1483,7 +1492,7 @@ class WeatherBot(BaseBot):
             )
         
         # NOAA unavailable or low confidence — skip instead of using poisoned Bayesian
-        logger.debug("[weather] %s — NOAA unavailable/low conf, skipping", ticker)
+        logger.debug("[weather] %s — NOAA unavailable/low conf (<40%%), skipping", ticker)
         return None
 
 
