@@ -1,5 +1,13 @@
 """
-bots/sector_bots.py  (v12.5 — Lower NOAA confidence threshold)
+bots/sector_bots.py  (v12.6 — LLMBot for qualitative sectors)
+
+Changes vs v12.5:
+  - all_bots(): Replaced EconomicsBot, PoliticsBot, FinancialMarketsBot, 
+    GlobalEventsBot with a single LLMBot that uses Claude API + web search.
+    These qualitative sectors benefit from LLM reasoning + current news context.
+  - Quantitative bots (SportsBot, WeatherBot, CryptoBot) unchanged — they use
+    specialized models with better calibration than LLM guessing.
+  - Old bots kept in file for reference but not instantiated.
 
 Changes vs v12.4:
   - WeatherBot: Lowered NOAA confidence threshold from 0.60 to 0.40.
@@ -2613,12 +2621,22 @@ class GlobalEventsBot(BaseBot):
 # ── Convenience factory ───────────────────────────────────────────────────────
 
 def all_bots() -> list[BaseBot]:
+    """
+    Return all active bots.
+    
+    v12.5: Qualitative sectors (politics, economics, financial_markets, 
+    global_events) now use LLMBot with Claude API + web search.
+    
+    Quantitative sectors (sports, weather, crypto) keep their specialized models.
+    """
+    from shared.llm_bot import LLMBot
+    
     return [
-        EconomicsBot(),
+        # Quantitative bots — keep specialized models
         CryptoBot(),
-        PoliticsBot(),
         WeatherBot(),
-        FinancialMarketsBot(),   # v11.7: replaces TechBot
         SportsBot(),
-        GlobalEventsBot(),       # v11.7: replaces EntertainmentBot
+        # Qualitative bot — LLM with web search handles:
+        # politics, economics, financial_markets, global_events
+        LLMBot(),
     ]
