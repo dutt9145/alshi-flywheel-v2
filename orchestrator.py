@@ -1,5 +1,15 @@
 """
-orchestrator.py  (v19.27 — Signal logging for all trade paths)
+orchestrator.py  (v19.28 — Weather correlation trading enabled)
+
+Changes vs v19.27:
+  1. _execute_correlations: Expanded sector whitelist from ["sports"] to
+     ["sports", "weather"]. Weather temperature markets have valid divergences
+     (if "above 85°F" is 50¢, "above 80°F" MUST be >= 50¢). Politics/economics
+     ladder markets are still blocked as their spreads are often legitimate.
+     
+  BUG FIX: Weather correlation signals were being found but never traded because
+  the v19.20 sports-only gate was blocking them. Dashboard showed 531 sports
+  signals, 0 weather signals despite active weather divergences in logs.
 
 Changes vs v19.26:
   1. _execute_fades: Now calls log_signal() before _execute_trade().
@@ -1353,13 +1363,14 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
-            # v19.21: Only trade sports correlations — politics/economics ladders
-            # (KXTRUMPACT thresholds, KXUSPSPEND levels, KXHORMUZNORM dates) have
-            # legitimate price spreads between rungs, not mispricings.
+            # v19.28: Trade sports AND weather correlations
+            # Politics/economics ladder markets (KXTRUMPACT thresholds, KXUSPSPEND 
+            # levels, KXHORMUZNORM dates) have legitimate price spreads between rungs.
+            # Weather temps are valid: if "above 85°F" is 50¢, "above 80°F" MUST be >= 50¢.
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector != "sports":
+            if inferred_sector not in ("sports", "weather"):
                 logger.debug(
-                    "CORR SKIP (non-sports sector=%s): %s",
+                    "CORR SKIP (sector=%s not in sports/weather): %s",
                     inferred_sector, sig.event_group,
                 )
                 continue
