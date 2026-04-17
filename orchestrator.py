@@ -1708,7 +1708,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.27 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.28 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
