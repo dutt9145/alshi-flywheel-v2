@@ -1,5 +1,20 @@
 """
-orchestrator.py  (v19.28 — Weather + crypto correlation trading enabled)
+orchestrator.py  (v19.29 — Financial markets correlation trading enabled)
+
+Changes vs v19.28:
+  1. _TICKER_SECTOR_MAP: Added new "financial_markets" sector covering:
+     - Commodities: KXJETFUEL, KXWTI, KXOIL, KXGOLD, KXSILVER, KXNAT, KXGASOLINE
+     - Forex: KXUSDJPY, KXEURUSD, KXGBPUSD, KXUSDCAD, KXUSDCHF, KXAUDUSD
+     - Stocks: KXSPY, KXQQQ, KXTSLA, KXAAPL, KXNVDA, KXAMZN, KXGOOG, KXMSFT
+     - Other: KXTRUFT (Truth Social), KXMAR (Marriott), KXHILT (Hilton)
+     These were previously falling back to "economics" and getting blocked.
+     
+  2. _execute_correlations: Added "financial_markets" to sector whitelist.
+     Now: ["sports", "weather", "crypto", "financial_markets"]
+     These are same-date price/threshold ladders where divergences = mispricings:
+       - "Jet fuel above $4.10" must be <= "above $3.70"
+       - "USDJPY above 160.75" must be <= "above 157.50"
+     Politics/economics ladders remain blocked (legitimate time-based spreads).
 
 Changes vs v19.27:
   1. _execute_correlations: Expanded sector whitelist from ["sports"] to
@@ -327,9 +342,17 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxhight",  # v19.22: Was missing — KXHIGHTDAL, KXHIGHTDC, etc.
       ), "weather"),
     (("kxai", "kxtech", "kxfed", "kxcpi", "kxgdp",
-      "kxjobs", "kxrate", "kxinfl", "kxwti", "kxpayroll",
+      "kxjobs", "kxrate", "kxinfl", "kxpayroll",
       "kxhighinfl", "kxuspspend",
       ), "economics"),
+    # v19.29: Financial markets — same-date price ladders safe for correlation
+    (("kxjetfuel", "kxwti", "kxoil", "kxgold", "kxsilver", "kxnat", "kxgasoline",
+      "kxusdjpy", "kxeurusd", "kxgbpusd", "kxusdcad", "kxusdchf", "kxaudusd",
+      "kxspy", "kxqqq", "kxtsla", "kxaapl", "kxnvda", "kxamzn", "kxgoog", "kxmsft",
+      "kxtruft",   # Truth Social metrics
+      "kxmar",     # Marriott hotel rooms
+      "kxhilt",    # Hilton
+      ), "financial_markets"),
 ]
 
 
@@ -1367,16 +1390,17 @@ class FlywheelOrchestrator:
                 break
 
             # v19.28: Trade sports, weather, AND crypto correlations
-            # These sectors have nested threshold markets where divergences = mispricings:
-            #   - Sports: "Over 8.5" must be <= "Over 7.5"
-            #   - Weather: "Above 85°F" must be <= "Above 80°F"  
-            #   - Crypto: "BTC above $100k" must be <= "BTC above $90k"
-            # Politics/economics ladder markets are blocked — their spreads are often
-            # legitimate (different deadlines or timeframes, not mispricings).
+            # v19.29: Added financial_markets — same-date price/threshold ladders:
+            #   - Commodities: "Jet fuel above $4.10" must be <= "above $3.70"
+            #   - Forex: "USDJPY above 160" must be <= "above 157"
+            #   - Stocks: "TSLA above $200" must be <= "above $180"
+            # These are valid nested thresholds like weather/crypto, not time-based.
+            # Politics/economics ladder markets remain blocked — their spreads are
+            # often legitimate (different deadlines or timeframes, not mispricings).
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector not in ("sports", "weather", "crypto", "financial markets"):
+            if inferred_sector not in ("sports", "weather", "crypto", "financial_markets"):
                 logger.debug(
-                    "CORR SKIP (sector=%s not in sports/weather/crypto): %s",
+                    "CORR SKIP (sector=%s not in whitelist): %s",
                     inferred_sector, sig.event_group,
                 )
                 continue
@@ -1708,7 +1732,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.28 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.29 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
