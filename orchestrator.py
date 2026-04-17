@@ -347,6 +347,8 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       ), "economics"),
     # v19.29: Financial markets — same-date price ladders safe for correlation
     (("kxjetfuel", "kxwti", "kxoil", "kxgold", "kxsilver", "kxnat", "kxgasoline",
+      "kxhoil",    # Heating oil (KXHOILW, KXHOILD, etc.)
+      "kxtrufegg", # Eggs commodity
       "kxusdjpy", "kxeurusd", "kxgbpusd", "kxusdcad", "kxusdchf", "kxaudusd",
       "kxspy", "kxqqq", "kxtsla", "kxaapl", "kxnvda", "kxamzn", "kxgoog", "kxmsft",
       "kxtruft",   # Truth Social metrics
