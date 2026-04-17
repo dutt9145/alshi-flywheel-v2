@@ -1,15 +1,18 @@
 """
-orchestrator.py  (v19.28 — Weather correlation trading enabled)
+orchestrator.py  (v19.28 — Weather + crypto correlation trading enabled)
 
 Changes vs v19.27:
   1. _execute_correlations: Expanded sector whitelist from ["sports"] to
-     ["sports", "weather"]. Weather temperature markets have valid divergences
-     (if "above 85°F" is 50¢, "above 80°F" MUST be >= 50¢). Politics/economics
-     ladder markets are still blocked as their spreads are often legitimate.
+     ["sports", "weather", "crypto"]. These sectors have nested threshold
+     markets where divergences ARE mispricings:
+       - Sports: "Over 8.5" must be <= "Over 7.5"
+       - Weather: "Above 85°F" must be <= "Above 80°F"
+       - Crypto: "BTC above $100k" must be <= "BTC above $90k"
+     Politics/economics ladders are still blocked (legitimate spreads).
      
-  BUG FIX: Weather correlation signals were being found but never traded because
-  the v19.20 sports-only gate was blocking them. Dashboard showed 531 sports
-  signals, 0 weather signals despite active weather divergences in logs.
+  BUG FIX: Weather/crypto correlation signals were being found but never
+  traded because the v19.20 sports-only gate was blocking them. Dashboard
+  showed 531 sports signals, 0 weather/crypto despite active divergences.
 
 Changes vs v19.26:
   1. _execute_fades: Now calls log_signal() before _execute_trade().
@@ -1363,14 +1366,17 @@ class FlywheelOrchestrator:
             if self.circuit_breaker.is_halted():
                 break
 
-            # v19.28: Trade sports AND weather correlations
-            # Politics/economics ladder markets (KXTRUMPACT thresholds, KXUSPSPEND 
-            # levels, KXHORMUZNORM dates) have legitimate price spreads between rungs.
-            # Weather temps are valid: if "above 85°F" is 50¢, "above 80°F" MUST be >= 50¢.
+            # v19.28: Trade sports, weather, AND crypto correlations
+            # These sectors have nested threshold markets where divergences = mispricings:
+            #   - Sports: "Over 8.5" must be <= "Over 7.5"
+            #   - Weather: "Above 85°F" must be <= "Above 80°F"  
+            #   - Crypto: "BTC above $100k" must be <= "BTC above $90k"
+            # Politics/economics ladder markets are blocked — their spreads are often
+            # legitimate (different deadlines or timeframes, not mispricings).
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector not in ("sports", "weather"):
+            if inferred_sector not in ("sports", "weather", "crypto"):
                 logger.debug(
-                    "CORR SKIP (sector=%s not in sports/weather): %s",
+                    "CORR SKIP (sector=%s not in sports/weather/crypto): %s",
                     inferred_sector, sig.event_group,
                 )
                 continue
