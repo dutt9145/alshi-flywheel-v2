@@ -955,9 +955,10 @@ class FlywheelOrchestrator:
         
         # Get tickers with signals but no outcome yet
         unresolved_rows = _query_signals(
-            "SELECT DISTINCT ticker FROM signals "
+            "SELECT ticker FROM signals "
             "WHERE outcome IS NULL "
-            "ORDER BY created_at DESC "
+            "GROUP BY ticker "
+            "ORDER BY MAX(created_at) DESC "
             "LIMIT 500"
         )
         
