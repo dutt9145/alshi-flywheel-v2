@@ -958,7 +958,7 @@ class FlywheelOrchestrator:
             "SELECT ticker FROM signals "
             "WHERE outcome IS NULL "
             "GROUP BY ticker "
-            "ORDER BY MAX(created_at) DESC "
+            "ORDER BY MAX(created_at) ASC "
             "LIMIT 500"
         )
         
