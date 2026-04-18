@@ -1,5 +1,21 @@
 """
-orchestrator.py  (v19.29 — Financial markets correlation trading enabled)
+orchestrator.py  (v19.30 — Finalized market resolution fix)
+
+Changes vs v19.29:
+  1. _ingest_resolved_markets: Added Phase 3 for finalized market resolution.
+     The Kalshi API only returns markets with status=settled in batch queries,
+     but weather, crypto, financial_markets, and some sports (ATP tennis)
+     use status=finalized instead. These markets were being traded but never
+     resolved because they didn't appear in the batch query.
+     
+     Phase 3 queries the signals table for unresolved tickers, looks them up
+     individually via get_market(), and resolves any with status=finalized
+     and result in (yes, no).
+     
+  BUG FIX: Weather had 45 trades with 0 resolved outcomes. Crypto had 17
+  trades with 0 resolved. Financial markets had 14 trades with 0 resolved.
+  ATP tennis trades also affected. Only MLB/NBA sports used status=settled
+  and were resolving correctly. Now all sectors resolve properly.
 
 Changes vs v19.28:
   1. _TICKER_SECTOR_MAP: Added new "financial_markets" sector covering:
@@ -354,6 +370,7 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxtruft",   # Truth Social metrics
       "kxmar",     # Marriott hotel rooms
       "kxhilt",    # Hilton
+      "kxnatgas",  # Natural gas (KXNATGASD, KXNATGASW)
       ), "financial_markets"),
 ]
 
@@ -705,6 +722,170 @@ class FlywheelOrchestrator:
 
     # ── Resolution ingestion ───────────────────────────────────────────────────
 
+    def _process_resolved_market(
+        self,
+        market: dict,
+        already_recorded: set[str],
+        processed_this_run: set[str],
+        bayesian_updated_events: set[str],
+    ) -> bool:
+        """
+        Process a single resolved market. Returns True if outcome was recorded.
+        
+        v19.30: Extracted from _ingest_resolved_markets to allow reuse in Phase 3.
+        """
+        p = _ph()
+        
+        ticker = _normalize_ticker(market.get("ticker", ""))
+        result = market.get("result", "")
+        result = result.lower() if result else ""
+        
+        if not ticker or result not in ("yes", "no"):
+            return False
+        if ticker in already_recorded or ticker in processed_this_run:
+            return False
+
+        resolved_yes = result == "yes"
+
+        sig_rows = _query_signals(
+            f"SELECT our_prob, direction FROM signals "
+            f"WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
+            (ticker,),
+        )
+
+        event_key = _normalize_ticker(
+            market.get("event_ticker", "") or ticker.rsplit("-", 1)[0]
+        )
+        allow_bayesian_update = event_key not in bayesian_updated_events
+
+        for bot in self.bots:
+            if not bot.is_relevant(market):
+                continue
+            if not allow_bayesian_update:
+                logger.debug(
+                    "[%s] Skipping duplicate Bayesian update for event %s (ticker=%s)",
+                    bot.sector_name, event_key, ticker,
+                )
+                continue
+            try:
+                features, _ = bot.fetch_features(market, skip_noaa=True)
+                import numpy as np
+                features = np.append(features, [0.0, 0.0])
+                bot.record_outcome(features, resolved_yes)
+                logger.info(
+                    "[%s] Bayesian update: %s → %s",
+                    bot.sector_name, ticker, result.upper(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[%s] record_outcome failed for %s: %s",
+                    bot.sector_name, ticker, e,
+                )
+
+        if allow_bayesian_update:
+            bayesian_updated_events.add(event_key)
+
+        _update_signal_brier(ticker, resolved_yes)
+
+        # v19.17: Brier tracker per-prop recording (MLB)
+        if sig_rows:
+            _prop_code = None
+            for _code in ("HIT", "TB", "HRR", "HR", "KS"):
+                if f"KXMLB{_code}" in ticker.upper():
+                    _prop_code = _code
+                    break
+            if _prop_code:
+                self.brier_tracker.record(
+                    _prop_code, float(sig_rows[0]["our_prob"]),
+                    1 if resolved_yes else 0,
+                )
+
+        # v19.19: NBA player prop outcome recording for logreg training
+        if _is_nba_player_prop(ticker):
+            try:
+                from shared.nba_logistic_model import record_outcome as record_nba_outcome
+                record_nba_outcome(ticker, 1 if resolved_yes else 0)
+                logger.debug("[NBA LOGREG] Recorded outcome: %s → %s", ticker, result.upper())
+            except Exception as e:
+                logger.warning("[NBA LOGREG] record_outcome failed for %s: %s", ticker, e)
+
+        if not sig_rows:
+            processed_this_run.add(ticker)
+            return False
+
+        our_prob  = float(sig_rows[0]["our_prob"])
+        direction = str(sig_rows[0]["direction"])
+
+        direction_correct = (
+            (direction == "YES" and resolved_yes) or
+            (direction == "NO"  and not resolved_yes)
+        )
+
+        pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
+        primary_trade_id   = trade_ids[0] if trade_ids else None
+
+        if primary_trade_id is None:
+            logger.debug(
+                "[OUTCOME SKIP] %s — signal exists but no trade, skipping outcome log",
+                ticker,
+            )
+            processed_this_run.add(ticker)
+            return False
+
+        sec_rows = _query_signals(
+            f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
+            (ticker,),
+        )
+        sec = sec_rows[0].get("sector", "") if sec_rows else ""
+        if not sec:
+            sec = _infer_sector_from_ticker(ticker)
+
+        if pnl_usd is not None:
+            logger.info(
+                "[P&L] %s resolved %s → $%+.2f (primary_trade_id=%s, all_ids=%s)",
+                ticker, result.upper(), pnl_usd, primary_trade_id, trade_ids,
+            )
+            self.circuit_breaker.record_pnl(pnl_usd)
+
+            with self._sector_pnl_lock:
+                if sec in self._sector_daily_pnl:
+                    provisional = self._open_provisionals.pop(ticker, 0.0)
+                    self._sector_daily_pnl[sec] = (
+                        self._sector_daily_pnl[sec] - provisional + pnl_usd
+                    )
+                    logger.debug(
+                        "[PROVISIONAL UNWIND] %s sector=%s "
+                        "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
+                        ticker, sec, provisional, pnl_usd,
+                        self._sector_daily_pnl[sec],
+                    )
+        else:
+            logger.debug(
+                "[P&L] %s resolved %s — no matching trade",
+                ticker, result.upper(),
+            )
+
+        processed_this_run.add(ticker)
+
+        try:
+            log_outcome(
+                ticker   = ticker,
+                resolved = result.upper(),
+                pnl_usd  = pnl_usd,
+                trade_id = primary_trade_id,
+                our_prob = our_prob,
+                correct  = direction_correct,
+                sector   = sec,
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "log_outcome failed for %s (trade_id=%s): %s — "
+                "outcome counted but not persisted; will retry next ingestion cycle",
+                ticker, primary_trade_id, e,
+            )
+            return False
+
     def _ingest_resolved_markets(self) -> int:
         logger.info("=== Resolution ingestion starting ===")
 
@@ -721,8 +902,7 @@ class FlywheelOrchestrator:
             return 0
 
         if not resolved_markets:
-            logger.info("No resolved markets returned from Kalshi.")
-            return 0
+            logger.info("No resolved markets returned from Kalshi (Phase 1/2).")
 
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
@@ -743,9 +923,9 @@ class FlywheelOrchestrator:
 
         processed_this_run: set[str] = set()
         recorded = 0
-
         bayesian_updated_events: set[str] = set()
 
+        # ── Phase 1 & 2: Batch-resolved markets (status=settled + historical) ──
         for market in resolved_markets:
             if self.circuit_breaker.is_halted():
                 logger.warning(
@@ -754,154 +934,86 @@ class FlywheelOrchestrator:
                 )
                 break
 
-            ticker = _normalize_ticker(market.get("ticker", ""))
-            result = market.get("result", "")
-
-            result = result.lower() if result else ""
-            if not ticker or result not in ("yes", "no"):
-                continue
-            if ticker in already_recorded or ticker in processed_this_run:
-                continue
-
-            resolved_yes = result == "yes"
-
-            sig_rows = _query_signals(
-                f"SELECT our_prob, direction FROM signals "
-                f"WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
-                (ticker,),
-            )
-
-            event_key = _normalize_ticker(
-                market.get("event_ticker", "") or ticker.rsplit("-", 1)[0]
-            )
-            allow_bayesian_update = event_key not in bayesian_updated_events
-
-            for bot in self.bots:
-                if not bot.is_relevant(market):
-                    continue
-                if not allow_bayesian_update:
-                    logger.debug(
-                        "[%s] Skipping duplicate Bayesian update for event %s (ticker=%s)",
-                        bot.sector_name, event_key, ticker,
-                    )
-                    continue
-                try:
-                    features, _ = bot.fetch_features(market, skip_noaa=True)
-                    import numpy as np
-                    features = np.append(features, [0.0, 0.0])
-                    bot.record_outcome(features, resolved_yes)
-                    logger.info(
-                        "[%s] Bayesian update: %s → %s",
-                        bot.sector_name, ticker, result.upper(),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "[%s] record_outcome failed for %s: %s",
-                        bot.sector_name, ticker, e,
-                    )
-
-            if allow_bayesian_update:
-                bayesian_updated_events.add(event_key)
-
-            _update_signal_brier(ticker, resolved_yes)
-
-            # v19.17: Brier tracker per-prop recording (MLB)
-            if sig_rows:
-                _prop_code = None
-                for _code in ("HIT", "TB", "HRR", "HR", "KS"):
-                    if f"KXMLB{_code}" in ticker.upper():
-                        _prop_code = _code
-                        break
-                if _prop_code:
-                    self.brier_tracker.record(
-                        _prop_code, float(sig_rows[0]["our_prob"]),
-                        1 if resolved_yes else 0,
-                    )
-
-            # v19.19: NBA player prop outcome recording for logreg training
-            if _is_nba_player_prop(ticker):
-                try:
-                    from shared.nba_logistic_model import record_outcome as record_nba_outcome
-                    record_nba_outcome(ticker, 1 if resolved_yes else 0)
-                    logger.debug("[NBA LOGREG] Recorded outcome: %s → %s", ticker, result.upper())
-                except Exception as e:
-                    logger.warning("[NBA LOGREG] record_outcome failed for %s: %s", ticker, e)
-
-            if not sig_rows:
-                processed_this_run.add(ticker)
-                continue
-
-            our_prob  = float(sig_rows[0]["our_prob"])
-            direction = str(sig_rows[0]["direction"])
-
-            direction_correct = (
-                (direction == "YES" and resolved_yes) or
-                (direction == "NO"  and not resolved_yes)
-            )
-
-            pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
-            primary_trade_id   = trade_ids[0] if trade_ids else None
-
-            if primary_trade_id is None:
-                logger.debug(
-                    "[OUTCOME SKIP] %s — signal exists but no trade, skipping outcome log",
-                    ticker,
-                )
-                processed_this_run.add(ticker)
-                continue
-
-            sec_rows = _query_signals(
-                f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
-                (ticker,),
-            )
-            sec = sec_rows[0].get("sector", "") if sec_rows else ""
-            if not sec:
-                sec = _infer_sector_from_ticker(ticker)
-
-            if pnl_usd is not None:
-                logger.info(
-                    "[P&L] %s resolved %s → $%+.2f (primary_trade_id=%s, all_ids=%s)",
-                    ticker, result.upper(), pnl_usd, primary_trade_id, trade_ids,
-                )
-                self.circuit_breaker.record_pnl(pnl_usd)
-
-                with self._sector_pnl_lock:
-                    if sec in self._sector_daily_pnl:
-                        provisional = self._open_provisionals.pop(ticker, 0.0)
-                        self._sector_daily_pnl[sec] = (
-                            self._sector_daily_pnl[sec] - provisional + pnl_usd
-                        )
-                        logger.debug(
-                            "[PROVISIONAL UNWIND] %s sector=%s "
-                            "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
-                            ticker, sec, provisional, pnl_usd,
-                            self._sector_daily_pnl[sec],
-                        )
-            else:
-                logger.debug(
-                    "[P&L] %s resolved %s — no matching trade",
-                    ticker, result.upper(),
-                )
-
-            processed_this_run.add(ticker)
-
-            try:
-                log_outcome(
-                    ticker   = ticker,
-                    resolved = result.upper(),
-                    pnl_usd  = pnl_usd,
-                    trade_id = primary_trade_id,
-                    our_prob = our_prob,
-                    correct  = direction_correct,
-                    sector   = sec,
-                )
+            if self._process_resolved_market(
+                market, already_recorded, processed_this_run, bayesian_updated_events
+            ):
                 recorded += 1
-            except Exception as e:
-                logger.error(
-                    "log_outcome failed for %s (trade_id=%s): %s — "
-                    "outcome counted but not persisted; will retry next ingestion cycle",
-                    ticker, primary_trade_id, e,
+
+        logger.info(
+            "Phase 1/2 complete — %d outcomes recorded from batch query",
+            recorded,
+        )
+
+        # ── Phase 3: Individual lookup for finalized markets ───────────────────
+        # The Kalshi API only returns markets with status=settled in batch queries.
+        # But weather, crypto, financial_markets, and some sports (ATP tennis) use
+        # status=finalized instead. These markets were traded but never resolved.
+        #
+        # v19.30: Look up unresolved tickers individually to catch finalized ones.
+        
+        logger.info("=== Phase 3: Checking unresolved tickers for finalized status ===")
+        
+        # Get tickers with signals but no outcome yet
+        unresolved_rows = _query_signals(
+            "SELECT DISTINCT ticker FROM signals "
+            "WHERE outcome IS NULL "
+            "ORDER BY created_at DESC "
+            "LIMIT 500"
+        )
+        
+        # Filter out already processed and already recorded
+        unresolved_tickers = [
+            r['ticker'] for r in unresolved_rows
+            if r['ticker'] not in processed_this_run
+            and r['ticker'] not in already_recorded
+        ]
+        
+        if not unresolved_tickers:
+            logger.info("Phase 3: No unresolved tickers to check")
+        else:
+            logger.info(
+                "Phase 3: Checking %d unresolved tickers individually...",
+                len(unresolved_tickers),
+            )
+            
+            # Sample what sectors we're checking
+            sector_counts: dict[str, int] = {}
+            for tk in unresolved_tickers[:100]:
+                sec = _infer_sector_from_ticker(tk)
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            logger.info("Phase 3 sector breakdown: %s", sector_counts)
+            
+            # Look up each ticker individually via get_finalized_markets
+            try:
+                finalized_markets = self.client.get_finalized_markets(
+                    tickers=unresolved_tickers,
+                    rate_limit_sleep=0.15,  # ~7 requests/sec to stay under limits
                 )
+                
+                logger.info(
+                    "Phase 3: Found %d finalized markets out of %d checked",
+                    len(finalized_markets), len(unresolved_tickers),
+                )
+                
+                phase3_recorded = 0
+                for market in finalized_markets:
+                    if self.circuit_breaker.is_halted():
+                        logger.warning("Circuit breaker active — stopping Phase 3")
+                        break
+                    
+                    if self._process_resolved_market(
+                        market, already_recorded, processed_this_run, bayesian_updated_events
+                    ):
+                        phase3_recorded += 1
+                        recorded += 1
+                
+                logger.info(
+                    "Phase 3 complete — %d additional outcomes recorded",
+                    phase3_recorded,
+                )
+                
+            except Exception as e:
+                logger.error("Phase 3 finalized market lookup failed: %s", e)
 
         # v19.17: Save Brier tracker state
         if recorded > 0:
@@ -910,7 +1022,7 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.warning("Brier tracker save failed: %s", e)
 
-        logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
+        logger.info("=== Resolution ingestion complete — %d total new outcomes ===", recorded)
         return recorded
 
     def _run_ingestion_thread(self) -> None:
@@ -1734,7 +1846,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.29 | DEMO=%s | $%.2f | arb_mode=%s",
+            "Kalshi Flywheel v19.30 | DEMO=%s | $%.2f | arb_mode=%s",
             DEMO_MODE, self.bankroll, self.arb._mode,
         )
         init_db()
