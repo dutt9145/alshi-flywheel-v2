@@ -957,6 +957,7 @@ class FlywheelOrchestrator:
         unresolved_rows = _query_signals(
             "SELECT ticker FROM signals "
             "WHERE outcome IS NULL "
+            "AND sector IN ('weather', 'crypto', 'financial_markets') "
             "GROUP BY ticker "
             "ORDER BY MAX(created_at) ASC "
             "LIMIT 500"

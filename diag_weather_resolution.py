@@ -4,35 +4,34 @@ import pathlib
 
 load_dotenv(pathlib.Path('.env'), override=True)
 
+import psycopg2
+
+# Get unresolved tickers the same way Phase 3 does (ASC order)
+db_url = os.getenv("DATABASE_URL")
+conn = psycopg2.connect(db_url)
+cur = conn.cursor()
+
+cur.execute("""
+    SELECT ticker FROM signals 
+    WHERE outcome IS NULL 
+    GROUP BY ticker 
+    ORDER BY MAX(created_at) ASC 
+    LIMIT 20
+""")
+tickers = [r[0] for r in cur.fetchall()]
+conn.close()
+
+print(f"First 20 unresolved tickers (oldest first):")
+for t in tickers:
+    print(f"  {t}")
+
+# Now test a few
 from shared.kalshi_client import KalshiClient
 client = KalshiClient()
 
-# Real tickers from DB that should have resolved (Apr 17 or earlier)
-test_tickers = {
-    "crypto": [
-        "KXBTC-26APR1703-B74850",
-        "KXBTCD-26APR1703-T74599.99",
-    ],
-    "financial_markets": [
-        "KXHOILW-26APR1717-T2.999",
-        "KXWTI-26APR17-T75.99",
-        "KXTRUFEGGS-26APR17-T2.765",
-    ],
-    "sports": [
-        "KXATPCHALLENGERMATCH-26APR16ABOSEY-ABO",
-        "KXATPCHALLENGERMATCH-26APR16BOLNOG-BOL",
-    ],
-}
-
-for sector, tickers in test_tickers.items():
-    print(f"\n=== {sector.upper()} ===")
-    for ticker in tickers:
-        try:
-            market = client.get_market(ticker)
-            if market:
-                print(f"{ticker[:50]}:")
-                print(f"  status={market.get('status')}, result={market.get('result')}")
-            else:
-                print(f"{ticker[:50]}: NOT FOUND")
-        except Exception as e:
-            print(f"{ticker[:50]}: ERROR - {str(e)[:60]}")
+print(f"\nLooking up first 5:")
+for ticker in tickers[:5]:
+    market = client.get_market(ticker)
+    status = market.get('status', 'NOT_FOUND')
+    result = market.get('result', '')
+    print(f"  {ticker}: status={status}, result={result}")
