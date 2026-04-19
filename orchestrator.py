@@ -960,7 +960,7 @@ class FlywheelOrchestrator:
             "AND sector IN ('weather', 'crypto', 'financial_markets') "
             "GROUP BY ticker "
             "ORDER BY MAX(created_at) ASC "
-            "LIMIT 500"
+            "LIMIT 1000"
         )
         
         # Filter out already processed and already recorded
