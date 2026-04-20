@@ -1,15 +1,16 @@
 """
-shared/consensus_engine.py  (v4 — per-sector edge ceilings)
+shared/consensus_engine.py  (v5 — sector calibration offsets)
 
-Changes vs v3:
-  1. Gate 5 now uses sector_max_edge(sector) instead of global MAX_EDGE_PCT.
-     Weather gets 60% ceiling (NOAA-backed predictions), sports gets 40%
-     (MLB Poisson model), uncalibrated sectors stay at 25%.
-     Previously, weather was rejecting 30-60% edges that were genuine NOAA
-     signal — Houston temperature markets with 96% confidence and 58% edge
-     were being thrown away because the global ceiling was 25%.
-  2. Import updated to pull sector_max_edge from settings.
-  3. All other gates unchanged from v3.
+Changes vs v4:
+  1. Added SECTOR_CALIBRATION dict with probability offsets based on
+     historical prediction vs actual analysis (2026-04-19):
+       Sports: predicted 33% YES, actual 46% → +13% offset
+       Crypto: predicted 25% YES, actual 38% → +13% offset
+       Weather: predicted 34% YES, actual 25% → -9% offset
+  2. Gate 2 (direction agreement) now uses calibrated probabilities
+     to determine direction, fixing the all-NO-trades bug.
+  3. Weighted average probs are calibrated before direction/edge calc.
+  4. All other gates unchanged from v4.
 """
 
 import logging
@@ -26,6 +27,33 @@ from config.settings import (
 
 logger = logging.getLogger(__name__)
 
+# ── Sector calibration offsets (v5) ────────────────────────────────────────────
+# Based on historical prediction vs actual analysis (2026-04-19):
+#   Sector        | Predicted | Actual | Offset
+#   sports        | 33% YES   | 46%    | +0.13 (under-predicting)
+#   crypto        | 25% YES   | 38%    | +0.13 (under-predicting)
+#   weather       | 34% YES   | 25%    | -0.09 (over-predicting)
+#   financial_mkts| (tbd)     | (tbd)  | 0.00  (no data yet)
+#
+# These offsets shift raw model probabilities before direction is determined.
+# This fixes the bug where 971/971 trades were NO because models consistently
+# predicted low YES probabilities.
+SECTOR_CALIBRATION = {
+    'sports':            0.13,
+    'crypto':            0.13,
+    'weather':          -0.09,
+    'financial_markets': 0.00,
+    'economics':         0.00,
+    'politics':          0.00,
+    'global_events':     0.00,
+}
+
+
+def _calibrate_prob(prob: float, sector: str) -> float:
+    """Apply sector calibration offset to probability, clamped to [0.05, 0.95]."""
+    offset = SECTOR_CALIBRATION.get(sector, 0.0)
+    return max(0.05, min(0.95, prob + offset))
+
 
 @dataclass
 class BotSignal:
@@ -33,20 +61,25 @@ class BotSignal:
     Output from a single sector bot for a given contract.
     """
     sector:          str
-    prob:            float          # our P(YES)
+    prob:            float          # our P(YES) — raw, before calibration
     confidence:      float          # model confidence 0–1
     market_prob:     float          # market's implied P(YES) from yes_price/100
     brier_score:     Optional[float] = None   # rolling Brier — lower = better
 
     @property
+    def calibrated_prob(self) -> float:
+        """Probability after applying sector calibration offset."""
+        return _calibrate_prob(self.prob, self.sector)
+
+    @property
     def edge(self) -> float:
-        """Signed edge: positive = we think YES is underpriced."""
-        return self.prob - self.market_prob
+        """Signed edge: positive = we think YES is underpriced (uses calibrated prob)."""
+        return self.calibrated_prob - self.market_prob
 
     @property
     def direction(self) -> str:
-        """YES if we think it should resolve YES, NO otherwise."""
-        return "YES" if self.prob > self.market_prob else "NO"
+        """YES if we think it should resolve YES, NO otherwise (uses calibrated prob)."""
+        return "YES" if self.calibrated_prob > self.market_prob else "NO"
 
 
 @dataclass
@@ -126,8 +159,10 @@ class ConsensusEngine:
                 reject_reason="No bots responded",
             )
 
-        # ── Gate 2: direction agreement ────────────────────────────────────────
-        directions = [s.direction for s in signals]
+        # ── Gate 2: direction agreement (v5: uses calibrated probs) ────────────
+        # Direction is now determined from calibrated_prob, not raw prob.
+        # This fixes the all-NO-trades bug caused by systematic under-prediction.
+        directions = [s.direction for s in signals]  # Uses calibrated_prob via property
         if len(set(directions)) > 1:
             disagreements = ", ".join(f"{s.sector}={s.direction}" for s in signals)
             return ConsensusResult(
@@ -140,11 +175,12 @@ class ConsensusEngine:
 
         direction = directions[0]
 
-        # ── Weighted averages ──────────────────────────────────────────────────
+        # ── Weighted averages (v5: uses calibrated probs) ──────────────────────
         weights    = np.array([self._bot_weight(s) for s in signals])
         weights   /= weights.sum()
 
-        probs      = np.array([s.prob       for s in signals])
+        # v5: Use calibrated probabilities for averaging
+        probs      = np.array([s.calibrated_prob for s in signals])
         confs      = np.array([s.confidence for s in signals])
 
         avg_prob  = float(np.dot(weights, probs))
@@ -152,6 +188,18 @@ class ConsensusEngine:
         avg_edge  = avg_prob - market_prob
         if direction == "NO":
             avg_edge = market_prob - avg_prob
+
+        # Log calibration effect for debugging
+        raw_probs = [s.prob for s in signals]
+        cal_probs = [s.calibrated_prob for s in signals]
+        if raw_probs != cal_probs:
+            logger.debug(
+                "[Consensus] %s calibration: raw=%s cal=%s dir=%s",
+                ticker, 
+                [f"{p:.2f}" for p in raw_probs],
+                [f"{p:.2f}" for p in cal_probs],
+                direction,
+            )
 
         # ── Gate 3: edge floor ─────────────────────────────────────────────────
         if avg_edge < CONSENSUS_EDGE_PCT:
