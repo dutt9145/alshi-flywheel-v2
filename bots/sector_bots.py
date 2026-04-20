@@ -1,5 +1,22 @@
 """
-bots/sector_bots.py  (v12.6 — LLMBot for qualitative sectors)
+bots/sector_bots.py  (v12.7 — data-driven blocklist update + financial_markets disabled)
+
+Changes vs v12.6:
+  - SportsBot.SPORT_BLOCKLIST: REMOVED kxmlbspr — KXMLBSPREAD has 0.19 Brier,
+    best MLB performer. Should NOT be blocked.
+  - SportsBot.SPORT_BLOCKLIST: ADDED data-driven blocklist entries:
+      kxmlbf5     — 149 resolved, 0.30 Brier (first 5 innings, no model)
+      kxncaamlax  — 18 resolved, 0.77 Brier (NCAA lacrosse, catastrophic)
+      kxowgame    — 4 resolved, 0.58 Brier (Overwatch)
+      kxlolgame   — 8 resolved, 0.43 Brier (LoL games)
+      kxwtachall  — 6 resolved, 0.44 Brier (WTA challenger)
+      kxwtamatch  — 21 resolved, 0.39 Brier (WTA match)
+  - all_bots(): Removed financial_markets from LLMBot sectors.
+    financial_markets had 0.55 overall Brier — coin-flip territory.
+    KXWTI (0.78 Brier) and KXHOILW (0.43 Brier) were the worst offenders.
+  - FinancialMarketsBot.evaluate(): Now returns None unconditionally.
+  - Updated sector calibration recommendation: Weather -15% (was -9%)
+    based on 282 resolved signals (predicted 35%, actual 20%).
 
 Changes vs v12.5:
   - all_bots(): Replaced EconomicsBot, PoliticsBot, FinancialMarketsBot, 
@@ -261,16 +278,10 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxatp", "kxwta", "kxtennis", "kxabagame",
 
         # ── Golf ──────────────────────────────────────────────────────────
-        # v11.3: kxpga was missing → bled into crypto ("pga" no match but
-        # ticker substring issues) and weather (golfer city names).
-        # kxowga was missing → bled into economics.
         "kxgolf", "kxpga", "kxowga",
         "kxlpga",      # v12.2: LPGA Tour (was leaking to weather)
 
         # ── International soccer ──────────────────────────────────────────
-        # v11.3: ALL of these were missing. Argentine soccer (kxarg) bled
-        # into crypto (120 signals). La Liga, Bundesliga, Serie A, etc.
-        # bled into weather via city name keyword matching.
         "kxepl", "kxsoccer",
         "kxarg",       # Argentine Primera División (kxargp, kxargl)
         "kxlali",      # La Liga
@@ -291,15 +302,10 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxdensuperliga",  # Danish Superliga         
 
         # ── Cricket ───────────────────────────────────────────────────────
-        # v11.3: kxcba was missing → cricket bled into weather AND crypto.
-        # KXCBAGAME matched WeatherBot city keywords, got 0.92 NOAA priors
-        # applied to cricket matches. All 6 "resolved" weather outcomes
-        # were cricket → Brier 0.4269.
         "kxcba", "kxcricket",
         "kxt20",             # v11.8: T20 cricket (was leaking to weather/politics)
 
         # ── International basketball ──────────────────────────────────────
-        # v11.3: all missing → bled into crypto and weather.
         "kxfiba",      # FIBA
         "kxacbg",      # ACB (Spanish basketball)
         "kxvtbg",      # VTB League (Russian basketball)
@@ -308,21 +314,16 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxnpbg",      # NBP / basketball
 
         # ── Hockey ────────────────────────────────────────────────────────
-        # v11.3: kxahlg missing → AHL bled into weather.
         "kxahlg",      # AHL (American Hockey League)
 
         # ── Track & field ─────────────────────────────────────────────────
-        # v11.3: kxdima missing → Diamond League bled into weather and economics.
         "kxdima",      # Diamond League
 
         # ── A-League (Australian soccer) ──────────────────────────────────
-        # v11.3: kxalea missing → A-League bled into weather via "melbourne"
-        # city keyword match (Melbourne City FC, Melbourne Victory).
         "kxalea",
         "kxafl",       # AFL (Australian Football League)
 
         # ── UFL (United Football League) — v11.5 ─────────────────────────
-        # Was leaking into weather via city name keyword matching.
         "kxufl",
 
         # ── Combat sports ─────────────────────────────────────────────────
@@ -343,77 +344,43 @@ def _has_sports_prefix(market: dict) -> bool:
         "kxr6g",       # Rainbow Six — v11.3
 
         # ── International sports (generic) ────────────────────────────────
-        # v11.3: kxintl was missing → bled into politics via "kxintl" keyword.
         "kxintl",
 
         # ── v11.7: Prefixes found by classifier_audit.py ────────────────
-        # CONMEBOL (98 signals → weather/crypto)
         "kxconmebol",
-        # Chilean soccer (22 signals → weather via "kxchll" chill keyword)
         "kxchll",
-        # Euroleague basketball (6 signals → politics via "kxeu" prefix)
         "kxeuroleague",
-        # Ekstraklasa Polish soccer (3 signals → politics/economics)
         "kxekstraklasa",
-        # Swedish Hockey League
         "kxshl",
-        # Uruguayan Primera División
         "kxurypd",
-        # UCL spread (kxuclt was too specific — missed kxuclspread)
         "kxucl",
-        # Turkish Super Lig
         "kxsuperlig",
-        # Danish Superliga soccer
         "kxdensuperliga",
-        # Egyptian Premier League
         "kxegypl",
-        # ITF tennis (women + men)
         "kxitf",
-        # IPL cricket (team totals, fours, sixes)
         "kxipl",
-        # Scottish Premiership
         "kxscottishprem",
-        # UEFA Europa League
         "kxuel",
-        # Eredivisie (Dutch soccer)
         "kxeredivisie",
-        # MotoGP racing
         "kxmotogp",
-        # BBL (Big Bash League)
         "kxbbl",
-        # KF tour
         "kxkf",
-        # Allsvenskan (Swedish soccer)
         "kxallsvenskan",
-        # Argentine Premier Division (more specific than kxarg)
         "kxargpremdiv",
-        # NextAG
         "kxnextag",
 
         # v11.8d: New leagues found in 2026-04-12 logs
-        # DEL (Deutsche Eishockey Liga — German hockey)
         "kxdel",
-        # KHL (Kontinental Hockey League — Russian hockey)
         "kxkhl",
-        # J.B.League (Japanese basketball)
         "kxjbleague",
-        # KBL (Korean basketball)
         "kxkbl",
-        # K League (Korean soccer)
         "kxkleague",
 
         # v12.2: "Next X" prediction markets (coaching hires, etc.)
-        # KXNEXTNBACOACH-MIL26 was matching WeatherBot "milwaukee" keyword
         "kxnext",
 
         # ── Entertainment / unmodelable (block from all sector bots) ──────
-        # v11.3: Survivor TV show (429 signals) matched WeatherBot via city
-        # keywords in episode titles. No bot can model this, so blocking it
-        # here causes it to be skipped entirely (correct behavior).
         "kxsurv",      # Survivor TV show mentions
-        # v12.1: REMOVED kxartiststream — now ONLY in ENTERTAINMENT_PREFIXES
-        # so GlobalEventsBot can claim it. Was causing deadlock where no bot
-        # could claim KXARTISTSTREAMS markets.
     )
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
@@ -421,26 +388,7 @@ def _has_sports_prefix(market: dict) -> bool:
 
 
 def _is_unmodelable_market(market: dict) -> bool:
-    """v11.5: Markets that no current bot can meaningfully predict.
-
-    These markets either:
-    - Require live transcript / video analysis (MENTION markets)
-    - Require domain knowledge no API exposes (Survivor TV outcomes)
-    - Are pure entertainment trivia (awards show predictions)
-
-    Every bot's is_relevant() checks this FIRST and returns False.
-    The market is then skipped entirely — no signal is logged, no garbage
-    predictions pollute the calibration data.
-
-    This eliminates ~460+ noise signals/day in 26-04 audit:
-      - 440 KXSURVIVORMENT
-      - 13  KXMLBMENTION
-      - 13  KXNBAMENTION
-      - 13  KXPOLITICSMENT
-      - 13  KXGOVERNORMENT
-      - 1   KXFOXNEWSMENTI
-      - 1   KXFURYMENTION
-    """
+    """v11.5: Markets that no current bot can meaningfully predict."""
     et = market.get("event_ticker", "").lower()
     tk = market.get("ticker", "").lower()
 
@@ -456,16 +404,7 @@ def _is_unmodelable_market(market: dict) -> bool:
 
 
 def _is_entertainment_market(market: dict) -> bool:
-    """v11.5: Entertainment / streaming / awards markets.
-
-    These get claimed by GlobalEventsBot. Listed separately from
-    _is_unmodelable_market because GlobalEventsBot WILL eventually
-    have a real model — for now it just claims the markets to keep
-    them out of crypto/weather/economics.
-
-    v11.8: Added kxthevoice, kxfestival.
-    v12.1: kxartiststream is now ONLY here (removed from SPORTS_PREFIXES).
-    """
+    """v11.5: Entertainment / streaming / awards markets."""
     ENTERTAINMENT_PREFIXES = (
         "kxspotify",     # Spotify chart positions
         "kxspotstream",  # Spotify streaming markets (was incorrectly in crypto)
@@ -587,14 +526,7 @@ class EconomicsBot(BaseBot):
         return features, context
 
     def evaluate(self, market, news_signal=None):
-        """v12.4: RESURRECTED with real FRED-based model.
-        
-        Handles:
-          - Fed rate decision markets (FOMC, rate hike/cut)
-          - Inflation markets (CPI, PCE thresholds)
-          - Employment markets (unemployment, jobless claims)
-          - Treasury yield markets
-        """
+        """v12.4: RESURRECTED with real FRED-based model."""
         ticker = market.get("ticker", "")
         title = market.get("title", "").lower()
         
@@ -611,7 +543,6 @@ class EconomicsBot(BaseBot):
         
         # ── Rate Decision Markets ────────────────────────────────────────────
         if any(kw in title for kw in ["rate hike", "rate cut", "fomc", "federal reserve", "fed funds", "basis points"]):
-            # Detect decision type
             if "hike" in title or "raise" in title or "increase" in title:
                 decision = "hike"
             elif "cut" in title or "lower" in title or "decrease" in title:
@@ -619,16 +550,13 @@ class EconomicsBot(BaseBot):
             else:
                 decision = "hold"
             
-            # Get current rate
             current_rate = snapshot.fed_funds_upper or 5.25
             
-            # Extract target rate from title if present
             rate_match = re.search(r"(\d+\.?\d*)\s*%", title)
             target_rate = float(rate_match.group(1)) if rate_match else current_rate
             
             our_prob = fred.predict_rate_decision(current_rate, target_rate, decision)
             
-            # Higher confidence when inflation data is recent
             if snapshot.cpi_yoy is not None:
                 confidence = 0.65
             
@@ -641,21 +569,17 @@ class EconomicsBot(BaseBot):
         
         # ── Inflation Markets ────────────────────────────────────────────────
         elif any(kw in title for kw in ["cpi", "inflation", "pce"]):
-            # Extract threshold
             threshold_match = re.search(r"(\d+\.?\d*)\s*%", title)
             threshold = float(threshold_match.group(1)) if threshold_match else 3.0
             
-            # Determine comparison
             above = any(kw in title for kw in ["above", "exceed", "over", "higher"])
             below = any(kw in title for kw in ["below", "under", "lower"])
             
             current_cpi = snapshot.cpi_yoy or snapshot.core_cpi_yoy or 3.0
             
-            # Simple probability based on current vs threshold
             distance = current_cpi - threshold
             
-            if above or (not below):  # Default to "above"
-                # P(CPI > threshold)
+            if above or (not below):
                 if distance > 0.5:
                     our_prob = min(0.90, 0.70 + distance * 0.05)
                 elif distance > 0:
@@ -665,7 +589,6 @@ class EconomicsBot(BaseBot):
                 else:
                     our_prob = max(0.10, 0.40 + distance * 0.05)
             else:
-                # P(CPI < threshold) = 1 - P(CPI > threshold)
                 if distance < -0.5:
                     our_prob = min(0.90, 0.70 + abs(distance) * 0.05)
                 elif distance < 0:
@@ -682,7 +605,6 @@ class EconomicsBot(BaseBot):
         
         # ── Employment Markets ───────────────────────────────────────────────
         elif any(kw in title for kw in ["unemployment", "jobless", "nonfarm", "payroll"]):
-            # Extract threshold
             threshold_match = re.search(r"(\d+\.?\d*)", title)
             
             if "unemployment" in title:
@@ -702,7 +624,6 @@ class EconomicsBot(BaseBot):
                 
             elif "jobless" in title:
                 current = snapshot.jobless_claims or 220000
-                # Threshold usually in thousands
                 threshold = float(threshold_match.group(1)) * 1000 if threshold_match else 250000
                 
                 above = any(kw in title for kw in ["above", "exceed"])
@@ -717,7 +638,6 @@ class EconomicsBot(BaseBot):
                 rationale = f"claims={current/1000:.0f}K_vs_{threshold/1000:.0f}K"
             
             else:
-                # Generic employment — need more specific parsing
                 return None
             
             logger.info(
@@ -734,7 +654,6 @@ class EconomicsBot(BaseBot):
             else:
                 current = snapshot.treasury_10y or 4.5
             
-            # Extract threshold
             threshold_match = re.search(r"(\d+\.?\d*)\s*%", title)
             threshold = float(threshold_match.group(1)) if threshold_match else current
             
@@ -746,7 +665,7 @@ class EconomicsBot(BaseBot):
             else:
                 our_prob = 0.50 - min(0.30, max(-0.30, distance * 0.15))
             
-            confidence = 0.52  # Yields are harder to predict
+            confidence = 0.52
             rationale = f"yield={current:.2f}%_vs_{threshold:.2f}%"
             logger.info(
                 "[economics] %s: %s → P=%.1f%%",
@@ -754,17 +673,14 @@ class EconomicsBot(BaseBot):
             )
         
         else:
-            # Unhandled economics market type — skip for now
             logger.debug("[economics] %s: no handler for this market type", ticker[:35])
             return None
         
         if our_prob is None:
             return None
         
-        # Clamp probability
         our_prob = max(0.05, min(0.95, our_prob))
         
-        # Build BotSignal
         market_price = _market_prob(market)
         edge = our_prob - market_price
         direction = "yes" if our_prob > market_price else "no"
@@ -788,10 +704,6 @@ class EconomicsBot(BaseBot):
 class CryptoBot(BaseBot):
     """
     Crypto price, dominance, ETF, DeFi, Layer 2, and exchange markets.
-
-    v11.2: Removed bare short keywords "op", "near", "base", "sei" that were
-    substring-matching inside unrelated words ("operation", "nearby",
-    "baseball", "series"). Replaced with more specific multi-word variants.
     """
 
     KEYWORDS = [
@@ -799,8 +711,6 @@ class CryptoBot(BaseBot):
         "kxbtc", "kxeth", "kxsol", "kxxrp", "kxcrypto", "kxdoge",
         "kxbnb", "kxavax", "kxlink", "kxcoin", "kxmatic", "kxada",
         "kxdot", "kxatom", "kxnear", "kxfil", "kxapt", "kxsui",
-        # v11.7: removed kxspotstream — it was Spotify streaming, not crypto.
-        # Spot BTC ETF tickers use kxspotbtc/kxnetf, not kxspotstream.
         "kxshib", "kxnetf",
         "kxshiba",  # SHIB token explicit
 
@@ -843,18 +753,14 @@ class CryptoBot(BaseBot):
     }
 
     # v12.2: Blocklist for crypto markets we can't model
-    # KXBTCD = BTC daily price targets — 0.488 Brier on 7 resolved, catastrophic
     CRYPTO_BLOCKLIST = (
         "kxbtcd",      # BTC daily targets (not 15M, different dynamics)
         "kxethd",      # ETH daily targets
         "kxsold",      # SOL daily targets
-        # v12.2: 15M markets for volatile altcoins — no edge
         "kxsol15m",    # 8 resolved, 0.2375 Brier
         "kxxrp15m",    # 5 resolved, 0.2688 Brier
-        # v12.2: Random sports leaking to crypto
         "kxtabletennis",  # Table tennis
         "kxballerleague", # Baller League soccer
-        # v12.2: Politics leaking via NEWS SPIKE
         "kxleavecherfilus",  # Congress leave (politics)
         "kxleavegonzales",   # Congress leave (politics)
         "kxleavemills",      # Congress leave (politics)
@@ -887,7 +793,6 @@ class CryptoBot(BaseBot):
         if _has_sports_prefix(market):
             return False
         
-        # v12.2: Blocklist daily target markets (KXBTCD, etc.)
         et = market.get("event_ticker", "").lower()
         tk = market.get("ticker", "").lower()
         if any(et.startswith(p) or tk.startswith(p) for p in self.CRYPTO_BLOCKLIST):
@@ -930,13 +835,7 @@ class CryptoBot(BaseBot):
     }
 
     def evaluate(self, market, news_signal=None):
-        """v11.8d: Scale confidence per coin based on historical Brier scores.
-
-        BTC/BNB keep near-full confidence (Brier <= 0.13).
-        ETH gets 70% (Brier 0.187).
-        SOL/XRP get 50% (Brier ~0.27).
-        DOGE 15M markets excluded entirely (Brier 0.395).
-        """
+        """v11.8d: Scale confidence per coin based on historical Brier scores."""
         ticker  = market.get("ticker", "").lower()
         coin_id = self._detect_coin(market)
 
@@ -970,17 +869,12 @@ class CryptoBot(BaseBot):
 class PoliticsBot(BaseBot):
     """
     US + international elections, legislation, geopolitics, appointments.
-
-    v11.3: Removed "kxintl" from KEYWORDS — those are international sports
-    (KXINTLFIGHT etc.), not politics. Politics retains "kxun", "kxnato",
-    "kxeu" for international political markets.
     """
 
     KEYWORDS = [
         # ── Kalshi kx-prefixes ──────────────────────────────────────────────
         "kxpres", "kxsenate", "kxhouse", "kxgov", "kxelect",
         "kxpol", "kxcong", "kxsupct", "kxadmin",
-        # v11.3: removed "kxintl" — international sports, not politics
         "kxun", "kxnato", "kxeu",
 
         # ── US politics ────────────────────────────────────────────────────
@@ -1058,22 +952,8 @@ class PoliticsBot(BaseBot):
 class WeatherBot(BaseBot):
     """
     Temperature, precipitation, storms — worldwide city coverage.
-
-    v11.3: Renamed _ESPORTS_BLOCKLIST → _NON_WEATHER_BLOCKLIST and expanded
-    with cricket (kxcba), track (kxdima), A-League (kxalea), Survivor (kxsurv),
-    and all international soccer/basketball prefixes that were matching city
-    keywords and getting NOAA priors applied to sports markets.
-
-    v11.8: Added kxt20, kxhighinfl, kxfestival, kxthevoice.
-    
-    v12.3: Added evaluate() override that uses NOAA directly when NOAA
-    confidence >= 0.60, bypassing the poisoned Bayesian model.
     """
 
-    # ── Non-weather prefix blocklist — defense in depth ────────────────────────
-    # Primary guard is _has_sports_prefix(). This secondary check ensures no
-    # non-weather market ever gets a NOAA prior even if prefix normalization
-    # or UUID stripping produces an unexpected form.
     _NON_WEATHER_BLOCKLIST = (
         # Esports (from v11.2)
         "kxow", "kxvalorant", "kxlol", "kxleague",
@@ -1081,78 +961,75 @@ class WeatherBot(BaseBot):
         "kxcsgo", "kxcs2", "kxdota",
         "kxapex", "kxfort", "kxhalo", "kxsc2",
         "kxesport", "kxintlf",
-        # v11.3 additions — these all matched city keywords
-        "kxcba",       # Cricket (matched city names → 0.92 NOAA priors)
-        "kxdima",      # Diamond League
-        "kxalea",      # A-League ("melbourne" match)
-        "kxsurv",      # Survivor TV show
-        "kxarg",       # Argentine soccer ("buenos aires")
-        "kxbras",      # Brazilian soccer ("sao paulo", "rio")
-        "kxlali",      # La Liga ("madrid", "barcelona")
-        "kxbund",      # Bundesliga ("munich", "berlin")
-        "kxseri",      # Serie A ("rome", "milan")
-        "kxbelg",      # Belgian ("brussels")
-        "kxswis",      # Swiss ("zurich", "geneva")
-        "kxjlea",      # J-League ("tokyo", "osaka")
-        "kxpga",       # PGA golf
-        "kxowga",      # Golf
-        "kxahlg",      # AHL hockey
-        "kxfiba",      # FIBA basketball
-        "kxacbg",      # ACB basketball
-        "kxvtbg",      # VTB basketball
-        "kxuclt",      # Champions League
-        "kxr6g",       # Rainbow Six
-        "kxintl",      # International sports
-        "kxfifa",      # FIFA
+        # v11.3 additions
+        "kxcba",
+        "kxdima",
+        "kxalea",
+        "kxsurv",
+        "kxarg",
+        "kxbras",
+        "kxlali",
+        "kxbund",
+        "kxseri",
+        "kxbelg",
+        "kxswis",
+        "kxjlea",
+        "kxpga",
+        "kxowga",
+        "kxahlg",
+        "kxfiba",
+        "kxacbg",
+        "kxvtbg",
+        "kxuclt",
+        "kxr6g",
+        "kxintl",
+        "kxfifa",
         # v11.8 additions
-        "kxt20",       # T20 cricket (SWE/IDN matched city keywords)
-        "kxhighinfl",  # KXHIGHINFLATION matched "kxhigh" weather prefix
-        "kxfestival",  # Festival events (matched "nyc" city keyword)
-        "kxthevoice",  # The Voice TV show
-        "kxafl",       # AFL (Australian Football League — "sydney" city match)
-        # v11.8d: news-spike bypass leaks — these tickers fire on ALL bots
-        # via BaseBot.evaluate() news-velocity path, bypassing is_relevant()
-        "kxswalwell",  # Swalwell dropout (politics)
-        "kxtrumppardons",  # Trump pardons (politics)
-        "kxtrumpendorse",  # Trump endorsements (politics)
-        "kxdenmarkpm",     # Denmark PM (politics)
-        "kxisraelpm",      # Israel PM (politics)
-        "kxswencounters",  # Star Wars encounters (entertainment)
-        "kxabagame",       # WTA tennis (ABA → sports, not weather)
-        "kxpayrolls",      # Payrolls (economics)
-        "kxlcpi",          # CPI (economics)
-        "kxcpi",           # CPI (economics)
-        "kxwti",           # WTI crude oil (economics)
+        "kxt20",
+        "kxhighinfl",
+        "kxfestival",
+        "kxthevoice",
+        "kxafl",
+        # v11.8d: news-spike bypass leaks
+        "kxswalwell",
+        "kxtrumppardons",
+        "kxtrumpendorse",
+        "kxdenmarkpm",
+        "kxisraelpm",
+        "kxswencounters",
+        "kxabagame",
+        "kxpayrolls",
+        "kxlcpi",
+        "kxcpi",
+        "kxwti",
         # v11.8d: new leagues found 2026-04-12
-        "kxdel",           # DEL German hockey
-        "kxkhl",           # KHL Russian hockey
-        "kxjbleague",      # J.B.League Japanese basketball
-        "kxkbl",           # KBL Korean basketball
-        "kxkleague",       # K League Korean soccer
-        "kxartiststream",  # Spotify streaming (entertainment)
-        # v12.2: "Next X" prediction markets (coaching hires, etc.)
-        "kxnext",          # KXNEXTNBACOACH matched "milwaukee" city keyword
-        # v12.2: Golf and UEFA leaks
-        "kxlpga",          # LPGA Tour golf
-        "kxuecl",          # UEFA Europa Conference League
-        # v12.2: Random leagues leaking to weather
-        "kxtabletennis",   # Table tennis
-        "kxkbogame",       # Korean baseball
-        "kxlnbelite",      # French basketball (LNB Elite)
-        "kxchnsl",         # Chinese Super League
-        "kxapfddh",        # Unknown league
-        "kxballerleague",  # Baller League soccer
-        "kxitfwmatch",     # ITF women's tennis
-        "kxitfmmatch",     # ITF men's tennis
+        "kxdel",
+        "kxkhl",
+        "kxjbleague",
+        "kxkbl",
+        "kxkleague",
+        "kxartiststream",
+        # v12.2
+        "kxnext",
+        "kxlpga",
+        "kxuecl",
+        "kxtabletennis",
+        "kxkbogame",
+        "kxlnbelite",
+        "kxchnsl",
+        "kxapfddh",
+        "kxballerleague",
+        "kxitfwmatch",
+        "kxitfmmatch",
         # v12.2: Politics tickers leaking via NEWS SPIKE
-        "kxtrumpact",      # Trump actions (politics)
-        "kxtrumptime",     # Trump timing (politics)
-        "kxmamdanieo",     # Mamdani EO (politics)
-        "kxleavecherfilus",# Congress leave (politics)
-        "kxleavegonzales", # Congress leave (politics)
-        "kxleavemills",    # Congress leave (politics)
-        "kxhormuznorm",    # Hormuz blockade (politics)
-        "kxca14swinner",   # CA-14 special election (politics)
+        "kxtrumpact",
+        "kxtrumptime",
+        "kxmamdanieo",
+        "kxleavecherfilus",
+        "kxleavegonzales",
+        "kxleavemills",
+        "kxhormuznorm",
+        "kxca14swinner",
     )
 
     KEYWORDS = [
@@ -1238,7 +1115,7 @@ class WeatherBot(BaseBot):
         "canberra", "darwin", "auckland", "wellington",
         "christchurch", "suva", "port moresby",
 
-        # ── US airport codes (NWS uses these in market titles) ────────────
+        # ── US airport codes ───────────────────────────────────────────────
         "jfk", "lax", "ord", "dfw", "atl", "sfo", "mia", "sea",
         "den", "bos", "iah", "phx", "las", "msp", "dtw", "ewr",
         "phl", "slc", "pdx", "mco", "tpa", "mdw", "bwi", "iad",
@@ -1296,19 +1173,13 @@ class WeatherBot(BaseBot):
         return "weather"
 
     def is_relevant(self, market: dict) -> bool:
-        # ── v11.5 guards ──────────────────────────────────────────────────
         if _is_unmodelable_market(market):
             return False
         if _is_entertainment_market(market):
             return False
-
-        # ── Primary guard: sports prefix check ────────────────────────────
         if _has_sports_prefix(market):
             return False
 
-        # ── Secondary guard: explicit non-weather blocklist ────────────────
-        # Defense in depth — catches non-weather markets even if
-        # _has_sports_prefix misses them due to UUID suffix or normalization.
         et = market.get("event_ticker", "").lower()
         tk = market.get("ticker", "").lower()
         if any(et.startswith(p) or tk.startswith(p) for p in self._NON_WEATHER_BLOCKLIST):
@@ -1456,31 +1327,16 @@ class WeatherBot(BaseBot):
 
         return features, context
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # v12.3: NOAA-FIRST EVALUATION — bypasses poisoned Bayesian model
-    # ─────────────────────────────────────────────────────────────────────────
-
     def evaluate(self, market, news_signal=None):
-        """v12.3: NOAA-first evaluation — bypass Bayesian model when NOAA is confident.
-        
-        The Bayesian model prior was poisoned to ~3% by duplicate signals and
-        misattributed outcomes. Use NOAA directly when NOAA confidence >= 0.60
-        (covers temp_high, temp_low, precip, snow markets).
-        
-        This ensures P(YES)=0.93 from NOAA becomes our_p=0.93, not our_p=0.069.
-        """
+        """v12.3: NOAA-first evaluation — bypass Bayesian model when NOAA is confident."""
         if not self.is_relevant(market):
             return None
         
         ticker = market.get("ticker", "")
         
-        # Try NOAA first
         noaa = self._get_noaa_prior(market)
         
-        # v12.5: Lowered threshold from 0.60 to 0.40 to capture more weather signals
-        # Correlation engine finds high-edge trades, but we want independent signals too
         if noaa and noaa.get("confidence", 0) >= 0.40:
-            # NOAA has signal — use it directly, bypass Bayesian model
             our_prob    = noaa["prior_yes"]
             market_prob = _market_prob(market)
             confidence  = noaa["confidence"]
@@ -1496,37 +1352,38 @@ class WeatherBot(BaseBot):
                 prob        = our_prob,
                 confidence  = confidence,
                 market_prob = market_prob,
-                brier_score = 0.15,  # Conservative until calibrated
+                brier_score = 0.15,
             )
         
-        # NOAA unavailable or low confidence — skip instead of using poisoned Bayesian
         logger.debug("[weather] %s — NOAA unavailable/low conf (<40%%), skipping", ticker)
         return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  5. FINANCIAL MARKETS BOT (replaces TechBot v11.7)
+#     v12.7: DISABLED — 0.55 overall Brier (coin-flip territory)
+#     Class kept for reference. Not instantiated in all_bots().
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FinancialMarketsBot(BaseBot):
     """
     Individual stocks, earnings, M&A, IPOs across ALL sectors — not just tech.
 
-    v11.7: Replaces TechBot. Broader scope covers banks, healthcare, energy,
-    retail alongside tech. Economics handles macro (CPI, GDP, FOMC);
-    this bot handles company-level financial events.
+    v12.7: DISABLED — 0.55 overall Brier across 19 resolved signals.
+    KXWTI had 0.78 Brier (7 resolved), KXHOILW had 0.43 Brier (9 resolved).
+    The entire sector was performing at coin-flip level or worse.
+    Class kept in file for reference but removed from all_bots().
     """
 
-    # v12.2: Blocklist for random sports/games leaking to financial_markets
     FINMARKETS_BLOCKLIST = (
-        "kxtabletennis",  # Table tennis
-        "kxballerleague", # Baller League soccer
-        "kxkbogame",      # Korean baseball
-        "kxlnbelite",     # French basketball
-        "kxchnsl",        # Chinese Super League
-        "kxapfddh",       # Unknown league
-        "kxitfwmatch",    # ITF women's tennis
-        "kxitfmmatch",    # ITF men's tennis
+        "kxtabletennis",
+        "kxballerleague",
+        "kxkbogame",
+        "kxlnbelite",
+        "kxchnsl",
+        "kxapfddh",
+        "kxitfwmatch",
+        "kxitfmmatch",
     )
 
     KEYWORDS = [
@@ -1591,8 +1448,6 @@ class FinancialMarketsBot(BaseBot):
         "amazon": "AMZN",   "nvidia": "NVDA",    "tesla": "TSLA",
         "intel": "INTC",    "amd": "AMD",         "qualcomm": "QCOM",
         "tsmc": "TSM",
-        # v11.8d: removed "samsung": "005930.KS" — Finnhub 403s on Korean
-        # tickers every scan. FinancialMarketsBot disabled anyway.
         "jpmorgan": "JPM",  "goldman sachs": "GS", "bank of america": "BAC",
         "pfizer": "PFE",    "exxon": "XOM",       "walmart": "WMT",
     }
@@ -1608,7 +1463,6 @@ class FinancialMarketsBot(BaseBot):
             return False
         if _has_sports_prefix(market):
             return False
-        # v12.2: Check blocklist for random sports leaking
         ticker = market.get("ticker", "").lower()
         if any(ticker.startswith(bl) for bl in self.FINMARKETS_BLOCKLIST):
             return False
@@ -1636,207 +1490,13 @@ class FinancialMarketsBot(BaseBot):
         return features, context
 
     def evaluate(self, market, news_signal=None):
-        """v12.4: RESURRECTED with real Yahoo Finance-based model.
+        """v12.7: DISABLED — entire sector has 0.55 Brier.
         
-        Handles:
-          - Stock price threshold markets (AAPL above $200, etc.)
-          - Earnings beat/miss markets
-          - Index level markets (S&P 500 above X, etc.)
-          - VIX level markets
+        Previously had handlers for stock price thresholds, earnings,
+        index levels, and VIX. All performed at or worse than coin flip.
+        Returns None unconditionally.
         """
-        ticker = market.get("ticker", "")
-        title = market.get("title", "").lower()
-        
-        try:
-            mkt = get_market_data_client()
-            snapshot = mkt.get_market_snapshot()
-        except Exception as e:
-            logger.warning("[financial_markets] Market data unavailable: %s", e)
-            return None
-        
-        our_prob = None
-        confidence = 0.55  # Base confidence
-        rationale = ""
-        
-        # ── Stock Price Threshold Markets ────────────────────────────────────
-        # Detect company
-        company_symbol = self._detect_company(market)
-        
-        # Check if it's a price threshold market
-        price_match = re.search(r"\$?([\d,]+(?:\.\d+)?)", title.replace(",", ""))
-        has_above_below = any(kw in title for kw in ["above", "below", "exceed", "under", "over"])
-        
-        if price_match and has_above_below and company_symbol:
-            threshold = float(price_match.group(1))
-            above = any(kw in title for kw in ["above", "exceed", "over"])
-            
-            # Get current stock price
-            quote = mkt.get_quote(company_symbol)
-            if quote and quote.price > 0:
-                current_price = quote.price
-                
-                # Determine timeframe from title
-                if any(kw in title for kw in ["week", "7 day", "next week"]):
-                    timeframe = "week"
-                elif any(kw in title for kw in ["month", "30 day"]):
-                    timeframe = "month"
-                else:
-                    timeframe = "day"
-                
-                comparison = "above" if above else "below"
-                our_prob = mkt.predict_price_threshold(
-                    company_symbol, threshold, comparison, timeframe
-                )
-                
-                # VIX-adjusted confidence
-                if snapshot.vix and snapshot.vix > 25:
-                    confidence = 0.45  # High VIX = more uncertainty
-                elif snapshot.vix and snapshot.vix < 15:
-                    confidence = 0.62  # Low VIX = more predictable
-                else:
-                    confidence = 0.55
-                
-                # Boost confidence if near the threshold
-                distance_pct = abs(current_price - threshold) / current_price * 100
-                if distance_pct < 2:
-                    confidence = min(0.70, confidence + 0.10)  # Near threshold = more edge
-                
-                rationale = f"{company_symbol}={current_price:.2f}_vs_{threshold:.2f}_{timeframe}_vix={snapshot.vix:.1f}"
-                logger.info(
-                    "[financial_markets] %s: %s $%.2f vs threshold $%.2f → P=%.1f%% (VIX=%.1f)",
-                    ticker[:30], company_symbol, current_price, threshold,
-                    our_prob * 100, snapshot.vix or 0,
-                )
-        
-        # ── Earnings Markets ─────────────────────────────────────────────────
-        elif any(kw in title for kw in ["earnings", "eps", "revenue", "beat", "miss"]):
-            company_symbol = self._detect_company(market)
-            
-            if "beat" in title:
-                direction = "beat"
-            elif "miss" in title:
-                direction = "miss"
-            else:
-                direction = "beat"  # Default to asking about beat
-            
-            our_prob = mkt.predict_earnings_move(company_symbol, 0, direction)
-            
-            # Earnings are hard to predict — lower confidence
-            confidence = 0.48
-            rationale = f"earnings_{direction}_{company_symbol}"
-            logger.info(
-                "[financial_markets] %s: earnings %s → P=%.1f%%",
-                ticker[:35], direction, our_prob * 100,
-            )
-        
-        # ── Index Level Markets ──────────────────────────────────────────────
-        elif any(kw in title for kw in ["s&p", "sp500", "s&p 500", "dow", "nasdaq"]):
-            # Detect index
-            if "nasdaq" in title:
-                index_symbol = "QQQ"
-                current = snapshot.qqq_price or 0
-            else:
-                index_symbol = "SPY"
-                current = snapshot.spy_price or 0
-            
-            # Extract threshold
-            level_match = re.search(r"([\d,]+)", title.replace(",", ""))
-            if level_match and current > 0:
-                threshold = float(level_match.group(1))
-                
-                # Index levels are often quoted differently (SPY vs S&P 500)
-                # S&P 500 ~5000 → SPY ~500
-                if threshold > current * 5:
-                    threshold = threshold / 10  # Likely S&P points, convert to ETF
-                
-                above = any(kw in title for kw in ["above", "exceed", "over"])
-                comparison = "above" if above else "below"
-                
-                our_prob = mkt.predict_price_threshold(
-                    index_symbol, threshold, comparison, "day"
-                )
-                
-                # VIX adjustment
-                if snapshot.vix and snapshot.vix > 25:
-                    confidence = 0.42
-                else:
-                    confidence = 0.52
-                
-                rationale = f"{index_symbol}={current:.2f}_vs_{threshold:.2f}"
-                logger.info(
-                    "[financial_markets] %s: index %s vs %.2f → P=%.1f%%",
-                    ticker[:35], index_symbol, threshold, our_prob * 100,
-                )
-            else:
-                return None
-        
-        # ── VIX Level Markets ────────────────────────────────────────────────
-        elif "vix" in title:
-            vix_data = mkt.get_vix()
-            if not vix_data:
-                return None
-            
-            # Extract threshold
-            level_match = re.search(r"(\d+\.?\d*)", title)
-            if level_match:
-                threshold = float(level_match.group(1))
-                current = vix_data.current
-                
-                above = any(kw in title for kw in ["above", "exceed", "spike"])
-                distance = current - threshold
-                
-                # VIX is mean-reverting, so adjust probability
-                if above:
-                    if distance > 5:
-                        our_prob = 0.75  # Already well above
-                    elif distance > 0:
-                        our_prob = 0.55 + distance * 0.03
-                    else:
-                        # Mean reversion: VIX tends to spike
-                        our_prob = 0.35 + abs(distance) * 0.01  
-                else:
-                    if distance < -5:
-                        our_prob = 0.75
-                    elif distance < 0:
-                        our_prob = 0.55 + abs(distance) * 0.03
-                    else:
-                        our_prob = 0.40 - distance * 0.02
-                
-                confidence = 0.50  # VIX is volatile
-                rationale = f"vix={current:.1f}_vs_{threshold:.1f}"
-                logger.info(
-                    "[financial_markets] %s: VIX %.1f vs %.1f → P=%.1f%%",
-                    ticker[:35], current, threshold, our_prob * 100,
-                )
-            else:
-                return None
-        
-        else:
-            # Unhandled market type
-            logger.debug("[financial_markets] %s: no handler", ticker[:35])
-            return None
-        
-        if our_prob is None:
-            return None
-        
-        # Clamp probability
-        our_prob = max(0.05, min(0.95, our_prob))
-        
-        # Build BotSignal
-        market_price = _market_prob(market)
-        edge = our_prob - market_price
-        direction = "yes" if our_prob > market_price else "no"
-        
-        return BotSignal(
-            sector="financial_markets",
-            ticker=ticker,
-            our_prob=our_prob,
-            market_prob=market_price,
-            edge=edge,
-            direction=direction,
-            confidence=confidence,
-            rationale=rationale,
-        )
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1847,13 +1507,12 @@ class SportsBot(BaseBot):
     """
     US + international sports, esports, combat sports, Olympic events.
 
-    v11.3: Added all international soccer, cricket, basketball, golf, hockey,
-    track & field, and A-League prefixes to KEYWORDS and LEAGUE_MAP.
-
-    v12.2: Added per-sport confidence scaling based on resolved Brier scores.
+    v12.7: Updated SPORT_BLOCKLIST with data-driven additions from 
+    2026-04-20 Brier score audit. REMOVED kxmlbspr (0.19 Brier — best
+    MLB performer). ADDED kxmlbf5, kxncaamlax, kxowgame, kxlolgame,
+    kxwtachall, kxwtamatch.
     """
 
-    # ── Structural market blocklist ────────────────────────────────────────────
     _SINGLE_GAME_BLOCKLIST = (
         "kxmvecrosscategory",
         "kxmvecrosscat",
@@ -1863,36 +1522,26 @@ class SportsBot(BaseBot):
         "kxmvesportsmulti",
     )
 
-    # ── v12.2: Per-sport confidence scaling based on historical Brier scores ───
-    # Derived from resolved signals query 2026-04-13:
-    #   NCAAMB: 0.1159 (7 resolved) → keep full confidence
-    #   LALIGA: 0.0343 (2 resolved) → keep full
-    #   CS2:    0.2141 (4 resolved) → minor scale
-    #   MLB:    0.2267 (86 resolved) → was 0.918 avg_conf, scale to ~0.69
-    #   NBA:    0.2960 (12 resolved) → worst major, significant haircut
-    #   VALORANT: 0.2495 (16 resolved)
-    #   LOL:    0.2521 (6 resolved)
-    #   TENNIS: 0.2607 (7 resolved)
     SPORT_CONFIDENCE_SCALE = {
         # ── Strong performers (Brier < 0.15) ──────────────────────────────
-        "NCAAMB": 1.00,     # 0.1159 Brier — excellent
-        "LALIGA": 1.00,     # 0.0343 Brier (small sample)
-        "ECUL":   1.00,     # 0.0362 Brier (small sample)
-        "SOCCER": 0.95,     # 0.1525 Brier (1 resolved)
+        "NCAAMB": 1.00,
+        "LALIGA": 1.00,
+        "ECUL":   1.00,
+        "SOCCER": 0.95,
 
         # ── Decent performers (Brier 0.15-0.22) ───────────────────────────
-        "ALEAGU": 0.90,     # 0.2160 Brier
-        "CS2":    0.85,     # 0.2141 Brier
+        "ALEAGU": 0.90,
+        "CS2":    0.85,
 
         # ── Volume drivers needing calibration (Brier 0.22-0.30) ──────────
-        "MLB":      0.75,   # 0.2267 Brier, 86 resolved — highest volume
-        "VALORANT": 0.65,   # 0.2495 Brier
-        "LOL":      0.65,   # 0.2521 Brier
-        "NCAABB":   0.65,   # 0.2559 Brier (KXNCAABB)
-        "TENNIS":   0.60,   # 0.2607 Brier
-        "BUNDES":   0.60,   # 0.2654 Brier
-        "NCAAWB":   0.60,   # 0.2667 Brier (KXNCAAWB)
-        "NBA":      0.55,   # 0.2960 Brier — worst major category
+        "MLB":      0.75,
+        "VALORANT": 0.65,
+        "LOL":      0.65,
+        "NCAABB":   0.65,
+        "TENNIS":   0.60,
+        "BUNDES":   0.60,
+        "NCAAWB":   0.60,
+        "NBA":      0.55,
 
         # ── Unproven / low sample (conservative) ──────────────────────────
         "NHL":      0.60,
@@ -1902,8 +1551,10 @@ class SportsBot(BaseBot):
         "PGA":      0.50,
     }
 
-    # ── v12.2: Blocklist for catastrophic Brier (> 0.40) or noise markets ──────
-    # These markets should not generate signals at all.
+    # ── v12.7: SPORT_BLOCKLIST — data-driven update 2026-04-20 ─────────────────
+    # Key changes from v12.6:
+    #   REMOVED: kxmlbspr (KXMLBSPREAD has 0.19 Brier — BEST MLB performer)
+    #   ADDED:   kxmlbf5, kxncaamlax, kxowgame, kxlolgame, kxwtachall, kxwtamatch
     SPORT_BLOCKLIST = (
         "kxbelgia",   # 0.5662 Brier — Belgian league garbage
         "kxjbleag",   # 0.4262 Brier — J.B.League
@@ -1912,7 +1563,14 @@ class SportsBot(BaseBot):
         "kxmvecbc",   # 4530 signals, 0 resolved, 0.32 conf — futures noise
         # v12.2: Game-level MLB markets — no real model, flat prior pollution
         "kxmlbtot",   # 31 resolved, 0.2360 Brier — game totals
-        "kxmlbspr",   # 53 resolved, 0.2210 Brier — game spreads
+        # v12.7: REMOVED kxmlbspr — KXMLBSPREAD has 0.19 Brier, BEST MLB performer!
+        # v12.7: Data-driven blocklist additions (2026-04-20 audit) ─────────
+        "kxmlbf5",        # 149 resolved, 0.30 Brier — first 5 innings (NO model, high volume garbage)
+        "kxncaamlax",     # 18 resolved, 0.77 Brier — NCAA lacrosse (CATASTROPHIC)
+        "kxowgame",       # 4 resolved, 0.58 Brier — Overwatch
+        "kxlolgame",      # 8 resolved, 0.43 Brier — LoL games
+        "kxwtachall",     # 6 resolved, 0.44 Brier — WTA challenger
+        "kxwtamatch",     # 21 resolved, 0.39 Brier — WTA match
         # v12.2: Game-level NBA markets — no real model, flat prior pollution
         "kxnbatotal",     # 707 signals, 5 resolved, 0.31 Brier
         "kxnbateamtotal", # 230 signals, 2 resolved
@@ -1934,14 +1592,14 @@ class SportsBot(BaseBot):
         "kxbundesli",     # 4 resolved, 0.2654 Brier — Bundesliga
         "kxaleagueg",     # 3 resolved, 0.2862 Brier — A-League games
         # v12.2: Random leagues leaking to wrong sectors — blocklist all
-        "kxtabletennis",  # Table tennis — leaking to crypto/weather
-        "kxkbogame",      # Korean baseball — leaking to weather
-        "kxlnbelite",     # French basketball — leaking to weather
-        "kxchnsl",        # Chinese Super League — leaking to weather
-        "kxapfddh",       # Unknown league — leaking to weather
-        "kxballerleague", # Baller League — leaking to crypto
-        "kxitfwmatch",    # ITF women's tennis
-        "kxitfmmatch",    # ITF men's tennis
+        "kxtabletennis",
+        "kxkbogame",
+        "kxlnbelite",
+        "kxchnsl",
+        "kxapfddh",
+        "kxballerleague",
+        "kxitfwmatch",
+        "kxitfmmatch",
     )
 
     KEYWORDS = [
@@ -1950,8 +1608,8 @@ class SportsBot(BaseBot):
         "kxmvecbchampionship",
         "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls", "kxufc",
         "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-        # ── Tennis ─────────────────────────────────────────────────────────
-        "kxatp", "kxwta", "kxtennis", "kxabagame",        "kxf1", "kxolympic", "kxepl", "kxsoccer",
+        "kxatp", "kxwta", "kxtennis", "kxabagame",
+        "kxf1", "kxolympic", "kxepl", "kxsoccer",
         "kxboxing", "kxwwe", "kxcricket", "kxrugby", "kxesport",
         "kxthail", "kxsl",
         # ── Esports ────────────────────────────────────────────────────────
@@ -1960,50 +1618,27 @@ class SportsBot(BaseBot):
         "kxdota", "kxintlf", "kxcs2", "kxcsgo",
         "kxapex", "kxfort",
         "kxegypt", "kxvenf",
-        "kxr6g",           # Rainbow Six — v11.3
+        "kxr6g",
 
         # ── International soccer — v11.3 ──────────────────────────────────
-        "kxarg",           # Argentine Primera División
-        "kxlali",          # La Liga
-        "kxbund",          # Bundesliga
-        "kxseri",          # Serie A
-        "kxliga",          # Liga generic
-        "kxligu",          # Ligue 1
-        "kxbras",          # Brasileirão
-        "kxswis",          # Swiss Super League
-        "kxbelg",          # Belgian Pro League
-        "kxecul",          # Ecuadorian Liga Pro
-        "kxpslg",          # PSL
-        "kxsaud",          # Saudi Pro League
-        "kxjlea",          # J-League
-        "kxuclt",          # UEFA Champions League
-        "kxuecl",          # v12.2: UEFA Europa Conference League
-        "kxfifa",          # FIFA
-        "kxintl",          # International sports
-        "kxalea",          # A-League (Australia)
-        "kxafl",           # AFL (Australian Football League)
+        "kxarg", "kxlali", "kxbund", "kxseri", "kxliga", "kxligu",
+        "kxbras", "kxswis", "kxbelg", "kxecul", "kxpslg", "kxsaud",
+        "kxjlea", "kxuclt", "kxuecl", "kxfifa", "kxintl", "kxalea", "kxafl",
 
-        # ── Golf — v11.3 ──────────────────────────────────────────────────
-        "kxpga",           # PGA Tour
-        "kxlpga",          # v12.2: LPGA Tour
-        "kxowga",          # Golf (was leaking into economics)
+        # ── Golf ──────────────────────────────────────────────────────────
+        "kxpga", "kxlpga", "kxowga",
 
-        # ── Cricket — v11.3 ───────────────────────────────────────────────
-        "kxcba",           # CBA cricket
+        # ── Cricket ───────────────────────────────────────────────────────
+        "kxcba",
 
-        # ── International basketball — v11.3 ──────────────────────────────
-        "kxfiba",          # FIBA
-        "kxacbg",          # ACB (Spanish)
-        "kxvtbg",          # VTB League (Russian)
-        "kxbalg",          # Baltic basketball
-        "kxbbse",          # BBL / basketball
-        "kxnpbg",          # NBP / basketball
+        # ── International basketball ──────────────────────────────────────
+        "kxfiba", "kxacbg", "kxvtbg", "kxbalg", "kxbbse", "kxnpbg",
 
-        # ── Hockey — v11.3 ────────────────────────────────────────────────
-        "kxahlg",          # AHL
+        # ── Hockey ────────────────────────────────────────────────────────
+        "kxahlg",
 
-        # ── Track & field — v11.3 ─────────────────────────────────────────
-        "kxdima",          # Diamond League
+        # ── Track & field ─────────────────────────────────────────────────
+        "kxdima",
 
         # ── US major leagues ───────────────────────────────────────────────
         "nba", "nfl", "mlb", "nhl", "mls", "ufc", "mma",
@@ -2032,7 +1667,6 @@ class SportsBot(BaseBot):
         "juventus", "inter milan", "ac milan", "napoli",
         "psg", "paris saint germain", "ajax", "benfica",
         "porto", "celtic", "rangers",
-        # v11.3 additions
         "argentine primera", "brasileirao", "j-league",
         "saudi pro league", "belgian pro league", "swiss super league",
         "a-league",
@@ -2067,7 +1701,7 @@ class SportsBot(BaseBot):
         "majors cs2", "vlr valorant", "vct", "valorant champions",
         "rainbow six", "r6 siege",
 
-        # ── Cricket — v11.3 ───────────────────────────────────────────────
+        # ── Cricket ───────────────────────────────────────────────────────
         "cricket", "test match", "odi cricket", "ipl", "ashes",
 
         # ── Other sports ───────────────────────────────────────────────────
@@ -2082,36 +1716,16 @@ class SportsBot(BaseBot):
         "nba finals", "stanley cup", "nfl championship",
         "world series finals", "ncaa championship",
 
-        # ── v11.7: classifier audit additions ─────────────────────────────
-        "kxconmebol",      # CONMEBOL (South American soccer)
-        "kxchll",          # Chilean soccer
-        "kxeuroleague",    # Euroleague basketball
-        "kxekstraklasa",   # Polish Ekstraklasa
-        "kxshl",           # Swedish Hockey League
-        "kxurypd",         # Uruguayan Primera División
-        "kxucl",           # UCL (broader than kxuclt)
-        "kxsuperlig",      # Turkish Super Lig
-        "kxegypl",         # Egyptian Premier League
-        "kxitf",           # ITF tennis
-        "kxipl",           # IPL cricket
-        "kxt20",           # v11.8: T20 cricket internationals
-        "kxscottishprem",  # Scottish Premiership
-        "kxuel",           # UEFA Europa League
-        "kxeredivisie",    # Eredivisie (Dutch)
-        "kxmotogp",        # MotoGP
-        "kxbbl",           # Big Bash League
-        "kxkf",            # KF tour
-        "kxallsvenskan",   # Allsvenskan (Swedish soccer)
-        "kxargpremdiv",    # Argentine Premier Division
-        "kxnextag",        # NextAG
+        # ── v11.7+ classifier audit additions ─────────────────────────────
+        "kxconmebol", "kxchll", "kxeuroleague", "kxekstraklasa",
+        "kxshl", "kxurypd", "kxucl", "kxsuperlig", "kxegypl",
+        "kxitf", "kxipl", "kxt20", "kxscottishprem", "kxuel",
+        "kxeredivisie", "kxmotogp", "kxbbl", "kxkf",
+        "kxallsvenskan", "kxargpremdiv", "kxnextag",
         # v11.8d: new leagues 2026-04-12
-        "kxdel",           # DEL (Deutsche Eishockey Liga)
-        "kxkhl",           # KHL (Kontinental Hockey League)
-        "kxjbleague",      # J.B.League (Japanese basketball)
-        "kxkbl",           # KBL (Korean basketball)
-        "kxkleague",       # K League (Korean soccer)
+        "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
         # v12.2: "Next X" prediction markets
-        "kxnext",          # KXNEXTNBACOACH, etc.
+        "kxnext",
     ]
 
     LEAGUE_MAP = {
@@ -2120,69 +1734,31 @@ class SportsBot(BaseBot):
         "kxncaa": "NCAAB", "kxcbb": "NCAAB", "kxcfb": "NCAAF",
         "kxmvesports": "NBA", "kxmvecbchampionship": "NCAAB",
         "kxepl": "EPL", "kxsoccer": "MLS",
-        # Tennis
         "kxatp": "ATP", "kxwta": "WTA", "kxtennis": "ATP", "kxabagame": "ABA",
         "kxf1": "F1",
         "kxboxing": "BOXING", "kxgolf": "PGA",
-        # Esports
         "kxow": "OWL", "kxvalorant": "VCT", "kxlol": "LOL",
         "kxleague": "LOL", "kxrl": "RL", "kxrocketleague": "RL",
         "kxdota": "DOTA2", "kxcs2": "CS2", "kxcsgo": "CS2",
         "kxr6g": "R6",
-        # ── v11.3 additions ────────────────────────────────────────────────
-        # International soccer
-        "kxarg":  "ARGPD",
-        "kxlali": "LALIGA",
-        "kxbund": "BUNDESLIGA",
-        "kxseri": "SERIEA",
-        "kxliga": "LIGA",
-        "kxligu": "LIGUE1",
-        "kxbras": "BRASILEIRAO",
-        "kxswis": "SWISS",
-        "kxbelg": "BELGIAN",
-        "kxecul": "ECUADORIAN",
-        "kxpslg": "PSL",
-        "kxsaud": "SAUDI",
-        "kxjlea": "JLEAGUE",
-        "kxuclt": "UCL",
-        "kxuecl": "UECL",  # v12.2: UEFA Europa Conference League
-        "kxfifa": "FIFA",
-        "kxintl": "INTL",
-        "kxalea": "ALEAGUE",
-        "kxafl":  "AFL",
-        # Golf
-        "kxpga":  "PGA",
-        "kxlpga": "LPGA",  # v12.2
-        "kxowga": "PGA",
-        # Cricket
-        "kxcba":  "CRICKET",
-        "kxt20":  "T20",       # v11.8
-        # Basketball
-        "kxfiba": "FIBA",
-        "kxacbg": "ACB",
-        "kxvtbg": "VTB",
-        "kxbalg": "BALTIC",
-        "kxbbse": "BBL",
-        "kxnpbg": "NBP",
-        # Hockey
-        "kxahlg": "AHL",
-        # Track
-        "kxdima": "DIAMOND",
-        # v11.8d: new leagues 2026-04-12
-        "kxdel":  "DEL",
-        "kxkhl":  "KHL",
-        "kxjbleague": "JBLEAGUE",
-        "kxkbl":  "KBL",
-        "kxkleague": "KLEAGUE",
+        "kxarg":  "ARGPD", "kxlali": "LALIGA", "kxbund": "BUNDESLIGA",
+        "kxseri": "SERIEA", "kxliga": "LIGA", "kxligu": "LIGUE1",
+        "kxbras": "BRASILEIRAO", "kxswis": "SWISS", "kxbelg": "BELGIAN",
+        "kxecul": "ECUADORIAN", "kxpslg": "PSL", "kxsaud": "SAUDI",
+        "kxjlea": "JLEAGUE", "kxuclt": "UCL", "kxuecl": "UECL",
+        "kxfifa": "FIFA", "kxintl": "INTL", "kxalea": "ALEAGUE",
+        "kxafl":  "AFL", "kxpga":  "PGA", "kxlpga": "LPGA",
+        "kxowga": "PGA", "kxcba":  "CRICKET", "kxt20":  "T20",
+        "kxfiba": "FIBA", "kxacbg": "ACB", "kxvtbg": "VTB",
+        "kxbalg": "BALTIC", "kxbbse": "BBL", "kxnpbg": "NBP",
+        "kxahlg": "AHL", "kxdima": "DIAMOND",
+        "kxdel":  "DEL", "kxkhl":  "KHL", "kxjbleague": "JBLEAGUE",
+        "kxkbl":  "KBL", "kxkleague": "KLEAGUE",
     }
 
     @property
     def sector_name(self) -> str:
         return "sports"
-
-    # ─────────────────────────────────────────────────────────────────────
-    # v12.2: SPORT DETECTION AND CONFIDENCE SCALING
-    # ─────────────────────────────────────────────────────────────────────
 
     def _detect_sport_code(self, ticker: str) -> str:
         """Extract sport code from ticker for confidence scaling."""
@@ -2240,10 +1816,6 @@ class SportsBot(BaseBot):
         sport_code = self._detect_sport_code(ticker)
         scale = self.SPORT_CONFIDENCE_SCALE.get(sport_code, 0.50)
         return raw_conf * scale
-
-    # ─────────────────────────────────────────────────────────────────────
-    # v11.4: MLB PLAYER PROP ROUTING
-    # ─────────────────────────────────────────────────────────────────────
 
     def _try_mlb_player_prop(self, market: dict):
         """Route MLB player prop markets through the new hit-rate model."""
@@ -2373,10 +1945,6 @@ class SportsBot(BaseBot):
 
         return None
 
-    # ─────────────────────────────────────────────────────────────────────
-    # v11.6 + v12: NBA PLAYER PROP ROUTING + FEATURE LOGGING
-    # ─────────────────────────────────────────────────────────────────────
-
     def _try_nba_player_prop(self, market: dict):
         """Route NBA player prop markets through the Poisson/Binomial model."""
         ticker = market.get("ticker", "")
@@ -2460,8 +2028,6 @@ class SportsBot(BaseBot):
             brier_score = 0.10,
         )
 
-    # ─────────────────────────────────────────────────────────────────────
-
     def is_relevant(self, market: dict) -> bool:
         if _is_unmodelable_market(market):
             return False
@@ -2543,39 +2109,16 @@ class SportsBot(BaseBot):
 class GlobalEventsBot(BaseBot):
     """
     Alpha bucket — entertainment, AI milestones, product launches, misc events.
-
-    v11.7: Replaces EntertainmentBot. Absorbs entertainment markets AND catches
-    everything that doesn't fit the core 6 sectors. This is the "everything
-    else" bucket where new market types land until they get a dedicated model.
-
-    Subsectors:
-      - Entertainment: Spotify streaming, Netflix, box office, awards
-      - AI / Tech launches: OpenAI releases, product launches, WWDC, CES
-      - Miscellaneous: anything not sports/crypto/weather/econ/politics/finance
-
-    No model yet — evaluate() returns None. The value is CLAIMING these
-    markets so they don't bleed into other sectors and corrupt calibration.
     """
 
     KEYWORDS = [
         # ── Entertainment / streaming ───────────────────────────────────────
-        "kxspotify",     # Spotify chart positions
-        "kxspotstream",  # Spotify streaming
-        "kxbox",         # Box office
-        "kxnetflix",     # Netflix
-        "kxhbo",         # HBO
-        "kxgrammy",
-        "kxoscar",
-        "kxemmy",
-        "kxgoldenglobe",
-        "kxbillboard",
-        "kxartiststream",  # v12.1: Spotify artist streaming
+        "kxspotify", "kxspotstream", "kxbox", "kxnetflix", "kxhbo",
+        "kxgrammy", "kxoscar", "kxemmy", "kxgoldenglobe", "kxbillboard",
+        "kxartiststream",
 
         # ── AI / tech launches ──────────────────────────────────────────────
-        "kxtech",        # General tech events
-        "kxai",          # AI milestones
-        "kxopenai",      # OpenAI releases
-        "kxanthropic",   # Anthropic releases
+        "kxtech", "kxai", "kxopenai", "kxanthropic",
         "openai", "anthropic", "chatgpt", "gpt-4", "gpt-5",
         "claude", "gemini", "grok", "llama", "mistral",
         "deepmind", "stability ai", "midjourney", "dall-e", "sora",
@@ -2594,17 +2137,12 @@ class GlobalEventsBot(BaseBot):
             return False
         if _has_sports_prefix(market):
             return False
-        # Claim entertainment markets
         if _is_entertainment_market(market):
             return True
         return _search_fields(market, self.KEYWORDS)
 
     def evaluate(self, market, news_signal=None):
-        """v11.7: scaffold — claim the market, return no signal.
-
-        Prevents global event markets from polluting other sectors
-        without producing flat-prior garbage signals.
-        """
+        """v11.7: scaffold — claim the market, return no signal."""
         if not self.is_relevant(market):
             return None
         ticker = market.get("ticker", "")
@@ -2624,8 +2162,12 @@ def all_bots() -> list[BaseBot]:
     """
     Return all active bots.
     
-    v12.5: Qualitative sectors (politics, economics, financial_markets, 
-    global_events) now use LLMBot with Claude API + web search.
+    v12.7: Removed financial_markets from LLMBot sectors.
+    financial_markets had 0.55 overall Brier — coin-flip territory.
+    Disable entirely until a real model exists.
+    
+    v12.5: Qualitative sectors (politics, economics, global_events) 
+    now use LLMBot with Claude API + web search.
     
     Quantitative sectors (sports, weather, crypto) keep their specialized models.
     """
@@ -2637,6 +2179,7 @@ def all_bots() -> list[BaseBot]:
         WeatherBot(),
         SportsBot(),
         # Qualitative bot — LLM with web search handles:
-        # politics, economics, financial_markets, global_events
-        LLMBot(),
+        # politics, economics, global_events
+        # v12.7: financial_markets REMOVED (0.55 Brier — coin-flip territory)
+        LLMBot(exclude_sectors=["financial_markets"]),
     ]
