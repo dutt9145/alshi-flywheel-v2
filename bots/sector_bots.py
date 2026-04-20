@@ -2181,5 +2181,5 @@ def all_bots() -> list[BaseBot]:
         # Qualitative bot — LLM with web search handles:
         # politics, economics, global_events
         # v12.7: financial_markets REMOVED (0.55 Brier — coin-flip territory)
-        LLMBot(exclude_sectors=["financial_markets"]),
+        LLMBot(),
     ]

@@ -449,6 +449,11 @@ class LLMBot:
         if not signal:
             return None
         
+        # v12.7: financial_markets disabled (0.55 Brier — coin-flip territory)
+        if signal.sector == "financial_markets":
+            logger.debug("[LLM] Skipping financial_markets: %s", ticker[:40])
+            return None
+        
         # Update sector_name for this signal
         self.sector_name = signal.sector
         
