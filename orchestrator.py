@@ -1866,7 +1866,7 @@ class FlywheelOrchestrator:
         jitter = random.randint(-45, 45)
         schedule.every(SCAN_INTERVAL_SEC + jitter).seconds.do(self.scan_markets)
         schedule.every().day.at(f"{RETRAIN_HOUR:02d}:00").do(self.retrain_models)
-        schedule.every(4).hours.do(self._run_ingestion_thread)
+        schedule.every(2).hours.do(self._run_ingestion_thread)
 
         self._run_ingestion_thread()
 
