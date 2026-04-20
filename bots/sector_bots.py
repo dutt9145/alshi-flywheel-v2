@@ -180,6 +180,9 @@ from shared.kalshi_ticker_parser import (
     is_mlb_non_player_prop_market,
     MLB_TEAMS,
 )
+
+from shared.pinnacle_reference import get_pinnacle_reference
+
 from shared.mlb_stats_fetcher import (
     lookup_player,
     fetch_batter_stats,
@@ -1881,8 +1884,19 @@ class SportsBot(BaseBot):
             except Exception as e:
                 logger.debug("[sports/mlb] probable pitcher lookup failed: %s", e)
 
-            prediction = predict_mlb_prop(parsed, season, rolling, opp_pitcher_stats)
+            # v13: Fetch game total from Pinnacle for dynamic AB estimation
+            game_total = None
+            try:
+                game_total = get_pinnacle_reference().get_game_total(ticker, sport="mlb")
+                if game_total:
+                    logger.debug(
+                        "[sports/mlb] %s O/U=%.1f from Pinnacle",
+                        ticker[:35], game_total,
+                    )
+            except Exception as e:
+                logger.debug("[sports/mlb] game total fetch failed: %s", e)
 
+            prediction = predict_mlb_prop(parsed, season, rolling, opp_pitcher_stats, game_total)
         if not prediction:
             return False, None
 
