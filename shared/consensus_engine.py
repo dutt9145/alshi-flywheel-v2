@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 SECTOR_CALIBRATION = {
     'sports':            0.13,
     'crypto':            0.13,
-    'weather':          -0.09,
+    'weather':          -0.15,
     'financial_markets': 0.00,
     'economics':         0.00,
     'politics':          0.00,
