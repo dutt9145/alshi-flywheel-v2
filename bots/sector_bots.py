@@ -153,6 +153,7 @@ Changes vs v11.2 (unchanged from v11.3):
 
 import asyncio
 import logging
+import math 
 import re
 from typing import Optional
 
@@ -707,6 +708,9 @@ class EconomicsBot(BaseBot):
 class CryptoBot(BaseBot):
     """
     Crypto price, dominance, ETF, DeFi, Layer 2, and exchange markets.
+
+    v13: evaluate() now bypasses poisoned Bayesian model with direct
+    price-vs-threshold volatility calculation (same pattern as WeatherBot v12.3).
     """
 
     KEYWORDS = [
@@ -784,6 +788,28 @@ class CryptoBot(BaseBot):
         "bnb":  "binancecoin",
     }
 
+    # v11.8d: Per-coin confidence scaling based on historical Brier scores
+    COIN_CONFIDENCE_SCALE = {
+        "bitcoin":      0.85,   # Brier 0.113 — strong
+        "binancecoin":  0.85,   # Brier 0.127 — strong
+        "ethereum":     0.70,   # Brier 0.187 — decent
+        "solana":       0.50,   # Brier 0.276 — weak
+        "ripple":       0.50,   # Brier 0.269 — weak
+        "dogecoin":     0.0,    # Brier 0.395 — excluded
+    }
+
+    # v13: Approximate annualized volatility by coin (historical 2024-2026)
+    COIN_ANNUAL_VOL = {
+        "bitcoin":      0.55,
+        "ethereum":     0.70,
+        "solana":       0.90,
+        "ripple":       0.85,
+        "dogecoin":     1.10,
+        "binancecoin":  0.60,
+        "avalanche-2":  0.85,
+        "matic-network": 0.90,
+    }
+
     @property
     def sector_name(self) -> str:
         return "crypto"
@@ -827,125 +853,190 @@ class CryptoBot(BaseBot):
         context["price_vs_target"]  = ratio
         return features, context
 
-    # v11.8d: Per-coin confidence scaling based on historical Brier scores
-    COIN_CONFIDENCE_SCALE = {
-        "bitcoin":      0.85,   # Brier 0.113 — strong
-        "binancecoin":  0.85,   # Brier 0.127 — strong
-        "ethereum":     0.70,   # Brier 0.187 — decent
-        "solana":       0.50,   # Brier 0.276 — weak
-        "ripple":       0.50,   # Brier 0.269 — weak
-        "dogecoin":     0.0,    # Brier 0.395 — excluded
-    }
+    def _parse_crypto_ticker(self, ticker: str) -> Optional[dict]:
+        """Parse Kalshi crypto ticker into components.
+
+        Formats:
+          KXBTC-26APR1703-B74850       → BTC, above $74,850, at 17:03
+          KXBTCD-26APR1703-T74599.99   → BTC daily, threshold $74,599.99
+          KXETH-26APR2017-B2320        → ETH, above $2,320
+          KXSOLD-26APR2017-T80.9999    → SOL daily, threshold $81.00
+          KXXRP-26APR2017-B1.3299500   → XRP, above $1.33
+          KXDOGE-26APR2017-B0.102      → DOGE, above $0.102
+          KXSOLE-26APR2017-B82         → SOL variant, above $82
+
+        Returns dict with: coin_id, threshold, is_daily, hours_to_expiry
+        """
+        parts = ticker.upper().split("-")
+        if len(parts) < 3:
+            return None
+
+        prefix = parts[0].lower()
+        time_part = parts[1]
+        threshold_part = parts[2]
+
+        # Detect coin — strip trailing D/E suffixes
+        clean_prefix = prefix.rstrip('de')
+        coin_id = self.TICKER_COIN_MAP.get(clean_prefix)
+        if not coin_id:
+            coin_id = self.TICKER_COIN_MAP.get(prefix)
+        if not coin_id:
+            return None
+
+        # Parse threshold: B75050 or T74599.99
+        if threshold_part.startswith("B") or threshold_part.startswith("T"):
+            try:
+                threshold = float(threshold_part[1:])
+            except ValueError:
+                return None
+        else:
+            return None
+
+        is_daily = prefix != clean_prefix and "d" in prefix
+
+        # Parse hours to expiry
+        hours_to_expiry = 1.0
+        try:
+            from datetime import datetime, timezone
+            m = re.match(r"(\d{2})([A-Z]{3})(\d{2})(\d{2})", time_part)
+            if m:
+                day = int(m.group(1))
+                month_str = m.group(2)
+                hour = int(m.group(3))
+                minute = int(m.group(4))
+                month_num = _MONTH_MAP.get(month_str, 4)
+                expiry = datetime(2026, month_num, day, hour, minute, tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                delta_hours = (expiry - now).total_seconds() / 3600
+                hours_to_expiry = max(0.05, delta_hours)
+        except Exception:
+            hours_to_expiry = 1.0 if not is_daily else 12.0
+
+        return {
+            "coin_id": coin_id,
+            "threshold": threshold,
+            "is_daily": is_daily,
+            "hours_to_expiry": hours_to_expiry,
+        }
 
     def evaluate(self, market, news_signal=None):
-        """v11.8d: Scale confidence per coin based on historical Brier scores."""
-        ticker  = market.get("ticker", "").lower()
+        """v13: Direct price-vs-threshold model — bypasses poisoned Bayesian.
+
+        Uses log-normal volatility model: P(above) = Φ(ln(price/threshold)/σ√t)
+        Same pattern as WeatherBot v12.3 bypassing Bayesian with NOAA data.
+
+        The old evaluate() called super().evaluate() which routed through the
+        BayesianPolyModel. That model was outputting 0.08 YES when market was
+        0.92, claiming 42% edge and betting NO on everything. The Bayesian prior
+        was poisoned by duplicate signals and misattributed outcomes — same bug
+        WeatherBot had before v12.3 fixed it.
+        """
+        ticker = market.get("ticker", "")
+
+        if not self.is_relevant(market):
+            return None
+
         coin_id = self._detect_coin(market)
 
         # DOGE 15M: exclude (worst performer, Brier 0.395)
-        if coin_id == "dogecoin" and "15m" in ticker:
+        if coin_id == "dogecoin" and "15m" in ticker.lower():
             logger.debug("[crypto] DOGE 15M excluded: %s", ticker)
             return None
 
-        signal = super().evaluate(market, news_signal)
-        if signal is None:
+        parsed = self._parse_crypto_ticker(ticker)
+        if not parsed:
+            logger.debug("[crypto] ticker parse failed: %s", ticker)
             return None
 
+        # Get current price from CoinGecko
+        try:
+            _, context = self.fetch_features(market)
+        except Exception as e:
+            logger.warning("[crypto] fetch_features failed: %s", e)
+            return None
+
+        current_price = context.get("price", 0)
+        if not current_price or current_price <= 0:
+            logger.debug("[crypto] no price for %s", coin_id)
+            return None
+
+        threshold = parsed["threshold"]
+        hours = parsed["hours_to_expiry"]
+
+        # Log-normal volatility model
+        # sigma_t = annual_vol * sqrt(hours / 8760)
+        annual_vol = self.COIN_ANNUAL_VOL.get(coin_id, 0.70)
+        sigma_t = annual_vol * math.sqrt(hours / 8760)
+        sigma_t = max(0.001, min(0.50, sigma_t))
+
+        if threshold <= 0:
+            our_prob = 0.95
+        else:
+            # d = ln(current/threshold) / sigma_t
+            # P(above) = Phi(d) where Phi is the normal CDF
+            d = math.log(current_price / threshold) / sigma_t if sigma_t > 0 else 0
+
+            # Approximate normal CDF (Abramowitz & Stegun)
+            def _norm_cdf(x):
+                if x > 6:
+                    return 1.0
+                if x < -6:
+                    return 0.0
+                t = 1.0 / (1.0 + 0.2316419 * abs(x))
+                d_val = 0.3989422804 * math.exp(-x * x / 2)
+                p = 1.0 - d_val * t * (
+                    0.319381530 + t * (
+                        -0.356563782 + t * (
+                            1.781477937 + t * (
+                                -1.821255978 + t * 1.330274429
+                            )
+                        )
+                    )
+                )
+                return p if x >= 0 else 1.0 - p
+
+            our_prob = _norm_cdf(d)
+
+        our_prob = max(0.03, min(0.97, our_prob))
+
+        market_prob = _market_prob(market)
+        edge = abs(our_prob - market_prob)
+
+        # Confidence based on time to expiry + distance from threshold
+        distance_pct = abs(current_price - threshold) / current_price
+        time_confidence = min(0.85, 0.50 + 0.35 * (1 - min(hours / 24, 1)))
+        distance_confidence = min(0.85, 0.40 + distance_pct * 5)
+        confidence = 0.5 * time_confidence + 0.5 * distance_confidence
+
+        # Per-coin confidence scaling (unchanged from v11.8d)
         scale = self.COIN_CONFIDENCE_SCALE.get(coin_id, 0.60)
         if scale <= 0.0:
             logger.debug("[crypto] %s excluded (scale=0): %s", coin_id, ticker)
             return None
 
-        return BotSignal(
-            sector      = signal.sector,
-            prob        = signal.prob,
-            confidence  = signal.confidence * scale,
-            market_prob = signal.market_prob,
-            brier_score = signal.brier_score,
+        confidence *= scale
+
+        if edge < MIN_EDGE_PCT:
+            logger.debug("[crypto] %s edge %.2f%% too small", ticker, edge * 100)
+            return None
+
+        direction = "YES" if our_prob > market_prob else "NO"
+
+        logger.info(
+            "[crypto/v13] %s | %s=$%.2f vs $%.2f | "
+            "σ_t=%.4f hrs=%.1f | our=%.3f mkt=%.3f edge=%+.3f dir=%s conf=%.2f",
+            ticker[:35], coin_id, current_price, threshold,
+            sigma_t, hours, our_prob, market_prob,
+            our_prob - market_prob, direction, confidence,
         )
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  3. POLITICS BOT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class PoliticsBot(BaseBot):
-    """
-    US + international elections, legislation, geopolitics, appointments.
-    """
-
-    KEYWORDS = [
-        # ── Kalshi kx-prefixes ──────────────────────────────────────────────
-        "kxpres", "kxsenate", "kxhouse", "kxgov", "kxelect",
-        "kxpol", "kxcong", "kxsupct", "kxadmin",
-        "kxun", "kxnato", "kxeu",
-
-        # ── US politics ────────────────────────────────────────────────────
-        "election", "vote", "congress", "senate", "president",
-        "governor", "democrat", "republican", "white house",
-        "approval", "impeach", "nominee", "ballot", "primary",
-        "caucus", "supreme court", "executive order", "policy",
-        "trump", "harris", "biden", "pelosi", "mcconnell",
-        "filibuster", "reconciliation", "continuing resolution",
-        "government shutdown", "debt limit", "midterm",
-        "electoral college", "popular vote", "swing state",
-        "attorney general", "secretary of state", "cabinet",
-        "veto", "pardon", "indictment", "conviction",
-
-        # ── International politics ─────────────────────────────────────────
-        "united nations", "un security council", "nato",
-        "european union", "european parliament", "g7", "g20",
-        "brics", "imf", "world bank", "wto",
-        "prime minister", "chancellor", "parliament",
-        "referendum", "coup", "sanctions", "treaty",
-        "ceasefire", "peace talks", "diplomatic",
-        "macron", "scholz", "sunak", "modi", "xi jinping",
-        "putin", "zelensky", "netanyahu", "erdogan",
-        "boris johnson", "trudeau", "albanese",
-
-        # ── Geopolitical events ────────────────────────────────────────────
-        "ukraine", "russia", "israel", "gaza", "taiwan",
-        "north korea", "iran nuclear", "south china sea",
-        "nato expansion", "un resolution", "armed conflict",
-        "trade sanctions", "export controls",
-
-        # ── Supreme Court ──────────────────────────────────────────────────
-        "supreme court ruling", "scotus", "oral arguments",
-        "majority opinion", "dissent", "overturned", "landmark ruling",
-        "constitutional", "first amendment", "second amendment",
-        "roe v wade", "affirmative action", "title ix",
-    ]
-
-    @property
-    def sector_name(self) -> str:
-        return "politics"
-
-    def is_relevant(self, market: dict) -> bool:
-        if _is_unmodelable_market(market):
-            return False
-        if _is_entertainment_market(market):
-            return False
-        if _has_sports_prefix(market):
-            return False
-        return _search_fields(market, self.KEYWORDS)
-
-    def fetch_features(self, market: dict, skip_noaa: bool = False) -> tuple[np.ndarray, dict]:
-        poly_slug  = market.get("polymarket_slug")
-        features, context = fetch_politics_features(poly_slug)
-        title   = market.get("title", "")
-        numbers = re.findall(r"\d+\.?\d*", title)
-        target  = float(numbers[0]) if numbers else 50.0
-        features = np.append(features, target)
-        close_ts = market.get("close_time", "")
-        try:
-            from datetime import datetime, timezone
-            close_dt      = datetime.fromisoformat(close_ts.replace("Z", "+00:00"))
-            days_to_close = (close_dt - datetime.now(timezone.utc)).days
-        except Exception:
-            days_to_close = 30
-        features = np.append(features, days_to_close)
-        context["days_to_close"] = days_to_close
-        return features, context
+        return BotSignal(
+            sector      = self.sector_name,
+            prob        = our_prob,
+            confidence  = confidence,
+            market_prob = market_prob,
+            brier_score = 0.15,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
