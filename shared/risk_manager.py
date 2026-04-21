@@ -41,12 +41,15 @@ class RiskManager:
         # Shadow mode tracking
         self._shadow_start: Optional[datetime] = None
 
-    def _maybe_reset_day(self):
+    def _maybe_reset_day(self) -> None:
         today = date.today()
         if today != self._today:
             logger.info(
                 "[risk] Day rolled %s → %s. Reset: %d trades, P&L $%.2f, %d players tracked",
-                self._today, today, self._trade_count, self._daily_pnl,
+                self._today,
+                today,
+                self._trade_count,
+                self._daily_pnl,
                 len(self._player_exposure),
             )
             self._today = today
@@ -57,11 +60,11 @@ class RiskManager:
             self._halted = False
             self._halt_reason = ""
 
-    def update_daily_pnl(self, pnl: float):
+    def update_daily_pnl(self, pnl: float) -> None:
         self._maybe_reset_day()
         self._daily_pnl = pnl
 
-    def start_shadow(self):
+    def start_shadow(self) -> None:
         if self._shadow_start is None:
             self._shadow_start = datetime.utcnow()
             logger.info("[risk] Shadow mode started at %s", self._shadow_start)
@@ -163,13 +166,15 @@ class RiskManager:
 
         return True, ""
 
-    def record_trade(self, player_name: str, sector: str, dollars: float):
+    def record_trade(self, player_name: str, sector: str, dollars: float) -> None:
         self._player_exposure[player_name] += dollars
         self._sector_exposure[sector] += dollars
         self._trade_count += 1
         logger.debug(
             "[risk] Recorded: %s (%s) $%.2f | player_total=$%.2f sector_total=$%.2f",
-            player_name, sector, dollars,
+            player_name,
+            sector,
+            dollars,
             self._player_exposure[player_name],
             self._sector_exposure[sector],
         )
