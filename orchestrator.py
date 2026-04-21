@@ -140,6 +140,7 @@ import os
 import re
 import threading
 import time
+from unittest import signals
 import uuid
 from datetime import datetime, timezone
 
@@ -673,10 +674,20 @@ class FlywheelOrchestrator:
         self._open_provisionals: dict[str, float] = {}
 
         # v19.17: Risk manager + Brier tracker + correlation tracking
-        self.risk_manager = RiskManager(bankroll=BANKROLL)
-        self.brier_tracker = BrierTracker.from_supabase(os.getenv("DATABASE_URL", ""))
-        self._scan_player_trades: dict[str, int] = {}  # Legacy, kept for backward compat
+        self.risk_manager = RiskManager(
+            bankroll=BANKROLL,
+            max_daily_drawdown_pct=0.08,
+            max_player_exposure_pct=0.03,
+            max_single_trade_pct=0.02,
+            max_sector_exposure_pct=0.07,
+            shadow_hours_required=72,
+        enforce_shadow=(not DEMO_MODE and os.getenv("ENFORCE_SHADOW_MODE", "false").lower() == "true"),
+        )
 
+        if self.risk_manager.enforce_shadow:
+            self.risk_manager.start_shadow()
+
+        self.brier_tracker = BrierTracker.from_supabase(os.getenv("DATABASE_URL", ""))
         # v19.23: Liquidity filter + enhanced correlation tracker
         self.liquidity_filter = LiquidityFilter(enabled=True)
         self.correlation_tracker = CorrelationTracker()
@@ -719,6 +730,31 @@ class FlywheelOrchestrator:
             self._resolved_count_cache[sector] = int(rows[0]["n"]) if rows else 0
 
         return self._resolved_count_cache[sector]
+    def _rebuild_demo_exposure(self) -> None:
+        """
+        Rebuild sector exposure from unresolved trades instead of zeroing exposure
+        every scan. This keeps Kelly sector caps closer to reality in demo mode.
+
+        A trade is treated as still open if it does not yet have an outcome row
+        with a non-null trade_id.
+        """
+        self._exposure = {b.sector_name: 0.0 for b in self.bots}
+
+        rows = _query_signals(
+            """
+            SELECT t.sector, t.dollars_risked
+            FROM trades t
+            LEFT JOIN outcomes o
+            ON o.trade_id = t.id
+            WHERE o.trade_id IS NULL
+            """
+        )
+
+        for row in rows:
+            sector = row.get("sector")
+            dollars = float(row.get("dollars_risked") or 0.0)
+            if sector in self._exposure:
+                self._exposure[sector] += dollars
 
     # ── Resolution ingestion ───────────────────────────────────────────────────
 
@@ -849,14 +885,17 @@ class FlywheelOrchestrator:
 
             with self._sector_pnl_lock:
                 if sec in self._sector_daily_pnl:
-                    provisional = self._open_provisionals.pop(ticker, 0.0)
+                    provisional_total = 0.0
+                    for tid in trade_ids:
+                        provisional_total += self._open_provisionals.pop(int(tid), 0.0)
+
                     self._sector_daily_pnl[sec] = (
-                        self._sector_daily_pnl[sec] - provisional + pnl_usd
+                        self._sector_daily_pnl[sec] - provisional_total + pnl_usd
                     )
                     logger.debug(
                         "[PROVISIONAL UNWIND] %s sector=%s "
-                        "provisional=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
-                        ticker, sec, provisional, pnl_usd,
+                        "provisional_total=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
+                        ticker, sec, provisional_total, pnl_usd,
                         self._sector_daily_pnl[sec],
                     )
         else:
@@ -955,12 +994,26 @@ class FlywheelOrchestrator:
         
         # Get tickers with signals but no outcome yet
         unresolved_rows = _query_signals(
-            "SELECT ticker FROM signals "
-            "WHERE outcome IS NULL "
-            "AND sector IN ('weather', 'crypto', 'financial_markets') "
-            "GROUP BY ticker "
-            "ORDER BY MAX(created_at) ASC "
-            "LIMIT 1000"
+            """
+            SELECT ticker, sector
+            FROM signals
+            WHERE outcome IS NULL
+                AND (
+                    sector IN ('weather', 'crypto', 'financial_markets')
+                    OR (
+                        sector = 'sports'
+                        AND (
+                          LOWER(ticker) LIKE 'kxatp%%'
+                          OR LOWER(ticker) LIKE 'kxwta%%'
+                          OR LOWER(ticker) LIKE 'kxtennis%%'
+                          OR LOWER(ticker) LIKE 'kxitf%%'
+                        )
+                    )
+                )
+            GROUP BY ticker, sector
+            ORDER BY MAX(created_at) ASC
+            LIMIT 1500
+            """
         )
         
         # Filter out already processed and already recorded
@@ -1275,6 +1328,11 @@ class FlywheelOrchestrator:
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
 
+        logger.info(
+            "[EXPOSURE] %s sector_exp=$%.2f bankroll=$%.2f",
+            lead_sector, sector_exp, live_bankroll,
+        )
+
         # v19.24: Apply Pinnacle confidence adjustment to drawdown factor
         effective_drawdown = drawdown_factor * pinnacle_adj
 
@@ -1410,18 +1468,6 @@ class FlywheelOrchestrator:
         self.risk_manager.record_trade(player_key, lead_sector, sizing["dollars"])
         self.correlation_tracker.record_trade(ticker, sizing["dollars"])
 
-        provisional_loss = -sizing["dollars"]
-        with self._sector_pnl_lock:
-            self._sector_daily_pnl[lead_sector] = (
-                self._sector_daily_pnl.get(lead_sector, 0.0) + provisional_loss
-            )
-            self._open_provisionals[ticker] = provisional_loss
-        logger.debug(
-            "[PROVISIONAL] %s sector=%s provisional_loss=$%.2f new_sector_pnl=$%.2f",
-            ticker, lead_sector, provisional_loss,
-            self._sector_daily_pnl[lead_sector],
-        )
-
         arb_note  = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
         fade_note = " [FADE]" if fade else ""
 
@@ -1439,6 +1485,20 @@ class FlywheelOrchestrator:
             demo_mode       = DEMO_MODE,
         )
 
+        provisional_loss = -sizing["dollars"]
+        with self._sector_pnl_lock:
+            self._sector_daily_pnl[lead_sector] = (
+        self._sector_daily_pnl.get(lead_sector, 0.0) + provisional_loss
+        )
+        if trade_id is not None:
+            self._open_provisionals[int(trade_id)] = provisional_loss
+
+        logger.debug(
+            "[PROVISIONAL] trade_id=%s ticker=%s sector=%s provisional_loss=$%.2f new_sector_pnl=$%.2f",
+            trade_id, ticker, lead_sector, provisional_loss,
+            self._sector_daily_pnl[lead_sector],
+        )
+
         logger.info(
             "TRADE #%d | %s | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%%s%s",
             trade_id, ticker, lead_sector.upper(), consensus.direction.upper(),
@@ -1453,68 +1513,73 @@ class FlywheelOrchestrator:
         if not self._last_bot_probs:
             return
 
+        market_map = {
+        _normalize_ticker(m.get("ticker", "")): m
+        for m in open_markets
+         }
+
         fades = self.fade_scanner.scan(open_markets, self._last_bot_probs)
 
         for fade in fades:
             from shared.consensus_engine import ConsensusResult
-            mock_consensus = ConsensusResult(
-                ticker         = fade.ticker,
-                signals        = [],
-                execute        = True,
-                direction      = fade.direction,
-                avg_prob       = fade.our_prob,
-                avg_edge       = abs(fade.our_prob - fade.market_prob),
-                avg_confidence = fade.confidence,
-                reject_reason  = "",
-            )
 
-            sector = self._last_bot_sectors.get(fade.ticker, "sports")
+        mock_consensus = ConsensusResult(
+            ticker         = fade.ticker,
+            signals        = [],
+            execute        = True,
+            direction      = fade.direction,
+            avg_prob       = fade.our_prob,
+            avg_edge       = abs(fade.our_prob - fade.market_prob),
+            avg_confidence = fade.confidence,
+            reject_reason  = "",
+        )
 
-            # v19.27: Log signal for fade trade so resolution can match
-            if not _signal_exists_in_db(fade.ticker):
-                try:
-                    log_signal(
-                        ticker      = fade.ticker,
-                        sector      = sector,
-                        our_prob    = mock_consensus.avg_prob,
-                        market_prob = fade.yes_price_cents / 100,
-                        edge        = mock_consensus.avg_edge,
-                        confidence  = mock_consensus.avg_confidence,
-                        direction   = mock_consensus.direction,
-                    )
-                except Exception as e:
-                    logger.warning("log_signal failed for fade trade %s: %s", fade.ticker, e)
+        sector = self._last_bot_sectors.get(fade.ticker, "sports")
 
-            self._execute_trade(
-                ticker      = fade.ticker,
-                title       = f"[FADE] {fade.ticker}",
-                yes_price   = fade.yes_price_cents,
-                consensus   = mock_consensus,
-                lead_sector = sector,
-                arb         = None,
-                fade        = True,
-            )
-            self.fade_scanner.mark_executed(fade.ticker)
+        if not _signal_exists_in_db(fade.ticker):
+            try:
+                log_signal(
+                    ticker      = fade.ticker,
+                    sector      = sector,
+                    our_prob    = mock_consensus.avg_prob,
+                    market_prob = fade.yes_price_cents / 100,
+                    edge        = mock_consensus.avg_edge,
+                    confidence  = mock_consensus.avg_confidence,
+                    direction   = mock_consensus.direction,
+                )
+            except Exception as e:
+                logger.warning("log_signal failed for fade trade %s: %s", fade.ticker, e)
+
+        self._execute_trade(
+            ticker      = fade.ticker,
+            title       = f"[FADE] {fade.ticker}",
+            yes_price   = fade.yes_price_cents,
+            consensus   = mock_consensus,
+            lead_sector = sector,
+            arb         = None,
+            fade        = True,
+            market      = market_map.get(_normalize_ticker(fade.ticker)),
+        )
+        self.fade_scanner.mark_executed(fade.ticker)
 
     # ── Correlation execution ──────────────────────────────────────────────────
 
     def _execute_correlations(self, open_markets: list[dict]) -> None:
+        market_map = {
+        _normalize_ticker(m.get("ticker", "")): m
+        for m in open_markets
+    }
+
         corr_signals = self.corr_engine.scan(open_markets)
 
         for sig in corr_signals:
             if self.circuit_breaker.is_halted():
                 break
 
-            # v19.28: Trade sports, weather, AND crypto correlations
-            # v19.29: Added financial_markets — same-date price/threshold ladders:
-            #   - Commodities: "Jet fuel above $4.10" must be <= "above $3.70"
-            #   - Forex: "USDJPY above 160" must be <= "above 157"
-            #   - Stocks: "TSLA above $200" must be <= "above $180"
-            # These are valid nested thresholds like weather/crypto, not time-based.
-            # Politics/economics ladder markets remain blocked — their spreads are
-            # often legitimate (different deadlines or timeframes, not mispricings).
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector not in ("sports", "weather", "crypto", "financial_markets"):
+
+            # recovery mode: do NOT let financial_markets correlation trades through
+            if inferred_sector not in ("sports", "weather", "crypto"):
                 logger.debug(
                     "CORR SKIP (sector=%s not in whitelist): %s",
                     inferred_sector, sig.event_group,
@@ -1528,11 +1593,6 @@ class FlywheelOrchestrator:
                 )
                 continue
 
-            # v19.18d: CONMEBOL duplicate fix — track event_group, not just
-            # individual tickers. The correlation engine produces multiple
-            # divergent pairs per event_group per scan. Without this guard,
-            # CONMEBOL groups generated 26 duplicate trades because each pair
-            # had a unique ticker that passed the per-ticker duplicate guard.
             corr_key = f"__corr__{sig.event_group}"
             now = time.monotonic()
             last_corr = self._recently_traded.get(corr_key, 0.0)
@@ -1557,18 +1617,22 @@ class FlywheelOrchestrator:
                 (sig.expensive_ticker, sig.expensive_direction, sig.expensive_price_cents),
             ]:
                 from shared.consensus_engine import ConsensusResult
+
                 mock_consensus = ConsensusResult(
                     ticker         = ticker,
                     signals        = [],
                     execute        = True,
                     direction      = direction,
-                    avg_prob       = sig.cheap_price_cents / 100 if direction == "YES" else 1 - sig.expensive_price_cents / 100,
+                    avg_prob       = (
+                        sig.cheap_price_cents / 100
+                        if direction == "YES"
+                        else 1 - sig.expensive_price_cents / 100
+                    ),
                     avg_edge       = sig.divergence_cents / 100 / 2,
                     avg_confidence = sig.confidence,
                     reject_reason  = "",
                 )
 
-                # v19.27: Log signal for correlation trade so resolution can match
                 if not _signal_exists_in_db(ticker):
                     try:
                         log_signal(
@@ -1591,64 +1655,71 @@ class FlywheelOrchestrator:
                     lead_sector = inferred_sector,
                     arb         = None,
                     fade        = False,
+                    market      = market_map.get(_normalize_ticker(ticker)),
                 )
 
     # ── Resolution timing execution ────────────────────────────────────────────
 
     def _execute_resolution_timing(self, open_markets: list[dict]) -> None:
+        market_map = {
+        _normalize_ticker(m.get("ticker", "")): m
+        for m in open_markets
+    }
+
         signals = self.res_timer.scan(
-            open_markets,
-            self._last_bot_probs,
-            self._last_bot_sectors,
-        )
+        open_markets,
+        self._last_bot_probs,
+        self._last_bot_sectors,
+    )
 
         for sig in signals:
             if self.circuit_breaker.is_halted():
                 break
 
-            if _is_blocked_structural_market(sig.ticker):
-                logger.info(
-                    "RESTIME BLOCKED (uncalibrated structural market): %s",
-                    sig.ticker,
+        if _is_blocked_structural_market(sig.ticker):
+            logger.info(
+                "RESTIME BLOCKED (uncalibrated structural market): %s",
+                sig.ticker,
+            )
+            return
+
+        from shared.consensus_engine import ConsensusResult
+
+        mock_consensus = ConsensusResult(
+            ticker         = sig.ticker,
+            signals        = [],
+            execute        = True,
+            direction      = sig.direction,
+            avg_prob       = sig.our_prob,
+            avg_edge       = abs(sig.our_prob - sig.yes_price_cents / 100),
+            avg_confidence = sig.confidence,
+            reject_reason  = "",
+        )
+
+        if not _signal_exists_in_db(sig.ticker):
+            try:
+                log_signal(
+                    ticker      = sig.ticker,
+                    sector      = sig.sector,
+                    our_prob    = mock_consensus.avg_prob,
+                    market_prob = sig.yes_price_cents / 100,
+                    edge        = mock_consensus.avg_edge,
+                    confidence  = mock_consensus.avg_confidence,
+                    direction   = mock_consensus.direction,
                 )
-                continue
+            except Exception as e:
+                logger.warning("log_signal failed for restime trade %s: %s", sig.ticker, e)
 
-            from shared.consensus_engine import ConsensusResult
-            mock_consensus = ConsensusResult(
-                ticker         = sig.ticker,
-                signals        = [],
-                execute        = True,
-                direction      = sig.direction,
-                avg_prob       = sig.our_prob,
-                avg_edge       = abs(sig.our_prob - sig.yes_price_cents / 100),
-                avg_confidence = sig.confidence,
-                reject_reason  = "",
-            )
-
-            # v19.27: Log signal for resolution timing trade so resolution can match
-            if not _signal_exists_in_db(sig.ticker):
-                try:
-                    log_signal(
-                        ticker      = sig.ticker,
-                        sector      = sig.sector,
-                        our_prob    = mock_consensus.avg_prob,
-                        market_prob = sig.yes_price_cents / 100,
-                        edge        = mock_consensus.avg_edge,
-                        confidence  = mock_consensus.avg_confidence,
-                        direction   = mock_consensus.direction,
-                    )
-                except Exception as e:
-                    logger.warning("log_signal failed for restime trade %s: %s", sig.ticker, e)
-
-            self._execute_trade(
-                ticker      = sig.ticker,
-                title       = f"[RESTIME] {sig.ticker}",
-                yes_price   = sig.yes_price_cents,
-                consensus   = mock_consensus,
-                lead_sector = sig.sector,
-                arb         = None,
-                fade        = False,
-            )
+        self._execute_trade(
+            ticker      = sig.ticker,
+            title       = f"[RESTIME] {sig.ticker}",
+            yes_price   = sig.yes_price_cents,
+            consensus   = mock_consensus,
+            lead_sector = sig.sector,
+            arb         = None,
+            fade        = False,
+            market      = market_map.get(_normalize_ticker(sig.ticker)),
+        )
 
     # ── Market scan ────────────────────────────────────────────────────────────
 
@@ -1660,13 +1731,10 @@ class FlywheelOrchestrator:
         self._scan_summary  = self.circuit_breaker.daily_summary()
         self.bankroll       = self._scan_bankroll
 
-        # ── FIX v19.16: Reset exposure each scan ──────────────────────────
-        # Previous bug: exposure accumulated across scans and never decreased
-        # when trades resolved. After 5 trades ($150 cap / $30 per trade),
-        # every subsequent trade sized to zero for the rest of the day.
-        # In demo mode there's no real capital at risk. In live mode this
-        # should be replaced with real position querying from Kalshi API.
-        self._exposure = {b.sector_name: 0.0 for b in self.bots}
+        # Rebuild open exposure from unresolved trades so Kelly sizing sees a
+        # realistic per-sector cap instead of a fresh zero every scan.
+        self._rebuild_demo_exposure()
+        logger.info("Rebuilt exposure for scan: %s", self._exposure)
 
         # v19.17: Update risk manager + reset correlation tracking
         self.risk_manager.update_daily_pnl(

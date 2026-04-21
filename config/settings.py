@@ -23,55 +23,58 @@ DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 # -- Bankroll & risk --
 BANKROLL = float(os.environ.get("BANKROLL") or os.getenv("BANKROLL") or 10000)
-KELLY_FRACTION = 0.25
-MIN_EDGE_PCT = float(os.getenv("MIN_EDGE_PCT", "0.05"))
-MAX_EDGE_PCT = float(os.getenv("MAX_EDGE_PCT", "0.25"))
 
-# -- Per-sector edge ceilings (v9: Fab 7) --
+# tighter demo survival mode
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.15"))
+MIN_EDGE_PCT   = float(os.getenv("MIN_EDGE_PCT", "0.10"))
+MAX_EDGE_PCT   = float(os.getenv("MAX_EDGE_PCT", "0.20"))
+
+# -- Per-sector edge ceilings --
 SECTOR_MAX_EDGE = {
-    "sports":            float(os.getenv("SECTOR_MAX_EDGE_SPORTS",            "0.40")),
-    "weather":           float(os.getenv("SECTOR_MAX_EDGE_WEATHER",           "0.60")),
-    "crypto":            float(os.getenv("SECTOR_MAX_EDGE_CRYPTO",            "0.25")),
-    "politics":          float(os.getenv("SECTOR_MAX_EDGE_POLITICS",          "0.25")),
-    "economics":         float(os.getenv("SECTOR_MAX_EDGE_ECONOMICS",         "0.25")),
-    "financial_markets": float(os.getenv("SECTOR_MAX_EDGE_FINANCIAL_MARKETS", "0.25")),
-    "global_events":     float(os.getenv("SECTOR_MAX_EDGE_GLOBAL_EVENTS",     "0.25")),
+    "sports":            float(os.getenv("SECTOR_MAX_EDGE_SPORTS",            "0.30")),
+    "weather":           float(os.getenv("SECTOR_MAX_EDGE_WEATHER",           "0.40")),
+    "crypto":            float(os.getenv("SECTOR_MAX_EDGE_CRYPTO",            "0.20")),
+    "politics":          float(os.getenv("SECTOR_MAX_EDGE_POLITICS",          "0.20")),
+    "economics":         float(os.getenv("SECTOR_MAX_EDGE_ECONOMICS",         "0.20")),
+    "financial_markets": float(os.getenv("SECTOR_MAX_EDGE_FINANCIAL_MARKETS", "0.20")),
+    "global_events":     float(os.getenv("SECTOR_MAX_EDGE_GLOBAL_EVENTS",     "0.20")),
 }
 
-CONSENSUS_EDGE_PCT   = 0.05
-CONSENSUS_CONFIDENCE = 0.75
-DIRECTION_FILTER = os.getenv("DIRECTION_FILTER", "BOTH")
-MAX_SINGLE_TRADE_PCT = 0.04
-MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "30"))
-MAX_SECTOR_EXPOSURE = 0.15
-MAX_MARKET_EXPOSURE = float(os.getenv("MAX_MARKET_EXPOSURE", "0.05"))
+CONSENSUS_EDGE_PCT   = float(os.getenv("CONSENSUS_EDGE_PCT", "0.08"))
+CONSENSUS_CONFIDENCE = float(os.getenv("CONSENSUS_CONFIDENCE", "0.82"))
+DIRECTION_FILTER     = os.getenv("DIRECTION_FILTER", "BOTH")
 
-# -- Per-sector daily loss caps (v9: Fab 7) --
+MAX_SINGLE_TRADE_PCT = float(os.getenv("MAX_SINGLE_TRADE_PCT", "0.02"))
+MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "12"))
+MAX_SECTOR_EXPOSURE  = float(os.getenv("MAX_SECTOR_EXPOSURE", "0.07"))
+MAX_MARKET_EXPOSURE  = float(os.getenv("MAX_MARKET_EXPOSURE", "0.02"))
+
+# -- Per-sector daily loss caps --
 SECTOR_MAX_DAILY_LOSS = {
-    "sports":            float(os.getenv("SECTOR_MAX_LOSS_SPORTS",            "50.0")),
-    "politics":          float(os.getenv("SECTOR_MAX_LOSS_POLITICS",          "25.0")),
-    "weather":           float(os.getenv("SECTOR_MAX_LOSS_WEATHER",           "30.0")),
-    "economics":         float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",         "40.0")),
-    "crypto":            float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",            "40.0")),
-    "financial_markets": float(os.getenv("SECTOR_MAX_LOSS_FINANCIAL_MARKETS", "40.0")),
-    "global_events":     float(os.getenv("SECTOR_MAX_LOSS_GLOBAL_EVENTS",     "25.0")),
+    "sports":            float(os.getenv("SECTOR_MAX_LOSS_SPORTS",            "20.0")),
+    "politics":          float(os.getenv("SECTOR_MAX_LOSS_POLITICS",          "10.0")),
+    "weather":           float(os.getenv("SECTOR_MAX_LOSS_WEATHER",           "12.0")),
+    "economics":         float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",         "10.0")),
+    "crypto":            float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",            "15.0")),
+    "financial_markets": float(os.getenv("SECTOR_MAX_LOSS_FINANCIAL_MARKETS", "0.0")),
+    "global_events":     float(os.getenv("SECTOR_MAX_LOSS_GLOBAL_EVENTS",     "10.0")),
 }
 
-# -- Per-sector minimum resolved before full Kelly (v9: Fab 7) --
+# -- Per-sector minimum resolved before full Kelly --
 SECTOR_MIN_RESOLVED = {
-    "sports":            int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",            "20")),
-    "politics":          int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",          "30")),
-    "weather":           int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",           "30")),
-    "economics":         int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS",         "30")),
-    "crypto":            int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",            "30")),
-    "financial_markets": int(os.getenv("SECTOR_MIN_RESOLVED_FINANCIAL_MARKETS", "30")),
-    "global_events":     int(os.getenv("SECTOR_MIN_RESOLVED_GLOBAL_EVENTS",     "50")),
+    "sports":            int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",            "150")),
+    "politics":          int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",          "75")),
+    "weather":           int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",           "75")),
+    "economics":         int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS",         "75")),
+    "crypto":            int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",            "60")),
+    "financial_markets": int(os.getenv("SECTOR_MIN_RESOLVED_FINANCIAL_MARKETS", "9999")),
+    "global_events":     int(os.getenv("SECTOR_MIN_RESOLVED_GLOBAL_EVENTS",     "100")),
 }
 
-EXPLORATION_KELLY_FRACTION = 0.25
+EXPLORATION_KELLY_FRACTION = float(os.getenv("EXPLORATION_KELLY_FRACTION", "0.10"))
 
 # -- Circuit breaker --
-CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.20"))
+CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.08"))
 
 # -- Sharp detector --
 SHARP_SPREAD_THRESHOLD_PCT    = float(os.getenv("SHARP_SPREAD_THRESHOLD_PCT",    "0.04"))
@@ -84,13 +87,13 @@ FADE_THRESHOLD_CENTS  = int(os.getenv("FADE_THRESHOLD_CENTS",    "82"))
 FADE_MIN_DISAGREEMENT = float(os.getenv("FADE_MIN_DISAGREEMENT", "0.10"))
 
 # -- Correlation engine --
-CORR_MIN_DIVERGENCE_CENTS = float(os.getenv("CORR_MIN_DIVERGENCE_CENTS", "8.0"))
-CORR_MAX_GROUP_SIZE       = int(os.getenv("CORR_MAX_GROUP_SIZE",         "10"))
+CORR_MIN_DIVERGENCE_CENTS = float(os.getenv("CORR_MIN_DIVERGENCE_CENTS", "12.0"))
+CORR_MAX_GROUP_SIZE       = int(os.getenv("CORR_MAX_GROUP_SIZE",         "6"))
 
 # -- Resolution timer --
-RESTIME_MIN_OVERDUE_MIN = float(os.getenv("RESTIME_MIN_OVERDUE_MIN", "15"))
-RESTIME_MIN_PROB        = float(os.getenv("RESTIME_MIN_PROB",        "0.80"))
-RESTIME_MIN_SAMPLES     = int(os.getenv("RESTIME_MIN_SAMPLES",       "20"))
+RESTIME_MIN_OVERDUE_MIN = float(os.getenv("RESTIME_MIN_OVERDUE_MIN", "20"))
+RESTIME_MIN_PROB        = float(os.getenv("RESTIME_MIN_PROB",        "0.88"))
+RESTIME_MIN_SAMPLES     = int(os.getenv("RESTIME_MIN_SAMPLES",       "40"))
 
 # -- News signal --
 NEWS_POLL_INTERVAL_SEC        = int(os.getenv("NEWS_POLL_INTERVAL_SEC",        "300"))
@@ -104,19 +107,17 @@ BETA_BETA_PRIOR      = 2
 MIN_TRAINING_SAMPLES = 50
 CALIBRATION_WINDOW   = 30
 
-# -- TIER 1: Free APIs --
+# -- APIs --
 FRED_API_KEY    = os.getenv("FRED_API_KEY", "")
 NEWSAPI_KEY     = os.getenv("NEWSAPI_KEY", "")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
-# -- TIER 2: $9-$50/mo --
 ODDS_API_KEY      = os.getenv("ODDS_API_KEY", "")
 ODDSPAPI_KEY      = os.getenv("ODDSPAPI_KEY", "")
 POLYGON_API_KEY   = os.getenv("POLYGON_API_KEY", "")
 MYSPORTSFEEDS_KEY = os.getenv("MYSPORTSFEEDS_KEY", "")
 FMP_API_KEY       = os.getenv("FMP_API_KEY", "")
 
-# -- TIER 3: $29-$150/mo --
 GLASSNODE_API_KEY = os.getenv("GLASSNODE_API_KEY", "")
 TOMORROW_IO_KEY   = os.getenv("TOMORROW_IO_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
@@ -135,7 +136,7 @@ RETRAIN_HOUR      = 2
 # -- Storage --
 DB_PATH = os.getenv("DB_PATH", "flywheel.db")
 
-# -- Sectors (v9: Fab 7) --
+# -- Sectors --
 SECTORS = ["economics", "crypto", "politics", "weather", "financial_markets", "sports", "global_events"]
 
 # -- Bet sizing helpers --
@@ -154,5 +155,4 @@ def sector_loss_cap(sector):
     return SECTOR_MAX_DAILY_LOSS.get(sector, 0.0)
 
 def sector_max_edge(sector):
-    """Return the edge ceiling for a given sector."""
     return SECTOR_MAX_EDGE.get(sector, MAX_EDGE_PCT)
