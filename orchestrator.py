@@ -794,8 +794,21 @@ class FlywheelOrchestrator:
         return True, ""
 
     def _rebuild_demo_exposure(self) -> None:
+        """Rebuild exposure from unresolved trades within the last 3 days.
+        
+        v13.1: Added staleness filter. Orphan trades older than 3 days
+        (usually because the market expired without resolution ingestion
+        catching it) were inflating exposure and blocking new trades.
+        Example: sports exposure hit $6,670 on $1000 bankroll because
+        900+ unresolved trades from pre-v13 were all being summed.
+        
+        Trades older than 3 days are effectively dead — Kalshi markets
+        resolve within 24-48 hours normally. If we haven't matched an
+        outcome after 3 days, the trade won't resolve and shouldn't
+        count against active exposure.
+        """
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
-
+ 
         rows = _query_signals(
             """
             SELECT t.sector, t.dollars_risked
@@ -803,9 +816,10 @@ class FlywheelOrchestrator:
             LEFT JOIN outcomes o
               ON o.trade_id = t.id
             WHERE o.trade_id IS NULL
+              AND t.created_at > NOW() - INTERVAL '3 days'
             """
         )
-
+ 
         for row in rows:
             sector = row.get("sector")
             dollars = float(row.get("dollars_risked") or 0.0)
