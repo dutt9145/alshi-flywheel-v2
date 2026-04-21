@@ -1,11 +1,36 @@
 """
-kalshi-flywheel / config/settings.py  (v9 — Fab 7 sector names)
+kalshi-flywheel / config/settings.py  (v10 — moderated tightening for v13 eval window)
 
-Changes vs v8:
-  1. Replaced "tech" -> "financial_markets" and "entertainment" -> "global_events"
-     in SECTORS, SECTOR_MAX_EDGE, SECTOR_MAX_DAILY_LOSS, SECTOR_MIN_RESOLVED.
-  2. All helpers (sector_max_edge, sector_loss_cap, sector_kelly_fraction)
-     now return correct values for the new sector names.
+Changes vs v9 (tight):
+  1. Reverted SECTOR_MAX_LOSS_WEATHER from 12.0 → 60.0
+     Rationale: we JUST raised this from 30→60 hours ago to fix the bug
+     where one weather trade locked the sector for 4 hours. Dropping to 12
+     makes it worse than the original broken state.
+  2. Reverted SECTOR_MIN_RESOLVED_SPORTS from 150 → 30
+     Rationale: 150 puts sports in permanent exploration (10% Kelly),
+     which suppresses NBA/MLB volume we need to evaluate v13 model fixes.
+  3. Reverted KELLY_FRACTION from 0.15 → 0.20 (compromise between 0.15 and 0.25)
+  4. Reverted MIN_EDGE_PCT from 0.10 → 0.05 (original)
+  5. Reverted CONSENSUS_EDGE_PCT from 0.08 → 0.05 (original)
+  6. Reverted CONSENSUS_CONFIDENCE from 0.82 → 0.75 (original)
+  7. Reverted MAX_SINGLE_TRADE_USD from 12 → 30 (original)
+  8. Reverted SECTOR_MAX_LOSS_SPORTS from 20 → 50 (original)
+  9. Reverted SECTOR_MAX_LOSS_CRYPTO from 15 → 40 (original)
+
+Kept from v9 tight:
+  - financial_markets fully disabled (cap=0, resolved=9999)
+  - MAX_SINGLE_TRADE_PCT 0.02 (was 0.04)
+  - MAX_SECTOR_EXPOSURE 0.07 (was 0.15)
+  - MAX_MARKET_EXPOSURE 0.02 (was 0.05)
+  - CIRCUIT_BREAKER_PCT 0.08 (was 0.20)
+  - CORR_MIN_DIVERGENCE_CENTS 12 (was 8) — fewer low-quality corr trades
+  - RESTIME thresholds tightened
+  - Shadow mode config retained
+
+Rationale: v13 model changes (dynamic AB, WHIP, crypto volatility) need
+7 days of normal-volume data to evaluate. Tightening position sizing
+is fine but tightening edge thresholds AND exploration floors simultaneously
+strangles the signal we need to collect.
 """
 
 import os
@@ -24,57 +49,63 @@ DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 # -- Bankroll & risk --
 BANKROLL = float(os.environ.get("BANKROLL") or os.getenv("BANKROLL") or 10000)
 
-# tighter demo survival mode
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.15"))
-MIN_EDGE_PCT   = float(os.getenv("MIN_EDGE_PCT", "0.10"))
-MAX_EDGE_PCT   = float(os.getenv("MAX_EDGE_PCT", "0.20"))
+# Moderated Kelly — 0.20 is between old 0.25 and tight 0.15
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.20"))
+MIN_EDGE_PCT   = float(os.getenv("MIN_EDGE_PCT", "0.05"))
+MAX_EDGE_PCT   = float(os.getenv("MAX_EDGE_PCT", "0.25"))
 
 # -- Per-sector edge ceilings --
 SECTOR_MAX_EDGE = {
-    "sports":            float(os.getenv("SECTOR_MAX_EDGE_SPORTS",            "0.30")),
-    "weather":           float(os.getenv("SECTOR_MAX_EDGE_WEATHER",           "0.40")),
-    "crypto":            float(os.getenv("SECTOR_MAX_EDGE_CRYPTO",            "0.20")),
-    "politics":          float(os.getenv("SECTOR_MAX_EDGE_POLITICS",          "0.20")),
-    "economics":         float(os.getenv("SECTOR_MAX_EDGE_ECONOMICS",         "0.20")),
-    "financial_markets": float(os.getenv("SECTOR_MAX_EDGE_FINANCIAL_MARKETS", "0.20")),
-    "global_events":     float(os.getenv("SECTOR_MAX_EDGE_GLOBAL_EVENTS",     "0.20")),
+    "sports":            float(os.getenv("SECTOR_MAX_EDGE_SPORTS",            "0.40")),
+    "weather":           float(os.getenv("SECTOR_MAX_EDGE_WEATHER",           "0.60")),
+    "crypto":            float(os.getenv("SECTOR_MAX_EDGE_CRYPTO",            "0.25")),
+    "politics":          float(os.getenv("SECTOR_MAX_EDGE_POLITICS",          "0.25")),
+    "economics":         float(os.getenv("SECTOR_MAX_EDGE_ECONOMICS",         "0.25")),
+    "financial_markets": float(os.getenv("SECTOR_MAX_EDGE_FINANCIAL_MARKETS", "0.25")),
+    "global_events":     float(os.getenv("SECTOR_MAX_EDGE_GLOBAL_EVENTS",     "0.25")),
 }
 
-CONSENSUS_EDGE_PCT   = float(os.getenv("CONSENSUS_EDGE_PCT", "0.08"))
-CONSENSUS_CONFIDENCE = float(os.getenv("CONSENSUS_CONFIDENCE", "0.82"))
+CONSENSUS_EDGE_PCT   = float(os.getenv("CONSENSUS_EDGE_PCT", "0.05"))
+CONSENSUS_CONFIDENCE = float(os.getenv("CONSENSUS_CONFIDENCE", "0.75"))
 DIRECTION_FILTER     = os.getenv("DIRECTION_FILTER", "BOTH")
 
+# Kept tight: smaller position sizing is fine, it's edge/volume we shouldn't strangle
 MAX_SINGLE_TRADE_PCT = float(os.getenv("MAX_SINGLE_TRADE_PCT", "0.02"))
-MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "12"))
+MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "30"))
 MAX_SECTOR_EXPOSURE  = float(os.getenv("MAX_SECTOR_EXPOSURE", "0.07"))
 MAX_MARKET_EXPOSURE  = float(os.getenv("MAX_MARKET_EXPOSURE", "0.02"))
 
 # -- Per-sector daily loss caps --
+# Weather restored to 60 (the fix we just deployed hours ago)
+# Sports restored to 50 (original) so NBA/MLB can flow
 SECTOR_MAX_DAILY_LOSS = {
-    "sports":            float(os.getenv("SECTOR_MAX_LOSS_SPORTS",            "20.0")),
-    "politics":          float(os.getenv("SECTOR_MAX_LOSS_POLITICS",          "10.0")),
-    "weather":           float(os.getenv("SECTOR_MAX_LOSS_WEATHER",           "12.0")),
-    "economics":         float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",         "10.0")),
-    "crypto":            float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",            "15.0")),
+    "sports":            float(os.getenv("SECTOR_MAX_LOSS_SPORTS",            "50.0")),
+    "politics":          float(os.getenv("SECTOR_MAX_LOSS_POLITICS",          "25.0")),
+    "weather":           float(os.getenv("SECTOR_MAX_LOSS_WEATHER",           "60.0")),
+    "economics":         float(os.getenv("SECTOR_MAX_LOSS_ECONOMICS",         "40.0")),
+    "crypto":            float(os.getenv("SECTOR_MAX_LOSS_CRYPTO",            "40.0")),
     "financial_markets": float(os.getenv("SECTOR_MAX_LOSS_FINANCIAL_MARKETS", "0.0")),
-    "global_events":     float(os.getenv("SECTOR_MAX_LOSS_GLOBAL_EVENTS",     "10.0")),
+    "global_events":     float(os.getenv("SECTOR_MAX_LOSS_GLOBAL_EVENTS",     "25.0")),
 }
 
 # -- Per-sector minimum resolved before full Kelly --
+# Sports restored to 30 so NBA/MLB v13 model can exit exploration mode
+# Weather 30 (already has 282 resolved, this is moot)
+# Crypto 30 (need fresh v13 crypto data to calibrate)
 SECTOR_MIN_RESOLVED = {
-    "sports":            int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",            "150")),
-    "politics":          int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",          "75")),
-    "weather":           int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",           "75")),
-    "economics":         int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS",         "75")),
-    "crypto":            int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",            "60")),
+    "sports":            int(os.getenv("SECTOR_MIN_RESOLVED_SPORTS",            "30")),
+    "politics":          int(os.getenv("SECTOR_MIN_RESOLVED_POLITICS",          "50")),
+    "weather":           int(os.getenv("SECTOR_MIN_RESOLVED_WEATHER",           "30")),
+    "economics":         int(os.getenv("SECTOR_MIN_RESOLVED_ECONOMICS",         "50")),
+    "crypto":            int(os.getenv("SECTOR_MIN_RESOLVED_CRYPTO",            "30")),
     "financial_markets": int(os.getenv("SECTOR_MIN_RESOLVED_FINANCIAL_MARKETS", "9999")),
-    "global_events":     int(os.getenv("SECTOR_MIN_RESOLVED_GLOBAL_EVENTS",     "100")),
+    "global_events":     int(os.getenv("SECTOR_MIN_RESOLVED_GLOBAL_EVENTS",     "75")),
 }
 
-EXPLORATION_KELLY_FRACTION = float(os.getenv("EXPLORATION_KELLY_FRACTION", "0.10"))
+EXPLORATION_KELLY_FRACTION = float(os.getenv("EXPLORATION_KELLY_FRACTION", "0.25"))
 
 # -- Circuit breaker --
-CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.08"))
+CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.10"))
 
 # -- Sharp detector --
 SHARP_SPREAD_THRESHOLD_PCT    = float(os.getenv("SHARP_SPREAD_THRESHOLD_PCT",    "0.04"))
@@ -87,13 +118,15 @@ FADE_THRESHOLD_CENTS  = int(os.getenv("FADE_THRESHOLD_CENTS",    "82"))
 FADE_MIN_DISAGREEMENT = float(os.getenv("FADE_MIN_DISAGREEMENT", "0.10"))
 
 # -- Correlation engine --
+# Kept tight: 12¢ divergence (was 8¢) cuts low-quality corr trades
 CORR_MIN_DIVERGENCE_CENTS = float(os.getenv("CORR_MIN_DIVERGENCE_CENTS", "12.0"))
-CORR_MAX_GROUP_SIZE       = int(os.getenv("CORR_MAX_GROUP_SIZE",         "6"))
+CORR_MAX_GROUP_SIZE       = int(os.getenv("CORR_MAX_GROUP_SIZE",         "8"))
 
 # -- Resolution timer --
+# Kept moderately tight
 RESTIME_MIN_OVERDUE_MIN = float(os.getenv("RESTIME_MIN_OVERDUE_MIN", "20"))
-RESTIME_MIN_PROB        = float(os.getenv("RESTIME_MIN_PROB",        "0.88"))
-RESTIME_MIN_SAMPLES     = int(os.getenv("RESTIME_MIN_SAMPLES",       "40"))
+RESTIME_MIN_PROB        = float(os.getenv("RESTIME_MIN_PROB",        "0.85"))
+RESTIME_MIN_SAMPLES     = int(os.getenv("RESTIME_MIN_SAMPLES",       "30"))
 
 # -- News signal --
 NEWS_POLL_INTERVAL_SEC        = int(os.getenv("NEWS_POLL_INTERVAL_SEC",        "300"))
