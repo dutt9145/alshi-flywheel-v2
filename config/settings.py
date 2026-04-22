@@ -65,8 +65,8 @@ SECTOR_MAX_EDGE = {
     "global_events":     float(os.getenv("SECTOR_MAX_EDGE_GLOBAL_EVENTS",     "0.25")),
 }
 
-CONSENSUS_EDGE_PCT   = float(os.getenv("CONSENSUS_EDGE_PCT", "0.05"))
-CONSENSUS_CONFIDENCE = float(os.getenv("CONSENSUS_CONFIDENCE", "0.75"))
+CONSENSUS_EDGE_PCT   = float(os.getenv("CONSENSUS_EDGE_PCT", "0.04"))
+CONSENSUS_CONFIDENCE = float(os.getenv("CONSENSUS_CONFIDENCE", "0.50"))
 DIRECTION_FILTER     = os.getenv("DIRECTION_FILTER", "BOTH")
 
 # Kept tight: smaller position sizing is fine, it's edge/volume we shouldn't strangle
