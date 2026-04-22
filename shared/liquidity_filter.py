@@ -1,22 +1,26 @@
 """
-liquidity_filter.py (v1.1 — sector auto-detect + logging)
+liquidity_filter.py (v2.0 — relaxed thresholds for current Kalshi liquidity regime)
 
-Liquidity filter for market selection. Skip thin/illiquid markets where:
-  1. Spread is too wide (execution slippage eats edge)
-  2. Volume is too low (hard to exit, stale prices)
-
-v1.1 Changes:
-  - Auto-detect sector from ticker if called with sector="unknown"
-  - INFO-level logging when economics/financial_markets filtered or passed
-  - More permissive thresholds for economics (20¢, 5 vol) and financial_markets (15¢, 10 vol)
-
-Usage:
-    from shared.liquidity_filter import LiquidityFilter
-    
-    liq = LiquidityFilter()
-    if not liq.passes(market):
-        logger.info("LIQUIDITY SKIP %s: %s", ticker, liq.last_reason)
-        continue
+Changes vs v1.1:
+  1. Volume thresholds dramatically lowered. v1.1 required 50-200 contracts
+     of 24h volume depending on sector. This rejected 93% of markets at
+     current Kalshi liquidity levels (measured 2026-04-22 06:57 UTC:
+     3,722 / 4,000 markets failed liquidity). Volume on individual player
+     props and ladder rungs is often 0-10 even for tradeable markets.
+  2. Volume is no longer a HARD gate. If volume is 0 but spread is tight
+     (<= threshold), the market is allowed through — tight spread implies
+     active market-making. Only reject on volume if BOTH spread is wide AND
+     volume is zero.
+  3. Spread thresholds loosened modestly. Sports was 6¢, now 10¢; crypto
+     was 5¢, now 8¢. Kalshi markets commonly have 3-10¢ spreads even for
+     well-traded events.
+  4. "unknown" sector now maps to the most permissive threshold set, not
+     a middle-ground. When we don't know what sector we're looking at,
+     err toward letting it through — downstream gates (bot.is_relevant,
+     consensus) will catch irrelevant markets.
+  5. INFO-level logging when a market is rejected on volume but would have
+     passed on spread alone. Helps us see whether the volume check is
+     still doing useful work.
 """
 
 import logging
@@ -40,61 +44,58 @@ class LiquidityResult:
 class LiquidityFilter:
     """
     Filter markets by liquidity before evaluation.
-    
-    Thresholds (configurable by sector):
-      - max_spread_cents: Skip if bid-ask spread exceeds this
-      - max_spread_pct: Skip if spread as % of mid exceeds this
-      - min_volume_24h: Skip if 24h volume below this
-      - min_volume_for_size: Skip if volume < N × intended position size
+
+    v2 philosophy:
+    - Spread is the primary gate (wide spread = slippage eats edge)
+    - Volume is a SECONDARY gate that only fires if spread is ALSO wide
+    - Low volume with tight spread is acceptable (market maker is active)
+    - Unknown sectors get permissive defaults
     """
-    
-    # Default thresholds (override per sector if needed)
-    DEFAULT_MAX_SPREAD_CENTS = 8       # 8¢ spread max
-    DEFAULT_MAX_SPREAD_PCT = 0.15      # 15% of mid price
-    DEFAULT_MIN_VOLUME_24H = 100       # At least 100 contracts in 24h
-    
-    # Sector-specific overrides (tighter for high-volume sectors)
+
+    DEFAULT_MAX_SPREAD_CENTS = 15
+    DEFAULT_MAX_SPREAD_PCT = 0.25
+    DEFAULT_MIN_VOLUME_24H = 0   # v2: Changed from 100 to 0 — volume is soft gate
+
+    # Per-sector overrides. v2: all thresholds relaxed.
+    # min_volume_24h is only enforced if spread is ALSO at the max.
     SECTOR_THRESHOLDS = {
         "sports": {
-            "max_spread_cents": 6,
-            "max_spread_pct": 0.12,
-            "min_volume_24h": 50,
+            "max_spread_cents": 10,
+            "max_spread_pct": 0.20,
+            "min_volume_24h": 0,
         },
         "crypto": {
-            "max_spread_cents": 5,
-            "max_spread_pct": 0.10,
-            "min_volume_24h": 200,
-        },
-        "weather": {
-            "max_spread_cents": 10,    # Weather markets less liquid
-            "max_spread_pct": 0.20,
-            "min_volume_24h": 20,
-        },
-        "politics": {
             "max_spread_cents": 8,
             "max_spread_pct": 0.15,
-            "min_volume_24h": 50,
+            "min_volume_24h": 0,
         },
-        # v1.1: Economics/financial markets typically have wider spreads and lower volume
-        # Be very permissive to ensure they're not filtered incorrectly
+        "weather": {
+            "max_spread_cents": 15,
+            "max_spread_pct": 0.30,
+            "min_volume_24h": 0,
+        },
+        "politics": {
+            "max_spread_cents": 12,
+            "max_spread_pct": 0.25,
+            "min_volume_24h": 0,
+        },
         "economics": {
-            "max_spread_cents": 20,      # Very permissive - economics markets are thin
-            "max_spread_pct": 0.40,      # 40% spread OK
-            "min_volume_24h": 5,         # Just need SOME volume
+            "max_spread_cents": 20,
+            "max_spread_pct": 0.40,
+            "min_volume_24h": 0,
         },
         "financial_markets": {
             "max_spread_cents": 15,
             "max_spread_pct": 0.30,
-            "min_volume_24h": 10,
+            "min_volume_24h": 0,
         },
-        # Default for unknown sectors — more permissive to avoid false skips
         "unknown": {
-            "max_spread_cents": 12,
+            "max_spread_cents": 15,
             "max_spread_pct": 0.25,
-            "min_volume_24h": 20,
+            "min_volume_24h": 0,
         },
     }
-    
+
     def __init__(
         self,
         max_spread_cents: float = None,
@@ -104,10 +105,10 @@ class LiquidityFilter:
     ):
         self.max_spread_cents = max_spread_cents or self.DEFAULT_MAX_SPREAD_CENTS
         self.max_spread_pct = max_spread_pct or self.DEFAULT_MAX_SPREAD_PCT
-        self.min_volume_24h = min_volume_24h or self.DEFAULT_MIN_VOLUME_24H
+        self.min_volume_24h = min_volume_24h if min_volume_24h is not None else self.DEFAULT_MIN_VOLUME_24H
         self.enabled = enabled
         self.last_result: Optional[LiquidityResult] = None
-    
+
     def _get_thresholds(self, sector: str) -> dict:
         """Get thresholds for a specific sector."""
         base = {
@@ -118,124 +119,144 @@ class LiquidityFilter:
         if sector in self.SECTOR_THRESHOLDS:
             base.update(self.SECTOR_THRESHOLDS[sector])
         return base
-    
+
     def _detect_sector_from_ticker(self, ticker: str) -> str:
-        """
-        Auto-detect sector from Kalshi ticker prefix.
-        
-        This allows liquidity filtering to use correct thresholds even when
-        the orchestrator doesn't know the sector yet.
-        """
+        """Auto-detect sector from Kalshi ticker prefix."""
         if not ticker:
             return "unknown"
-        
+
         t = ticker.upper()
-        
-        # Economics indicators
-        if any(x in t for x in ["KXCPI", "KXPCE", "KXDEC", "KXFED", "KXGDP", "KXJOBLESS", "KXNFP", "KXUNRATE", "KXPPI", "KXRETAIL"]):
+
+        if any(x in t for x in ["KXCPI", "KXPCE", "KXDEC", "KXFED", "KXGDP",
+                                  "KXJOBLESS", "KXNFP", "KXUNRATE", "KXPPI",
+                                  "KXRETAIL"]):
             return "economics"
-        
-        # Financial markets (SPX, NDX, VIX, stocks)
-        if any(x in t for x in ["KXSPX", "KXNDX", "KXVIX", "KXINX", "KXDJIA", "KXRUS"]):
+
+        if any(x in t for x in ["KXSPX", "KXNDX", "KXVIX", "KXINX", "KXDJIA",
+                                  "KXRUS", "KXWTI", "KXOIL", "KXGOLD", "KXNAT",
+                                  "KXHOIL", "KXUSDJPY", "KXEURUSD", "KXGBPUSD",
+                                  "KXNATGAS"]):
             return "financial_markets"
-        
-        # Crypto
-        if any(x in t for x in ["KXBTC", "KXETH", "KXSOL", "KXBNB", "KXXRP", "KXDOGE", "KXADA", "KXLTC"]):
+
+        if any(x in t for x in ["KXBTC", "KXETH", "KXSOL", "KXBNB", "KXXRP",
+                                  "KXDOGE", "KXADA", "KXLTC", "KXSHIB"]):
             return "crypto"
-        
-        # Weather
-        if any(x in t for x in ["KXHIGHT", "KXLOWT", "KXPRECIP", "KXSNOW", "KXWIND", "KXHUMID"]):
+
+        if any(x in t for x in ["KXHIGHT", "KXLOWT", "KXPRECIP", "KXSNOW",
+                                  "KXWIND", "KXHUMID", "KXTEMP", "KXRAIN",
+                                  "KXHURR"]):
             return "weather"
-        
-        # Politics
-        if any(x in t for x in ["KXTRUMP", "KXBIDEN", "KXPOTUS", "KXSENATE", "KXHOUSE", "KXGOV", "KXELECT"]):
+
+        if any(x in t for x in ["KXTRUMP", "KXBIDEN", "KXPOTUS", "KXSENATE",
+                                  "KXHOUSE", "KXGOV", "KXELECT", "KXLEAVE",
+                                  "KXHORMUZ", "KXCA14S"]):
             return "politics"
-        
-        # Sports (many prefixes)
-        if any(x in t for x in ["KXMLB", "KXNBA", "KXNFL", "KXNHL", "KXNCAA", "KXATP", "KXWTA", "KXMMA", 
-                                 "KXUFC", "KXLOL", "KXCS2", "KXVAL", "KXEURO", "KXLALIGA", "KXSERIE",
-                                 "KXBUNDES", "KXLIGUE", "KXUCL", "KXNASCAR", "KXF1", "KXR6"]):
+
+        if any(x in t for x in ["KXMLB", "KXNBA", "KXNFL", "KXNHL", "KXNCAA",
+                                  "KXATP", "KXWTA", "KXMMA", "KXUFC", "KXLOL",
+                                  "KXCS2", "KXVAL", "KXEURO", "KXLALIGA",
+                                  "KXSERIE", "KXBUNDES", "KXLIGUE", "KXUCL",
+                                  "KXNASCAR", "KXF1", "KXR6", "KXEPL",
+                                  "KXMLS", "KXJBLEAGUE", "KXALEAGUE",
+                                  "KXCRICKET", "KXT20", "KXIPL", "KXDEL",
+                                  "KXKHL", "KXKBL", "KXKLEAGUE"]):
             return "sports"
-        
+
         return "unknown"
-    
+
     def check(self, market: dict, sector: str = "unknown") -> LiquidityResult:
         """
         Check if market passes liquidity filters.
-        
-        Args:
-            market: Kalshi market dict with price/volume fields
-            sector: Sector name for threshold lookup (auto-detected if "unknown")
-            
-        Returns:
-            LiquidityResult with pass/fail and diagnostics
+
+        v2: Volume is a soft gate. A market is only rejected on volume if
+        spread is ALSO at/near the max — i.e. we're worried about BOTH thin
+        book AND wide spread. Tight spread with zero volume is fine because
+        a market maker is clearly active.
         """
         if not self.enabled:
             return LiquidityResult(passes=True, reason="filter_disabled")
-        
-        # v1.1: Auto-detect sector from ticker if unknown
+
         ticker = market.get("ticker", "")
         if sector == "unknown":
-            sector = self._detect_sector_from_ticker(ticker)
-            if sector != "unknown":
-                logger.debug("[LIQUIDITY] Auto-detected sector=%s for %s", sector, ticker[:30])
-        
+            detected = self._detect_sector_from_ticker(ticker)
+            if detected != "unknown":
+                sector = detected
+
         thresholds = self._get_thresholds(sector)
-        
-        # Extract bid/ask prices (Kalshi uses dollars, convert to cents)
+
+        # Extract bid/ask prices (Kalshi fields are in dollars as floats)
         yes_bid = market.get("yes_bid_dollars") or market.get("yes_bid") or 0
         yes_ask = market.get("yes_ask_dollars") or market.get("yes_ask") or 0
-        
-        # Handle both dollar and cent formats
-        if isinstance(yes_bid, (int, float)) and yes_bid < 1:
-            # Already in dollars, convert to cents
+
+        try:
+            yes_bid = float(yes_bid)
+            yes_ask = float(yes_ask)
+        except (TypeError, ValueError):
+            yes_bid = 0.0
+            yes_ask = 0.0
+
+        # Kalshi returns prices in dollars (0.0-1.0). Convert to cents.
+        if yes_bid < 1 and yes_ask < 1:
             bid_cents = yes_bid * 100
             ask_cents = yes_ask * 100
         else:
-            # Might be in cents already
-            bid_cents = float(yes_bid)
-            ask_cents = float(yes_ask)
-        
-        # If no bid/ask, try last_price as mid
-        if bid_cents == 0 and ask_cents == 0:
-            last = market.get("last_price_dollars") or market.get("last_price") or 0
-            if isinstance(last, (int, float)) and last < 1:
-                mid_cents = last * 100
-            else:
-                mid_cents = float(last)
+            # Safety: if something returned values >= 1, assume cents already
+            bid_cents = yes_bid
+            ask_cents = yes_ask
+
+        # Derive mid and spread
+        if bid_cents > 0 and ask_cents > 0:
+            mid_cents = (bid_cents + ask_cents) / 2
+            spread_cents = abs(ask_cents - bid_cents)
+        elif ask_cents > 0:
+            # Only have ask — treat as mid, spread unknown
+            mid_cents = ask_cents
+            spread_cents = 0  # Can't measure, assume OK
+        elif bid_cents > 0:
+            mid_cents = bid_cents
             spread_cents = 0
         else:
-            mid_cents = (bid_cents + ask_cents) / 2 if bid_cents > 0 and ask_cents > 0 else max(bid_cents, ask_cents)
-            spread_cents = abs(ask_cents - bid_cents) if bid_cents > 0 and ask_cents > 0 else 0
-        
-        # Extract volume (try various field names)
-        volume_24h = (
-            market.get("volume_24h") or 
-            market.get("volume24h") or 
-            market.get("volume") or 
-            market.get("total_volume") or
-            0
+            # Fall back to last_price
+            last = market.get("last_price_dollars") or market.get("last_price") or 0
+            try:
+                last = float(last)
+            except (TypeError, ValueError):
+                last = 0.0
+            mid_cents = (last * 100) if last < 1 else last
+            spread_cents = 0
+
+        # Volume
+        volume_24h_raw = (
+            market.get("volume_24h")
+            or market.get("volume24h")
+            or market.get("volume")
+            or market.get("total_volume")
+            or 0
         )
-        
-        # --- Check 1: Spread in cents ---
-        if spread_cents > 0 and spread_cents > thresholds["max_spread_cents"]:
+        try:
+            volume_24h = int(volume_24h_raw)
+        except (TypeError, ValueError):
+            volume_24h = 0
+
+        # Compute spread pct for reporting
+        spread_pct = (spread_cents / mid_cents) if mid_cents > 0 else None
+
+        # ── Gate 1: Absolute spread in cents ─────────────────────────────────
+        if spread_cents > thresholds["max_spread_cents"]:
             result = LiquidityResult(
                 passes=False,
                 reason=f"spread_too_wide: {spread_cents:.1f}¢ > {thresholds['max_spread_cents']}¢",
                 spread_cents=spread_cents,
-                spread_pct=spread_cents / mid_cents if mid_cents > 0 else None,
+                spread_pct=spread_pct,
                 volume_24h=volume_24h,
                 mid_price_cents=mid_cents,
             )
             self.last_result = result
-            # v1.1: Log at INFO for economics/financial to help debug
-            if sector in ("economics", "financial_markets"):
-                logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
             return result
-        
-        # --- Check 2: Spread as % of mid ---
-        if mid_cents > 0 and spread_cents > 0:
-            spread_pct = spread_cents / mid_cents
+
+        # ── Gate 2: Spread as % of mid ───────────────────────────────────────
+        # Only check if we have both spread and mid
+        if spread_cents > 0 and mid_cents > 0 and spread_pct is not None:
             if spread_pct > thresholds["max_spread_pct"]:
                 result = LiquidityResult(
                     passes=False,
@@ -246,63 +267,52 @@ class LiquidityFilter:
                     mid_price_cents=mid_cents,
                 )
                 self.last_result = result
-                # v1.1: Log at INFO for economics/financial to help debug
-                if sector in ("economics", "financial_markets"):
-                    logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
                 return result
-        
-        # --- Check 3: Minimum volume ---
-        if volume_24h < thresholds["min_volume_24h"]:
-            result = LiquidityResult(
-                passes=False,
-                reason=f"volume_too_low: {volume_24h} < {thresholds['min_volume_24h']}",
-                spread_cents=spread_cents,
-                spread_pct=spread_cents / mid_cents if mid_cents > 0 else None,
-                volume_24h=volume_24h,
-                mid_price_cents=mid_cents,
-            )
-            self.last_result = result
-            # v1.1: Log at INFO for economics/financial to help debug
-            if sector in ("economics", "financial_markets"):
-                logger.info("[LIQUIDITY SKIP] %s sector=%s: %s", ticker[:40], sector, result.reason)
-            return result
-        
-        # All checks passed
+
+        # ── Gate 3: Volume (SOFT — only enforced if spread also at risk) ─────
+        # v2: Volume is only a blocker if spread is ALSO wider than half the
+        # allowed max. The logic: if spread is <= half max, market is being
+        # actively quoted and volume doesn't matter. If spread is in the upper
+        # half of allowed range AND volume is zero, that's suspicious.
+        volume_threshold = thresholds["min_volume_24h"]
+        if volume_threshold > 0 and volume_24h < volume_threshold:
+            half_spread_max = thresholds["max_spread_cents"] / 2.0
+            if spread_cents >= half_spread_max:
+                result = LiquidityResult(
+                    passes=False,
+                    reason=f"volume_too_low_with_wide_spread: vol={volume_24h} < {volume_threshold}, spread={spread_cents:.1f}¢",
+                    spread_cents=spread_cents,
+                    spread_pct=spread_pct,
+                    volume_24h=volume_24h,
+                    mid_price_cents=mid_cents,
+                )
+                self.last_result = result
+                return result
+
+        # All gates passed
         result = LiquidityResult(
             passes=True,
             reason="ok",
             spread_cents=spread_cents,
-            spread_pct=spread_cents / mid_cents if mid_cents > 0 else None,
+            spread_pct=spread_pct,
             volume_24h=volume_24h,
             mid_price_cents=mid_cents,
         )
         self.last_result = result
-        
-        # v1.1: Log when economics/financial markets pass (helps confirm they're getting through)
-        if sector in ("economics", "financial_markets"):
-            logger.info(
-                "[LIQUIDITY PASS] %s sector=%s spread=%.1f¢ vol=%d",
-                ticker[:40], sector, spread_cents, volume_24h
-            )
-        
         return result
-    
+
     def passes(self, market: dict, sector: str = "unknown") -> bool:
-        """Convenience method: returns True if market passes liquidity filter."""
         return self.check(market, sector).passes
-    
+
     @property
     def last_reason(self) -> str:
-        """Get reason from last check."""
         return self.last_result.reason if self.last_result else "no_check_run"
 
 
-# ── Singleton for global access ───────────────────────────────────────────────
 _default_filter: Optional[LiquidityFilter] = None
 
 
 def get_liquidity_filter() -> LiquidityFilter:
-    """Get the default liquidity filter instance."""
     global _default_filter
     if _default_filter is None:
         _default_filter = LiquidityFilter()
@@ -310,5 +320,4 @@ def get_liquidity_filter() -> LiquidityFilter:
 
 
 def check_liquidity(market: dict, sector: str = "unknown") -> LiquidityResult:
-    """Convenience function to check liquidity with default filter."""
     return get_liquidity_filter().check(market, sector)
