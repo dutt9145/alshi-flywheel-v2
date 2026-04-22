@@ -50,7 +50,7 @@ DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 BANKROLL = float(os.environ.get("BANKROLL") or os.getenv("BANKROLL") or 10000)
 
 # Moderated Kelly — 0.20 is between old 0.25 and tight 0.15
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.20"))
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))
 MIN_EDGE_PCT   = float(os.getenv("MIN_EDGE_PCT", "0.05"))
 MAX_EDGE_PCT   = float(os.getenv("MAX_EDGE_PCT", "0.25"))
 
@@ -72,7 +72,7 @@ DIRECTION_FILTER     = os.getenv("DIRECTION_FILTER", "BOTH")
 # Kept tight: smaller position sizing is fine, it's edge/volume we shouldn't strangle
 MAX_SINGLE_TRADE_PCT = float(os.getenv("MAX_SINGLE_TRADE_PCT", "0.02"))
 MAX_SINGLE_TRADE_USD = float(os.getenv("MAX_SINGLE_TRADE_USD", "30"))
-MAX_SECTOR_EXPOSURE  = float(os.getenv("MAX_SECTOR_EXPOSURE", "0.07"))
+MAX_SECTOR_EXPOSURE  = float(os.getenv("MAX_SECTOR_EXPOSURE", "0.15"))
 MAX_MARKET_EXPOSURE  = float(os.getenv("MAX_MARKET_EXPOSURE", "0.02"))
 
 # -- Per-sector daily loss caps --
@@ -102,7 +102,7 @@ SECTOR_MIN_RESOLVED = {
     "global_events":     int(os.getenv("SECTOR_MIN_RESOLVED_GLOBAL_EVENTS",     "75")),
 }
 
-EXPLORATION_KELLY_FRACTION = float(os.getenv("EXPLORATION_KELLY_FRACTION", "0.25"))
+EXPLORATION_KELLY_FRACTION = float(os.getenv("EXPLORATION_KELLY_FRACTION", "0.50"))
 
 # -- Circuit breaker --
 CIRCUIT_BREAKER_PCT = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.10"))
