@@ -2263,28 +2263,12 @@ class GlobalEventsBot(BaseBot):
 
 # ── Convenience factory ───────────────────────────────────────────────────────
 
-def all_bots() -> list[BaseBot]:
-    """
-    Return all active bots.
-    
-    v12.7: Removed financial_markets from LLMBot sectors.
-    financial_markets had 0.55 overall Brier — coin-flip territory.
-    Disable entirely until a real model exists.
-    
-    v12.5: Qualitative sectors (politics, economics, global_events) 
-    now use LLMBot with Claude API + web search.
-    
-    Quantitative sectors (sports, weather, crypto) keep their specialized models.
-    """
-    from shared.llm_bot import LLMBot
-    
-    return [
-        # Quantitative bots — keep specialized models
-        CryptoBot(),
-        WeatherBot(),
-        SportsBot(),
-        # Qualitative bot — LLM with web search handles:
-        # politics, economics, global_events
-        # v12.7: financial_markets REMOVED (0.55 Brier — coin-flip territory)
-        LLMBot(),
-    ]
+    def all_bots() -> list[BaseBot]:
+        # LLMBot disabled 2026-04-22: user trades only sports/crypto/weather.
+        # LLM was rate-limited (30k tok/min cap) calling Claude API on every
+        # politics/economics/global_events market, burning quota for zero signals.
+        return [
+            CryptoBot(),
+            WeatherBot(),
+            SportsBot(),
+        ]
