@@ -2263,16 +2263,17 @@ class GlobalEventsBot(BaseBot):
 
 # ── Convenience factory ───────────────────────────────────────────────────────
 
-    def all_bots() -> list[BaseBot]:
-        """
-        Return all active bots.
-    
-        v20 update: LLMBot disabled — user trades sports/crypto/weather only.
-        LLM was hitting Anthropic rate limit (30k tok/min) calling on every
-        politics/economics market and returning zero useful signals.
-        """
-        return [
-            CryptoBot(),
-            WeatherBot(),
-            SportsBot(),
-        ]
+
+def all_bots() -> list[BaseBot]:
+    """
+    Return all active bots.
+
+    v20 update: LLMBot disabled — user trades sports/crypto/weather only.
+    LLM was hitting Anthropic rate limit (30k tok/min) calling on every
+    politics/economics market and returning zero useful signals.
+    """
+    return [
+        CryptoBot(),
+        WeatherBot(),
+        SportsBot(),
+    ]
