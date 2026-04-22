@@ -1,146 +1,75 @@
 """
-orchestrator.py  (v19.30 — Finalized market resolution fix)
+orchestrator.py  (v20.0 — clean slate rewrite)
 
-Changes vs v19.29:
-  1. _ingest_resolved_markets: Added Phase 3 for finalized market resolution.
-     The Kalshi API only returns markets with status=settled in batch queries,
-     but weather, crypto, financial_markets, and some sports (ATP tennis)
-     use status=finalized instead. These markets were being traded but never
-     resolved because they didn't appear in the batch query.
-     
-     Phase 3 queries the signals table for unresolved tickers, looks them up
-     individually via get_market(), and resolves any with status=finalized
-     and result in (yes, no).
-     
-  BUG FIX: Weather had 45 trades with 0 resolved outcomes. Crypto had 17
-  trades with 0 resolved. Financial markets had 14 trades with 0 resolved.
-  ATP tennis trades also affected. Only MLB/NBA sports used status=settled
-  and were resolving correctly. Now all sectors resolve properly.
+Rewritten against the new schema (migrations/001_clean_slate_v3.sql) and the
+new calibration_logger (v11). Key changes from v19.31:
 
-Changes vs v19.28:
-  1. _TICKER_SECTOR_MAP: Added new "financial_markets" sector covering:
-     - Commodities: KXJETFUEL, KXWTI, KXOIL, KXGOLD, KXSILVER, KXNAT, KXGASOLINE
-     - Forex: KXUSDJPY, KXEURUSD, KXGBPUSD, KXUSDCAD, KXUSDCHF, KXAUDUSD
-     - Stocks: KXSPY, KXQQQ, KXTSLA, KXAAPL, KXNVDA, KXAMZN, KXGOOG, KXMSFT
-     - Other: KXTRUFT (Truth Social), KXMAR (Marriott), KXHILT (Hilton)
-     These were previously falling back to "economics" and getting blocked.
-     
-  2. _execute_correlations: Added "financial_markets" to sector whitelist.
-     Now: ["sports", "weather", "crypto", "financial_markets"]
-     These are same-date price/threshold ladders where divergences = mispricings:
-       - "Jet fuel above $4.10" must be <= "above $3.70"
-       - "USDJPY above 160.75" must be <= "above 157.50"
-     Politics/economics ladders remain blocked (legitimate time-based spreads).
+1. SIGNAL STREAM SEPARATION
+   - main_signals: consensus/fade/restime decisions (real model views)
+   - correlation_legs: correlation engine pair arbitrage legs
+   DB CHECK constraint on main_signals prevents correlation artifacts from
+   leaking into the main stream. The two streams are structurally separate
+   and calibration analyses run only against main_signals.
 
-Changes vs v19.27:
-  1. _execute_correlations: Expanded sector whitelist from ["sports"] to
-     ["sports", "weather", "crypto"]. These sectors have nested threshold
-     markets where divergences ARE mispricings:
-       - Sports: "Over 8.5" must be <= "Over 7.5"
-       - Weather: "Above 85°F" must be <= "Above 80°F"
-       - Crypto: "BTC above $100k" must be <= "BTC above $90k"
-     Politics/economics ladders are still blocked (legitimate spreads).
-     
-  BUG FIX: Weather/crypto correlation signals were being found but never
-  traded because the v19.20 sports-only gate was blocking them. Dashboard
-  showed 531 sports signals, 0 weather/crypto despite active divergences.
+2. DB-BACKED COOLDOWN (30-MINUTE)
+   Replaces the in-memory _recently_traded dict that got wiped on every
+   Railway restart. Now checks the trades table directly for recent trades
+   on the same ticker. Survives restarts and works across parallel instances.
+   Cooldown is checked at the TOP of _execute_trade before any early returns.
 
-Changes vs v19.26:
-  1. _execute_fades: Now calls log_signal() before _execute_trade().
-  2. _execute_correlations: Now calls log_signal() for each leg before _execute_trade().
-  3. _execute_resolution_timing: Now calls log_signal() before _execute_trade().
-  
-  BUG FIX: Resolution ingestion matches against the `signals` table, but fade/
-  correlation/restime trades bypassed signal logging — they called _execute_trade()
-  directly. This caused 174 trades with 0 resolved outcomes because there were no
-  signals to match against. Now all trade paths log signals properly.
+3. ONE OUTCOME ROW PER TRADE (via trade_id)
+   Previously _calculate_pnl summed across all trade rows for a ticker,
+   which multiplied P&L by N whenever the same ticker had N phantom
+   duplicates. Now each trade gets its own outcome row keyed on trade_id.
+   Eliminates the phantom-multiplier bug structurally.
 
-Changes vs v19.25:
-  1. Limit order execution: Instead of market orders, place limits at mid
-     and reprice if not filled. Saves 2-4¢ per trade on average.
-  2. Early exit manager: Monitor open positions and exit when edge evaporates,
-     stop loss triggers, or take profit threshold hit. Frees capital for
-     better opportunities.
+4. SOURCE TAGGING
+   Every trade row now has a `source` column ('main', 'fade', 'restime',
+   'correlation'). Lets us cleanly separate performance analysis per path.
 
-Changes vs v19.24:
-  1. Lineup checker: Before MLB/NBA player prop trades, verify the player is
-     actually in the starting lineup (MLB) or not injured/out (NBA). Skip if
-     player is scratched, on IL, or listed as OUT/DOUBTFUL.
-  2. Weather ensemble: Cross-check NOAA with Open-Meteo. When models agree
-     (within 2°F) → boost confidence. When they diverge (>5°F) → reduce
-     confidence. Integrated into weather sector trades.
+5. GATE-FAILURE INSTRUMENTATION
+   _evaluate_market increments per-stage counters. At end of scan, log a
+   summary showing exactly where main-path signals die. Tells us in
+   production whether the consensus path actually fires.
 
-Changes vs v19.23:
-  1. Pinnacle sharp line check: Before executing sports trades, compare our
-     probability to Pinnacle's line via Odds API. Skip if divergence > 10%,
-     reduce confidence if > 5%, boost if aligned within 3%.
-  2. Integrated into _execute_trade for MLB/NBA player props.
+6. LOG_OUTCOME COMMITS BEFORE P&L SIDE EFFECTS
+   Fixes a subtle double-booking risk: if log_outcome raised, v19.x had
+   already called circuit_breaker.record_pnl() and mutated sector P&L.
+   Next ingestion cycle would re-book the same outcome. Now the side
+   effects only fire after successful persistence.
 
-Changes vs v19.22:
-  1. Liquidity filter: Skip thin/illiquid markets (spread > 8¢ or volume < 100).
-     Markets failing liquidity check are logged and skipped before bot evaluation.
-  2. Time-decay Kelly: Scale down position size as expiry approaches.
-     - 24+ hours out: 100% Kelly
-     - 12 hours out: ~75%
-     - 6 hours out: ~55%
-     - 1 hour out: 25%
-     - <15 min out: 0% (no bet)
-  3. Enhanced correlation tracker: Detects same-game/same-player props and
-     discounts Kelly by 1/sqrt(1 + prior_trades). Replaces the simple
-     _scan_player_trades dict with full ticker parsing and group tracking.
+Preserved from v19.x (all still working, no refactor):
+   - RiskManager, BrierTracker
+   - Pinnacle sharp-line check for sports
+   - LineupChecker for MLB/NBA
+   - WeatherEnsemble (NOAA + Open-Meteo)
+   - LimitOrderManager (smart limit orders)
+   - EarlyExitManager
+   - LiquidityFilter
+   - CorrelationTracker (same-game prop discount)
+   - CircuitBreaker (daily P&L halt)
+   - Resolution ingestion Phase 1/2/3
+   - Sector exposure tracking and caps
+   - Exploration mode Kelly scaling
+   - NBA/MLB feature logging for logreg training
 
-Changes vs v19.21:
-  1. _evaluate_market: Replaced in-memory dedupe guard with database check.
-     In-memory dict (_last_bot_probs) reset on every container restart,
-     causing 10+ duplicate signals per ticker. Now checks signals table
-     directly before inserting.
-  2. _signal_exists_in_db: New helper function for dedupe check.
-
-Changes vs v19.20:
-  1. _execute_correlations: Added sports-only sector gate. Politics/economics
-     ladder markets (KXTRUMPACT thresholds, KXUSPSPEND thresholds, KXHORMUZNORM
-     dates) have legitimate price spreads between rungs — not mispricings.
-     Correlation arb only makes sense for sports spread markets.
-
-Changes vs v19.19:
-  1. _TICKER_SECTOR_MAP: Added missing politics prefixes that were falling
-     back to economics: kxtrumpact, kxtrumptime, kxmamdanieo, kxleave,
-     kxhormuz, kxca14s, kxpressbriefing.
-  2. _SPORTS_PREFIXES: Added random leagues that were leaking to economics
-     via correlation engine: kxchnsl, kxballerleague, kxapfddh, kxr6,
-     kxhnl, kxelh.
-  3. _TICKER_SECTOR_MAP sports tuple: Synced with _SPORTS_PREFIXES additions.
-
-Changes vs v19.18:
-  1. _ingest_resolved_markets: Added NBA player prop outcome recording.
-     Calls record_nba_outcome() for KXNBAPTS/REB/AST/3PT/STL/BLK tickers
-     so resolved NBA props feed the logreg training pipeline (mirrors MLB).
-
-Changes vs v19.17:
-  1. _evaluate_market: Added `if not bot.is_relevant(market): continue` gate
-     before bot.evaluate(). Fixes news-spike path in BaseBot.evaluate()
-     bypassing sector classification — weather bot was evaluating politics,
-     economics, entertainment markets at 0.920 conf via news velocity signal.
-  2. _SPORTS_PREFIXES: synced with sector_bots.py v11.8 (~40 missing prefixes
-     added). Fixes misclassified sector P&L on resolution ingestion.
-  3. _TICKER_SECTOR_MAP: synced with all sector prefixes for correct sector
-     inference during resolution ingestion.
-
-Changes vs v19.16:
-  1. RiskManager: drawdown kill switch (-20%), per-player cap (5%),
-     per-trade cap (3%), per-sector cap (30%). Checked before every trade.
-  2. Same-game prop correlation: tracks trades per player+game within a scan,
-     downscales Kelly by 1/sqrt(n) for correlated bets.
-  3. BrierTracker: records per-prop outcomes on resolution, persists to Supabase.
-  4. All v19.16 changes carried forward intact.
+Deployment order:
+   1. Run migrations/001_clean_slate_v3.sql
+   2. Verify with integrity tests (all three must pass)
+   3. Replace shared/calibration_logger.py (v11)
+   4. Replace orchestrator.py (v20.0)
+   5. Restart the Railway deployment
+   6. Watch logs for "[GATE STATS]" summary at end of first scan
 """
 
 import logging
+import math
 import os
 import re
 import threading
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import schedule
@@ -160,27 +89,32 @@ from config.settings import (
     sector_kelly_fraction, sector_loss_cap,
 )
 from shared.arb_layer import ArbLayer
-from shared.calibration_logger import init_db, log_signal, log_trade, log_outcome
+from shared.calibration_logger import (
+    init_db,
+    log_main_signal,
+    log_correlation_leg,
+    link_correlation_leg_to_trade,
+    log_trade,
+    log_outcome,
+)
 from shared.circuit_breaker import CircuitBreaker
-from shared.consensus_engine import ConsensusEngine
+from shared.consensus_engine import ConsensusEngine, ConsensusResult, BotSignal
 from shared.correlation_engine import CorrelationEngine
-from shared.correlation_tracker import CorrelationTracker  # v19.23: Enhanced correlation
-from shared.early_exit_manager import EarlyExitManager  # v19.26: Exit when edge evaporates
+from shared.correlation_tracker import CorrelationTracker
+from shared.early_exit_manager import EarlyExitManager
 from shared.fade_scanner import FadeScanner
 from shared.kalshi_client import KalshiClient
-from shared.kelly_sizer import kelly_stake, no_kelly_stake  # v3: time-decay built-in
-from shared.limit_order_manager import LimitOrderManager  # v19.26: Smart limit orders
-from shared.lineup_checker import LineupChecker  # v19.25: Verify player in lineup
-from shared.liquidity_filter import LiquidityFilter  # v19.23: Liquidity filter
+from shared.kelly_sizer import kelly_stake, no_kelly_stake
+from shared.limit_order_manager import LimitOrderManager
+from shared.lineup_checker import LineupChecker
+from shared.liquidity_filter import LiquidityFilter
 from shared.news_signal import NewsSignal
-from shared.pinnacle_reference import PinnacleReference  # v19.24: Sharp line comparison
+from shared.pinnacle_reference import PinnacleReference
 from shared.resolution_timer import ResolutionTimer
 from shared.sharp_detector import SharpDetector
-from shared.weather_ensemble import WeatherEnsemble  # v19.25: NOAA + Open-Meteo
+from shared.weather_ensemble import WeatherEnsemble
 from bots.sector_bots import all_bots
 
-# v19.17: Going-live safety + tracking
-import math
 from shared.risk_manager import RiskManager
 from shared.brier_tracker import BrierTracker
 
@@ -190,19 +124,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
-# v19.18d: Reduce log volume to stay under Railway's 500 logs/sec limit.
-# sharp_detector emits an INFO [SHARP] line for every market with a spread,
-# generating 200+ lines/scan. MLB stats fetcher logs every opposing pitcher
-# lookup. Both are noise at INFO — promote to WARNING so only actionable
-# SHARP VETO lines (logged in orchestrator at INFO) survive.
+# Quiet the high-volume internal modules
 logging.getLogger("shared.sharp_detector").setLevel(logging.WARNING)
 logging.getLogger("shared.mlb_stats_fetcher").setLevel(logging.WARNING)
 logging.getLogger("shared.nba_stats_fetcher").setLevel(logging.WARNING)
 
-# ── Duplicate trade cooldown ───────────────────────────────────────────────────
-RECENT_TRADE_WINDOW_SEC = 300  # 5 minutes
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Ticker normalization ───────────────────────────────────────────────────────
+# v20: Cooldown extended from 5 min (in-memory) to 30 min (DB-backed).
+RECENT_TRADE_WINDOW_SEC = 1800
+
+FINANCIAL_MARKETS_DISABLED = True
+
+SCAN_PAGE_SLEEP_SEC = 0.25
+
 _UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
 
 
@@ -211,106 +148,10 @@ def _normalize_ticker(ticker: str) -> str:
     return _UUID_SUFFIX_RE.sub('', ticker)
 
 
-# ── Sports prefix guard (v19.20: added random leagues) ─────────────────────────
-_SPORTS_PREFIXES = (
-    # MVE family
-    "kxmve", "kxmvecross", "kxmvecrosscategory", "kxmvecrosscat",
-    "kxmvesports", "kxmvesportsmulti", "kxmvesportsmultigame",
-    "kxmvecbchampionship",
-    # US major sports
-    "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
-    "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
-    # Tennis
-    "kxatp", "kxwta", "kxtennis", "kxabagame",
-    # Golf
-    "kxpga", "kxowga",
-    # International soccer
-    "kxepl", "kxsoccer",
-    "kxarg", "kxlali", "kxbund", "kxseri", "kxliga", "kxligu",
-    "kxbras", "kxswis", "kxbelg", "kxecul", "kxpslg", "kxsaud",
-    "kxjlea", "kxuclt", "kxucl", "kxfifa", "kxalea", "kxafl",
-    "kxconmebol", "kxchll", "kxargpremdiv",
-    "kxsuperlig", "kxegypl", "kxscottishprem",
-    "kxuel", "kxeredivisie", "kxallsvenskan",
-    # Cricket
-    "kxcba", "kxcricket", "kxt20", "kxipl", "kxbbl",
-    # International basketball
-    "kxfiba", "kxacbg", "kxvtbg", "kxbalg", "kxbbse", "kxnpbg",
-    "kxeuroleague",
-    # Hockey
-    "kxahlg", "kxshl",
-    # Track & field
-    "kxdima",
-    # Combat sports
-    "kxboxing", "kxwwe",
-    # Racing
-    "kxf1", "kxmotogp",
-    # Olympic / other
-    "kxolympic", "kxrugby", "kxthail", "kxsl", "kxufl",
-    "kxintl", "kxkf", "kxnextag",
-    # Esports
-    "kxow", "kxvalorant", "kxlol", "kxleague",
-    "kxrl", "kxrocketleague",
-    "kxcsgo", "kxcs2", "kxdota", "kxintlf",
-    "kxapex", "kxfort", "kxhalo", "kxsc2",
-    "kxesport", "kxegypt", "kxvenf", "kxr6g",
-    # Entertainment / unmodelable (block from non-sports)
-    "kxsurv",
-    # Legacy aliases
-    "kxcbagame", "kxacbgame", "kxaleaguegame", "kxaleague",
-    # ITF tennis
-    "kxitf",
-    # Ekstraklasa / Uruguayan
-    "kxekstraklasa", "kxurypd",
-    # v11.8d: new leagues 2026-04-12
-    "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
-    # Entertainment (block from sports path, route to GlobalEventsBot)
-    "kxartiststream",
-    # v19.20: Random leagues that were leaking to economics via correlation
-    "kxchnsl",        # Chinese Super League
-    "kxballerleague", # Baller League
-    "kxapfddh",       # Unknown league
-    "kxr6",           # Rainbow Six esports (KXR6MAP, KXR6GAME)
-    "kxhnl",          # HNL league
-    "kxelh",          # ELH league
-    "kxtabletennis",  # Table tennis
-    "kxkbogame",      # Korean baseball
-    "kxlnbelite",     # French basketball
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# Sector inference from ticker
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _has_sports_prefix(market: dict) -> bool:
-    et      = market.get("event_ticker", "").lower()
-    tk      = market.get("ticker", "").lower()
-    tk_norm = _UUID_SUFFIX_RE.sub('', tk)
-    return any(
-        et.startswith(p) or tk.startswith(p) or tk_norm.startswith(p)
-        for p in _SPORTS_PREFIXES
-    )
-
-
-# ── Structural market blocklist ────────────────────────────────────────────────
-_STRUCTURAL_MARKET_BLOCKLIST = (
-    "kxmvecrosscategory",
-    "kxmvecrosscat",
-    "kxmvecross",
-    "kxmvesportsmultigameextended",
-    "kxmvesportsmultigame",
-    "kxmvesportsmulti",
-)
-
-
-def _is_blocked_structural_market(ticker: str) -> bool:
-    """Return True if ticker matches an uncalibrated structural market type."""
-    tk = _UUID_SUFFIX_RE.sub('', ticker.lower())
-    return any(tk.startswith(p) for p in _STRUCTURAL_MARKET_BLOCKLIST)
-
-
-# ── Scan page rate-limit guard ─────────────────────────────────────────────────
-SCAN_PAGE_SLEEP_SEC = 0.25
-
-
-# ── Sector inference from ticker (v19.20: added politics + random leagues) ────
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
     (("kxmve", "kxnba", "kxnfl", "kxmlb", "kxnhl", "kxmls",
       "kxufc", "kxncaa", "kxcbb", "kxcfb", "kxnascar", "kxgolf",
@@ -332,7 +173,6 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxrl", "kxrocketleague", "kxapex", "kxfort", "kxr6g",
       "kxitf", "kxkf", "kxnextag", "kxsurv",
       "kxdel", "kxkhl", "kxjbleague", "kxkbl", "kxkleague",
-      # v19.20: Random leagues that were falling back to economics
       "kxchnsl", "kxballerleague", "kxapfddh", "kxr6", "kxhnl", "kxelh",
       "kxtabletennis", "kxkbogame", "kxlnbelite",
       ), "sports"),
@@ -344,33 +184,22 @@ _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
       "kxpol", "kxvote", "kxapprove",
       "kxswalwell", "kxtrumppardons", "kxtrumpendorse",
       "kxdenmarkpm", "kxisraelpm",
-      # v19.20: Additional politics prefixes (were falling back to economics)
-      "kxtrumpact",      # Trump executive actions
-      "kxtrumptime",     # Trump timing markets
-      "kxmamdanieo",     # Mamdani EO
-      "kxleave",         # KXLEAVECHERFILUS, KXLEAVEGONZALES, KXLEAVEMILLS
-      "kxhormuz",        # Strait of Hormuz geopolitics (KXHORMUZNORM)
-      "kxca14s",         # CA-14 special election (KXCA14SWINNER)
-      "kxpressbriefing", # Press briefing counts
+      "kxtrumpact", "kxtrumptime", "kxmamdanieo",
+      "kxleave", "kxhormuz", "kxca14s", "kxpressbriefing",
       ), "politics"),
     (("kxhurr", "kxtemp", "kxrain", "kxsnow", "kxweather",
       "kxnoaa", "kxclimate", "kxlowt", "kxchll", "kxdens",
-      "kxhight",  # v19.22: Was missing — KXHIGHTDAL, KXHIGHTDC, etc.
+      "kxhight",
       ), "weather"),
     (("kxai", "kxtech", "kxfed", "kxcpi", "kxgdp",
       "kxjobs", "kxrate", "kxinfl", "kxpayroll",
       "kxhighinfl", "kxuspspend",
       ), "economics"),
-    # v19.29: Financial markets — same-date price ladders safe for correlation
     (("kxjetfuel", "kxwti", "kxoil", "kxgold", "kxsilver", "kxnat", "kxgasoline",
-      "kxhoil",    # Heating oil (KXHOILW, KXHOILD, etc.)
-      "kxtrufegg", # Eggs commodity
+      "kxhoil", "kxtrufegg",
       "kxusdjpy", "kxeurusd", "kxgbpusd", "kxusdcad", "kxusdchf", "kxaudusd",
       "kxspy", "kxqqq", "kxtsla", "kxaapl", "kxnvda", "kxamzn", "kxgoog", "kxmsft",
-      "kxtruft",   # Truth Social metrics
-      "kxmar",     # Marriott hotel rooms
-      "kxhilt",    # Hilton
-      "kxnatgas",  # Natural gas (KXNATGASD, KXNATGASW)
+      "kxtruft", "kxmar", "kxhilt", "kxnatgas",
       ), "financial_markets"),
 ]
 
@@ -383,55 +212,45 @@ def _infer_sector_from_ticker(ticker: str) -> str:
     return "economics"
 
 
-# ── v19.22: Database-side signal dedupe ────────────────────────────────────────
-def _signal_exists_in_db(ticker: str) -> bool:
-    """Check if a signal already exists for this ticker.
-    
-    v19.22: Database-side dedupe guard. Survives container restarts unlike
-    the in-memory _last_bot_probs dict which reset on every Railway deploy,
-    causing 10+ duplicate signals per ticker and poisoning the Bayesian model.
-    """
-    p = _ph()
-    rows = _query_signals(
-        f"SELECT 1 FROM signals WHERE ticker = {p} LIMIT 1",
-        (ticker,),
-    )
-    return len(rows) > 0
-
-def _recent_signal_exists_in_db(ticker: str, within_minutes: int = 180) -> bool:
-    """
-    Return True only if the most recent signal for this ticker is recent.
-    This allows legitimate later re-entries while still blocking duplicate spam.
-    """
-    p = _ph()
-    rows = _query_signals(
-        f"SELECT created_at FROM signals WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
-        (ticker,),
-    )
-    if not rows:
-        return False
-
-    raw = rows[0].get("created_at")
-    if raw is None:
-        return True
-
-    try:
-        if isinstance(raw, datetime):
-            dt = raw
-        else:
-            s = str(raw).replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s)
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        age_sec = (datetime.now(timezone.utc) - dt).total_seconds()
-        return age_sec <= within_minutes * 60
-    except Exception:
-        return True
+def _is_financial_markets_ticker(ticker: str) -> bool:
+    return _infer_sector_from_ticker(ticker) == "financial_markets"
 
 
-# ── Connection pool ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Structural market blocklist
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STRUCTURAL_MARKET_BLOCKLIST = (
+    "kxmvecrosscategory",
+    "kxmvecrosscat",
+    "kxmvecross",
+    "kxmvesportsmultigameextended",
+    "kxmvesportsmultigame",
+    "kxmvesportsmulti",
+)
+
+
+def _is_blocked_structural_market(ticker: str) -> bool:
+    tk = _UUID_SUFFIX_RE.sub('', ticker.lower())
+    return any(tk.startswith(p) for p in _STRUCTURAL_MARKET_BLOCKLIST)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NBA player prop detection (for outcome recording)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NBA_PROP_CODES = ("PTS", "REB", "AST", "3PT", "STL", "BLK")
+
+
+def _is_nba_player_prop(ticker: str) -> bool:
+    tk_upper = ticker.upper()
+    return any(tk_upper.startswith(f"KXNBA{code}") for code in _NBA_PROP_CODES)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection pool
+# ─────────────────────────────────────────────────────────────────────────────
+
 _pg_pool = None
 _pool_lock = threading.Lock()
 
@@ -458,13 +277,14 @@ def _ph() -> str:
     return "%s" if os.getenv("DATABASE_URL") else "?"
 
 
-def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
+def _query_db(sql: str, params: tuple = (), _retries: int = 2) -> list:
+    """Generic DB query helper. Returns list of dicts."""
     pool = _get_pool()
     try:
         if pool:
             conn = pool.getconn()
             try:
-                cur  = conn.cursor()
+                cur = conn.cursor()
                 cur.execute(sql, params)
                 cols = [d[0] for d in cur.description] if cur.description else []
                 rows = [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -478,7 +298,7 @@ def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
                 pool.putconn(conn)
                 if _retries > 0:
                     logger.warning(
-                        "_query_signals SSL/connection error, retrying (%d left): %s",
+                        "_query_db error, retrying (%d left): %s",
                         _retries, e,
                     )
                     global _pg_pool
@@ -487,7 +307,7 @@ def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
                     except Exception:
                         pass
                     _pg_pool = None
-                    return _query_signals(sql, params, _retries=_retries - 1)
+                    return _query_db(sql, params, _retries=_retries - 1)
                 raise
             finally:
                 try:
@@ -496,18 +316,67 @@ def _query_signals(sql: str, params: tuple = (), _retries: int = 2) -> list:
                     pass
         else:
             import sqlite3
-            db_path = os.getenv("DB_PATH", "flywheel.db")
-            conn    = sqlite3.connect(db_path)
+            conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
             conn.row_factory = sqlite3.Row
-            rows    = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
             conn.close()
             return rows
     except Exception as e:
-        logger.error("_query_signals error: %s", e)
+        logger.error("_query_db error: %s", e)
         return []
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# DB-backed cooldown (v20 — replaces in-memory _recently_traded dict)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _recently_traded_in_db(ticker: str, within_sec: int = RECENT_TRADE_WINDOW_SEC) -> bool:
+    """True if a trade exists for this ticker within the last `within_sec` seconds."""
+    p = _ph()
+    if os.getenv("DATABASE_URL"):
+        sql = (
+            f"SELECT 1 FROM trades "
+            f"WHERE ticker = {p} "
+            f"  AND created_at > NOW() - (INTERVAL '1 second' * {p}) "
+            f"LIMIT 1"
+        )
+        rows = _query_db(sql, (ticker, int(within_sec)))
+    else:
+        sql = (
+            f"SELECT 1 FROM trades "
+            f"WHERE ticker = {p} "
+            f"  AND created_at > datetime('now', {p}) "
+            f"LIMIT 1"
+        )
+        rows = _query_db(sql, (ticker, f"-{int(within_sec)} seconds"))
+    return len(rows) > 0
+
+
+def _recent_main_signal_exists(ticker: str, source: str, within_minutes: int = 30) -> bool:
+    """True if a main_signals row exists for (ticker, source) recently."""
+    p = _ph()
+    if os.getenv("DATABASE_URL"):
+        sql = (
+            f"SELECT 1 FROM main_signals "
+            f"WHERE ticker = {p} AND source = {p} "
+            f"  AND created_at > NOW() - (INTERVAL '1 minute' * {p}) "
+            f"LIMIT 1"
+        )
+        rows = _query_db(sql, (ticker, source, int(within_minutes)))
+    else:
+        sql = (
+            f"SELECT 1 FROM main_signals "
+            f"WHERE ticker = {p} AND source = {p} "
+            f"  AND created_at > datetime('now', {p}) "
+            f"LIMIT 1"
+        )
+        rows = _query_db(sql, (ticker, source, f"-{int(within_minutes)} minutes"))
+    return len(rows) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_yes_price_cents(market: dict) -> int:
     try:
@@ -530,59 +399,33 @@ def _parse_yes_price_cents(market: dict) -> int:
     return 0
 
 
-def _calculate_pnl(ticker: str, resolved_yes: bool) -> tuple[float | None, list[int]]:
-    p = _ph()
-    trade_rows = _query_signals(
-        f"SELECT id, direction, contracts, yes_price_cents "
-        f"FROM trades "
-        f"WHERE ticker = {p} "
-        f"ORDER BY created_at DESC "
-        f"LIMIT 50",
-        (ticker,),
-    )
+def _calculate_trade_pnl(
+    direction: str,
+    contracts: int,
+    yes_price_cents: int,
+    resolved_yes: bool,
+) -> float:
+    """P&L for a single trade given its direction, size, entry price, and outcome."""
+    yes_price_frac = yes_price_cents / 100.0
+    no_price_frac = 1.0 - yes_price_frac
+    direction_upper = direction.upper()
 
-    if not trade_rows:
-        return None, []
+    if direction_upper == "YES":
+        per_contract = (1.0 - yes_price_frac) if resolved_yes else (-yes_price_frac)
+    elif direction_upper == "NO":
+        per_contract = (1.0 - no_price_frac) if not resolved_yes else (-no_price_frac)
+    else:
+        raise ValueError(f"unknown direction: {direction!r}")
 
-    total_pnl: float = 0.0
-    trade_ids: list[int] = []
-
-    for trade in trade_rows:
-        raw_id    = trade.get("id")
-        direction = str(trade.get("direction", "YES")).upper()
-        contracts = int(trade.get("contracts", 0))
-        yes_price = int(trade.get("yes_price_cents", 50))
-
-        if contracts <= 0:
-            continue
-
-        try:
-            trade_ids.append(int(raw_id))
-        except (TypeError, ValueError):
-            logger.warning("Skipping non-integer trade id: %r", raw_id)
-            continue
-
-        yes_price_frac = yes_price / 100.0
-        no_price_frac  = 1.0 - yes_price_frac
-
-        if direction == "YES":
-            pnl = contracts * ((1.0 - yes_price_frac) if resolved_yes else (-yes_price_frac))
-        else:
-            pnl = contracts * (no_price_frac if not resolved_yes else (-no_price_frac))
-
-        total_pnl += pnl
-
-    if not trade_ids:
-        return None, []
-
-    return round(total_pnl, 2), trade_ids
+    return round(contracts * per_contract, 4)
 
 
-def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
+def _update_main_signal_brier(ticker: str, resolved_yes: bool) -> None:
+    """Update Brier score on unresolved main_signals rows for this ticker."""
     outcome = 1 if resolved_yes else 0
-    now     = datetime.now(timezone.utc)
-    p       = _ph()
-    pool    = _get_pool()
+    now = datetime.now(timezone.utc)
+    p = _ph()
+    pool = _get_pool()
 
     try:
         if pool:
@@ -591,7 +434,7 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
                 cur = conn.cursor()
                 cur.execute(
                     f"""
-                    UPDATE signals
+                    UPDATE main_signals
                     SET outcome     = {p},
                         outcome_at  = {p},
                         brier_score = POWER(our_prob - {p}, 2)
@@ -605,11 +448,10 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
                 pool.putconn(conn)
         else:
             import sqlite3
-            db_path = os.getenv("DB_PATH", "flywheel.db")
-            conn    = sqlite3.connect(db_path)
+            conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
             conn.execute(
                 f"""
-                UPDATE signals
+                UPDATE main_signals
                 SET outcome     = {p},
                     outcome_at  = {p},
                     brier_score = (our_prob - {p}) * (our_prob - {p})
@@ -620,22 +462,57 @@ def _update_signal_brier(ticker: str, resolved_yes: bool) -> None:
             )
             conn.commit()
             conn.close()
-        logger.debug("Signal brier updated: %s → outcome=%d", ticker, outcome)
     except Exception as e:
-        logger.warning("_update_signal_brier failed for %s: %s", ticker, e)
+        logger.warning("_update_main_signal_brier failed for %s: %s", ticker, e)
 
 
-# ── v19.19: NBA prop codes for outcome recording ───────────────────────────────
-_NBA_PROP_CODES = ("PTS", "REB", "AST", "3PT", "STL", "BLK")
+def _update_correlation_leg_outcome(ticker: str, resolved_yes: bool) -> None:
+    """Mark unresolved correlation_legs rows for this ticker with their outcome."""
+    outcome = 1 if resolved_yes else 0
+    now = datetime.now(timezone.utc)
+    p = _ph()
+    pool = _get_pool()
+
+    try:
+        if pool:
+            conn = pool.getconn()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"""
+                    UPDATE correlation_legs
+                    SET outcome    = {p},
+                        outcome_at = {p}
+                    WHERE ticker   = {p}
+                      AND outcome IS NULL
+                    """,
+                    (outcome, now, ticker),
+                )
+                conn.commit()
+            finally:
+                pool.putconn(conn)
+        else:
+            import sqlite3
+            conn = sqlite3.connect(os.getenv("DB_PATH", "flywheel.db"))
+            conn.execute(
+                f"""
+                UPDATE correlation_legs
+                SET outcome    = {p},
+                    outcome_at = {p}
+                WHERE ticker   = {p}
+                  AND outcome IS NULL
+                """,
+                (outcome, now, ticker),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.warning("_update_correlation_leg_outcome failed for %s: %s", ticker, e)
 
 
-def _is_nba_player_prop(ticker: str) -> bool:
-    """Return True if ticker is an NBA player prop market."""
-    tk_upper = ticker.upper()
-    return any(tk_upper.startswith(f"KXNBA{code}") for code in _NBA_PROP_CODES)
-
-
-# ── Orchestrator ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FlywheelOrchestrator:
 
@@ -659,7 +536,6 @@ class FlywheelOrchestrator:
             large_order_contracts=SHARP_LARGE_ORDER_CONTRACTS,
             volume_spike_multiplier=SHARP_VOLUME_SPIKE_MULTIPLIER,
         )
-
         self.fade_scanner = FadeScanner(
             kalshi_client=self.client,
             sharp_detector=self.sharp,
@@ -667,18 +543,15 @@ class FlywheelOrchestrator:
             fade_threshold_cents=FADE_THRESHOLD_CENTS,
             fade_min_disagreement=FADE_MIN_DISAGREEMENT,
         )
-
         self.corr_engine = CorrelationEngine(
             min_divergence_cents=CORR_MIN_DIVERGENCE_CENTS,
             max_group_size=CORR_MAX_GROUP_SIZE,
         )
-
         self.res_timer = ResolutionTimer(
             min_overdue_minutes=RESTIME_MIN_OVERDUE_MIN,
             min_prob_to_trade=RESTIME_MIN_PROB,
             min_sample_count=RESTIME_MIN_SAMPLES,
         )
-
         self.news = NewsSignal(
             api_key=NEWSAPI_KEY,
             poll_interval_sec=NEWS_POLL_INTERVAL_SEC,
@@ -688,9 +561,9 @@ class FlywheelOrchestrator:
 
         self._exposure: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
         self._sector_daily_pnl: dict[str, float] = {b.sector_name: 0.0 for b in self.bots}
-
         self._sector_pnl_lock = threading.Lock()
         self._ingestion_lock = threading.Lock()
+
         self._last_bot_probs: dict[str, float] = {}
         self._last_bot_sectors: dict[str, str] = {}
 
@@ -699,9 +572,9 @@ class FlywheelOrchestrator:
 
         self._scan_bankroll: float = self.bankroll
         self._scan_summary: dict = {}
-
-        self._recently_traded: dict[str, float] = {}
         self._open_provisionals: dict[int, float] = {}
+
+        self._gate_stats: dict[str, int] = defaultdict(int)
 
         self.risk_manager = RiskManager(
             bankroll=BANKROLL,
@@ -716,7 +589,6 @@ class FlywheelOrchestrator:
             self.risk_manager.start_shadow()
 
         self.brier_tracker = BrierTracker.from_supabase(os.getenv("DATABASE_URL", ""))
-        self._scan_player_trades: dict[str, int] = {}
 
         self.liquidity_filter = LiquidityFilter(enabled=True)
         self.correlation_tracker = CorrelationTracker()
@@ -725,7 +597,6 @@ class FlywheelOrchestrator:
             api_key=os.getenv("ODDS_API_KEY", ""),
             enabled=True,
         )
-
         self.lineup_checker = LineupChecker(enabled=True)
         self.weather_ensemble = WeatherEnsemble(enabled=True)
 
@@ -738,6 +609,8 @@ class FlywheelOrchestrator:
             enabled=not DEMO_MODE,
         )
 
+    # ── Utility ────────────────────────────────────────────────────────────────
+
     def _get_sector_resolved_count(self, sector: str) -> int:
         now = time.monotonic()
         if now - self._resolved_count_cache_ts > 60.0:
@@ -746,8 +619,9 @@ class FlywheelOrchestrator:
 
         if sector not in self._resolved_count_cache:
             p = _ph()
-            rows = _query_signals(
-                f"SELECT COUNT(*) as n FROM signals WHERE sector = {p} AND outcome IS NOT NULL",
+            rows = _query_db(
+                f"SELECT COUNT(*) as n FROM main_signals "
+                f"WHERE sector = {p} AND outcome IS NOT NULL",
                 (sector,),
             )
             self._resolved_count_cache[sector] = int(rows[0]["n"]) if rows else 0
@@ -757,18 +631,11 @@ class FlywheelOrchestrator:
     def _extract_risk_entity_key(self, ticker: str, sector: str) -> str:
         parts = ticker.split("-")
         tk = ticker.upper()
-
         if sector == "sports" and len(parts) >= 3:
-            if (
-                tk.startswith("KXMLB")
-                or tk.startswith("KXNBA")
-                or tk.startswith("KXATP")
-                or tk.startswith("KXWTA")
-                or tk.startswith("KXTENNIS")
-                or tk.startswith("KXITF")
-            ):
+            if (tk.startswith("KXMLB") or tk.startswith("KXNBA")
+                or tk.startswith("KXATP") or tk.startswith("KXWTA")
+                or tk.startswith("KXTENNIS") or tk.startswith("KXITF")):
                 return parts[2]
-
         return ticker
 
     def _passes_market_quality_gate(self, market: dict | None, sector: str) -> tuple[bool, str]:
@@ -780,7 +647,7 @@ class FlywheelOrchestrator:
         if _is_blocked_structural_market(ticker):
             return False, "structural blocklist"
 
-        if sector == "financial_markets":
+        if sector == "financial_markets" and FINANCIAL_MARKETS_DISABLED:
             return False, "financial_markets disabled"
 
         liq_result = self.liquidity_filter.check(market, sector=sector)
@@ -793,38 +660,25 @@ class FlywheelOrchestrator:
 
         return True, ""
 
-    def _rebuild_demo_exposure(self) -> None:
-        """Rebuild exposure from unresolved trades within the last 3 days.
-        
-        v13.1: Added staleness filter. Orphan trades older than 3 days
-        (usually because the market expired without resolution ingestion
-        catching it) were inflating exposure and blocking new trades.
-        Example: sports exposure hit $6,670 on $1000 bankroll because
-        900+ unresolved trades from pre-v13 were all being summed.
-        
-        Trades older than 3 days are effectively dead — Kalshi markets
-        resolve within 24-48 hours normally. If we haven't matched an
-        outcome after 3 days, the trade won't resolve and shouldn't
-        count against active exposure.
-        """
+    def _rebuild_exposure(self) -> None:
+        """Rebuild per-sector exposure from unresolved trades in the last 3 days."""
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
- 
-        rows = _query_signals(
+        rows = _query_db(
             """
             SELECT t.sector, t.dollars_risked
             FROM trades t
-            LEFT JOIN outcomes o
-              ON o.trade_id = t.id
+            LEFT JOIN outcomes o ON o.trade_id = t.id
             WHERE o.trade_id IS NULL
               AND t.created_at > NOW() - INTERVAL '3 days'
             """
         )
- 
         for row in rows:
             sector = row.get("sector")
             dollars = float(row.get("dollars_risked") or 0.0)
             if sector in self._exposure:
                 self._exposure[sector] += dollars
+
+    # ── Resolution ingestion ───────────────────────────────────────────────────
 
     def _process_resolved_market(
         self,
@@ -832,69 +686,64 @@ class FlywheelOrchestrator:
         already_recorded: set[str],
         processed_this_run: set[str],
         bayesian_updated_events: set[str],
-    ) -> bool:
+    ) -> int:
+        """Process one resolved market. Returns number of outcomes written."""
         p = _ph()
 
         ticker = _normalize_ticker(market.get("ticker", ""))
-        result = market.get("result", "")
-        result = result.lower() if result else ""
+        result_raw = market.get("result", "") or ""
+        result = result_raw.lower()
 
         if not ticker or result not in ("yes", "no"):
-            return False
+            return 0
         if ticker in already_recorded or ticker in processed_this_run:
-            return False
+            return 0
 
-        resolved_yes = result == "yes"
-
-        sig_rows = _query_signals(
-            f"SELECT our_prob, direction FROM signals WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
-            (ticker,),
-        )
+        resolved_yes = (result == "yes")
 
         event_key = _normalize_ticker(
             market.get("event_ticker", "") or ticker.rsplit("-", 1)[0]
         )
         allow_bayesian_update = event_key not in bayesian_updated_events
 
-        for bot in self.bots:
-            if not bot.is_relevant(market):
-                continue
-            if not allow_bayesian_update:
-                logger.debug(
-                    "[%s] Skipping duplicate Bayesian update for event %s (ticker=%s)",
-                    bot.sector_name, event_key, ticker,
-                )
-                continue
-            try:
-                features, _ = bot.fetch_features(market, skip_noaa=True)
-                import numpy as np
-                features = np.append(features, [0.0, 0.0])
-                bot.record_outcome(features, resolved_yes)
-                logger.info(
-                    "[%s] Bayesian update: %s → %s",
-                    bot.sector_name, ticker, result.upper(),
-                )
-            except Exception as e:
-                logger.warning(
-                    "[%s] record_outcome failed for %s: %s",
-                    bot.sector_name, ticker, e,
-                )
-
         if allow_bayesian_update:
+            for bot in self.bots:
+                if not bot.is_relevant(market):
+                    continue
+                try:
+                    features, _ = bot.fetch_features(market, skip_noaa=True)
+                    import numpy as np
+                    features = np.append(features, [0.0, 0.0])
+                    bot.record_outcome(features, resolved_yes)
+                    logger.info(
+                        "[%s] Bayesian update: %s → %s",
+                        bot.sector_name, ticker, result.upper(),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] record_outcome failed for %s: %s",
+                        bot.sector_name, ticker, e,
+                    )
             bayesian_updated_events.add(event_key)
 
-        _update_signal_brier(ticker, resolved_yes)
+        _update_main_signal_brier(ticker, resolved_yes)
+        _update_correlation_leg_outcome(ticker, resolved_yes)
 
-        if sig_rows:
-            _prop_code = None
-            for _code in ("HIT", "TB", "HRR", "HR", "KS"):
-                if f"KXMLB{_code}" in ticker.upper():
-                    _prop_code = _code
+        main_sig_rows = _query_db(
+            f"SELECT our_prob, direction, sector FROM main_signals "
+            f"WHERE ticker = {p} ORDER BY created_at DESC LIMIT 1",
+            (ticker,),
+        )
+        if main_sig_rows:
+            prop_code = None
+            for code in ("HIT", "TB", "HRR", "HR", "KS"):
+                if f"KXMLB{code}" in ticker.upper():
+                    prop_code = code
                     break
-            if _prop_code:
+            if prop_code:
                 self.brier_tracker.record(
-                    _prop_code,
-                    float(sig_rows[0]["our_prob"]),
+                    prop_code,
+                    float(main_sig_rows[0]["our_prob"]),
                     1 if resolved_yes else 0,
                 )
 
@@ -902,82 +751,92 @@ class FlywheelOrchestrator:
             try:
                 from shared.nba_logistic_model import record_outcome as record_nba_outcome
                 record_nba_outcome(ticker, 1 if resolved_yes else 0)
-                logger.debug("[NBA LOGREG] Recorded outcome: %s → %s", ticker, result.upper())
             except Exception as e:
                 logger.warning("[NBA LOGREG] record_outcome failed for %s: %s", ticker, e)
 
-        if not sig_rows:
-            processed_this_run.add(ticker)
-            return False
-
-        our_prob = float(sig_rows[0]["our_prob"])
-        direction = str(sig_rows[0]["direction"])
-
-        direction_correct = (
-            (direction == "YES" and resolved_yes) or
-            (direction == "NO" and not resolved_yes)
-        )
-
-        pnl_usd, trade_ids = _calculate_pnl(ticker, resolved_yes)
-        primary_trade_id = trade_ids[0] if trade_ids else None
-
-        if primary_trade_id is None:
-            logger.debug(
-                "[OUTCOME SKIP] %s — signal exists but no trade, skipping outcome log",
-                ticker,
-            )
-            processed_this_run.add(ticker)
-            return False
-
-        sec_rows = _query_signals(
-            f"SELECT sector FROM signals WHERE ticker = {p} LIMIT 1",
+        # One outcome row per trade
+        trade_rows = _query_db(
+            f"""
+            SELECT t.id, t.direction, t.contracts, t.yes_price_cents,
+                   t.sector, t.source, t.avg_prob
+            FROM trades t
+            LEFT JOIN outcomes o ON o.trade_id = t.id
+            WHERE t.ticker = {p}
+              AND o.trade_id IS NULL
+            ORDER BY t.created_at ASC
+            """,
             (ticker,),
         )
-        sec = sec_rows[0].get("sector", "") if sec_rows else ""
-        if not sec:
-            sec = _infer_sector_from_ticker(ticker)
 
-        if pnl_usd is not None:
+        if not trade_rows:
+            processed_this_run.add(ticker)
+            return 0
+
+        outcomes_written = 0
+
+        for trade in trade_rows:
+            trade_id = int(trade["id"])
+            direction = str(trade.get("direction", "YES")).upper()
+            contracts = int(trade.get("contracts", 0))
+            yes_price = int(trade.get("yes_price_cents", 50))
+            sector = trade.get("sector", "") or _infer_sector_from_ticker(ticker)
+            source = trade.get("source", "main") or "main"
+            trade_our_prob = float(trade.get("avg_prob") or 0.5)
+
+            if contracts <= 0:
+                continue
+
+            try:
+                pnl_usd = _calculate_trade_pnl(
+                    direction=direction,
+                    contracts=contracts,
+                    yes_price_cents=yes_price,
+                    resolved_yes=resolved_yes,
+                )
+            except ValueError as e:
+                logger.warning("P&L calc failed for trade_id=%d: %s", trade_id, e)
+                continue
+
+            direction_correct = (
+                (direction == "YES" and resolved_yes)
+                or (direction == "NO" and not resolved_yes)
+            )
+
+            # Commit outcome FIRST, then apply side effects
+            try:
+                log_outcome(
+                    ticker=ticker,
+                    resolved=result.upper(),
+                    pnl_usd=pnl_usd,
+                    trade_id=trade_id,
+                    our_prob=trade_our_prob,
+                    correct=direction_correct,
+                    sector=sector,
+                )
+            except Exception as e:
+                logger.error(
+                    "log_outcome failed for trade_id=%d ticker=%s: %s",
+                    trade_id, ticker, e,
+                )
+                continue
+
             logger.info(
-                "[P&L] %s resolved %s → $%+.2f (primary_trade_id=%s, all_ids=%s)",
-                ticker, result.upper(), pnl_usd, primary_trade_id, trade_ids,
+                "[P&L] trade_id=%d %s resolved %s → $%+.2f (source=%s)",
+                trade_id, ticker, result.upper(), pnl_usd, source,
             )
             self.circuit_breaker.record_pnl(pnl_usd)
 
             with self._sector_pnl_lock:
-                if sec in self._sector_daily_pnl:
-                    provisional_total = 0.0
-                    for tid in trade_ids:
-                        provisional_total += self._open_provisionals.pop(int(tid), 0.0)
+                if sector in self._sector_daily_pnl:
+                    provisional = self._open_provisionals.pop(trade_id, 0.0)
+                    self._sector_daily_pnl[sector] = (
+                        self._sector_daily_pnl[sector] - provisional + pnl_usd
+                    )
 
-                    self._sector_daily_pnl[sec] = (
-                        self._sector_daily_pnl[sec] - provisional_total + pnl_usd
-                    )
-                    logger.debug(
-                        "[PROVISIONAL UNWIND] %s sector=%s provisional_total=$%.2f actual=$%.2f new_sector_pnl=$%.2f",
-                        ticker, sec, provisional_total, pnl_usd,
-                        self._sector_daily_pnl[sec],
-                    )
+            outcomes_written += 1
 
         processed_this_run.add(ticker)
-
-        try:
-            log_outcome(
-                ticker=ticker,
-                resolved=result.upper(),
-                pnl_usd=pnl_usd,
-                trade_id=primary_trade_id,
-                our_prob=our_prob,
-                correct=direction_correct,
-                sector=sec,
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                "log_outcome failed for %s (trade_id=%s): %s — outcome counted but not persisted; will retry next ingestion cycle",
-                ticker, primary_trade_id, e,
-            )
-            return False
+        return outcomes_written
 
     def _ingest_resolved_markets(self) -> int:
         logger.info("=== Resolution ingestion starting ===")
@@ -985,7 +844,7 @@ class FlywheelOrchestrator:
         try:
             min_ts = self.client.get_latest_outcome_ts()
             if min_ts:
-                logger.info("Incremental ingestion — fetching markets after %s", min_ts)
+                logger.info("Incremental — fetching markets after %s", min_ts)
             resolved_markets = self.client.get_resolved_markets(
                 min_settled_ts=min_ts,
                 max_pages=10 if min_ts else 350,
@@ -994,16 +853,13 @@ class FlywheelOrchestrator:
             logger.error("Failed to fetch resolved markets: %s", e)
             return 0
 
-        if not resolved_markets:
-            logger.info("No resolved markets returned from Kalshi (Phase 1/2).")
-
         logger.info("%d settled markets returned from Kalshi", len(resolved_markets))
 
         p = _ph()
         if min_ts:
             already_recorded = {
                 _normalize_ticker(r["ticker"])
-                for r in _query_signals(
+                for r in _query_db(
                     f"SELECT DISTINCT ticker FROM outcomes WHERE logged_at > {p}",
                     (min_ts,),
                 )
@@ -1011,7 +867,7 @@ class FlywheelOrchestrator:
         else:
             already_recorded = {
                 _normalize_ticker(r["ticker"])
-                for r in _query_signals("SELECT DISTINCT ticker FROM outcomes")
+                for r in _query_db("SELECT DISTINCT ticker FROM outcomes")
             }
 
         processed_this_run: set[str] = set()
@@ -1020,39 +876,36 @@ class FlywheelOrchestrator:
 
         for market in resolved_markets:
             if self.circuit_breaker.is_halted():
-                logger.warning(
-                    "Circuit breaker active — stopping ingestion early to prevent further phantom P&L accumulation"
-                )
+                logger.warning("Circuit breaker active — stopping ingestion early")
                 break
-
-            if self._process_resolved_market(
+            recorded += self._process_resolved_market(
                 market, already_recorded, processed_this_run, bayesian_updated_events
-            ):
-                recorded += 1
+            )
 
-        logger.info("Phase 1/2 complete — %d outcomes recorded from batch query", recorded)
+        logger.info("Phase 1/2 complete — %d outcome rows written", recorded)
 
-        logger.info("=== Phase 3: Checking unresolved tickers for finalized status ===")
+        # Phase 3
+        logger.info("=== Phase 3: checking unresolved tickers for finalized status ===")
 
-        unresolved_rows = _query_signals(
+        unresolved_rows = _query_db(
             """
-            SELECT ticker, sector
-            FROM signals
-            WHERE outcome IS NULL
+            SELECT DISTINCT t.ticker
+            FROM trades t
+            LEFT JOIN outcomes o ON o.trade_id = t.id
+            WHERE o.trade_id IS NULL
+              AND t.created_at > NOW() - INTERVAL '7 days'
               AND (
-                sector IN ('weather', 'crypto', 'financial_markets')
+                t.sector IN ('weather', 'crypto', 'financial_markets')
                 OR (
-                  sector = 'sports'
+                  t.sector = 'sports'
                   AND (
-                    LOWER(ticker) LIKE 'kxatp%%'
-                    OR LOWER(ticker) LIKE 'kxwta%%'
-                    OR LOWER(ticker) LIKE 'kxtennis%%'
-                    OR LOWER(ticker) LIKE 'kxitf%%'
+                    LOWER(t.ticker) LIKE 'kxatp%%'
+                    OR LOWER(t.ticker) LIKE 'kxwta%%'
+                    OR LOWER(t.ticker) LIKE 'kxtennis%%'
+                    OR LOWER(t.ticker) LIKE 'kxitf%%'
                   )
                 )
               )
-            GROUP BY ticker, sector
-            ORDER BY MAX(created_at) ASC
             LIMIT 1500
             """
         )
@@ -1064,48 +917,27 @@ class FlywheelOrchestrator:
         ]
 
         if not unresolved_tickers:
-            logger.info("Phase 3: No unresolved tickers to check")
+            logger.info("Phase 3: no unresolved tickers to check")
         else:
-            logger.info(
-                "Phase 3: Checking %d unresolved tickers individually...",
-                len(unresolved_tickers),
-            )
-
-            sector_counts: dict[str, int] = {}
-            for tk in unresolved_tickers[:100]:
-                sec = _infer_sector_from_ticker(tk)
-                sector_counts[sec] = sector_counts.get(sec, 0) + 1
-            logger.info("Phase 3 sector breakdown: %s", sector_counts)
-
+            logger.info("Phase 3: checking %d unresolved tickers", len(unresolved_tickers))
             try:
                 finalized_markets = self.client.get_finalized_markets(
                     tickers=unresolved_tickers,
                     rate_limit_sleep=0.15,
                 )
-
-                logger.info(
-                    "Phase 3: Found %d finalized markets out of %d checked",
-                    len(finalized_markets), len(unresolved_tickers),
-                )
+                logger.info("Phase 3: found %d finalized", len(finalized_markets))
 
                 phase3_recorded = 0
                 for market in finalized_markets:
                     if self.circuit_breaker.is_halted():
-                        logger.warning("Circuit breaker active — stopping Phase 3")
                         break
-
-                    if self._process_resolved_market(
+                    phase3_recorded += self._process_resolved_market(
                         market, already_recorded, processed_this_run, bayesian_updated_events
-                    ):
-                        phase3_recorded += 1
-                        recorded += 1
-
-                logger.info(
-                    "Phase 3 complete — %d additional outcomes recorded",
-                    phase3_recorded,
-                )
+                    )
+                recorded += phase3_recorded
+                logger.info("Phase 3: %d additional outcomes", phase3_recorded)
             except Exception as e:
-                logger.error("Phase 3 finalized market lookup failed: %s", e)
+                logger.error("Phase 3 failed: %s", e)
 
         if recorded > 0:
             try:
@@ -1113,12 +945,12 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.warning("Brier tracker save failed: %s", e)
 
-        logger.info("=== Resolution ingestion complete — %d total new outcomes ===", recorded)
+        logger.info("=== Resolution ingestion complete — %d total outcomes ===", recorded)
         return recorded
 
     def _run_ingestion_thread(self) -> None:
         if not self._ingestion_lock.acquire(blocking=False):
-            logger.warning("Ingestion already running — skipping this cycle")
+            logger.warning("Ingestion already running — skipping")
             return
 
         def _run():
@@ -1129,53 +961,50 @@ class FlywheelOrchestrator:
 
         t = threading.Thread(target=_run, daemon=True, name="resolution-ingestion")
         t.start()
-        logger.info("Resolution ingestion thread started")
+
+    # ── Main path ──────────────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
+        """Evaluate a single market through the main consensus path.
+
+        v20: Extensive gate-failure instrumentation. Every rejection increments
+        a counter so we can see at end of scan where markets die.
+        """
+        self._gate_stats['markets_scanned'] += 1
+
         ticker = _normalize_ticker(
             market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
         )
         title = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
-        if not hasattr(self, "_debug_logged"):
-            logger.info("DEBUG market keys: %s", list(market.keys()))
-            logger.info(
-                "DEBUG price fields: bid=%s ask=%s last=%s yes_ask=%s",
-                market.get("yes_bid"),
-                market.get("yes_ask"),
-                market.get("last_price"),
-                market.get("yes_ask_price"),
-            )
-            logger.info(
-                "DEBUG yes_bid_dollars=%s yes_ask_dollars=%s last_price_dollars=%s",
-                market.get("yes_bid_dollars"),
-                market.get("yes_ask_dollars"),
-                market.get("last_price_dollars"),
-            )
-            self._debug_logged = True
-
         if yes_price == 0:
+            self._gate_stats['rejected_no_price'] += 1
             return
         if yes_price <= 2 or yes_price >= 98:
+            self._gate_stats['rejected_extreme_price'] += 1
+            return
+
+        if FINANCIAL_MARKETS_DISABLED and _is_financial_markets_ticker(ticker):
+            self._gate_stats['rejected_fm_disabled'] += 1
             return
 
         liq_result = self.liquidity_filter.check(market, sector="unknown")
         if not liq_result.passes:
-            logger.debug(
-                "LIQUIDITY SKIP %s: %s (spread=%.1f¢ vol=%s)",
-                ticker[:40], liq_result.reason,
-                liq_result.spread_cents or 0, liq_result.volume_24h,
-            )
+            self._gate_stats['rejected_liquidity'] += 1
             return
+
+        self._gate_stats['reached_bot_evaluation'] += 1
 
         self.news.register_market(title)
         sharp_signal = self.sharp.analyze(market)
 
         signals = []
+        any_bot_relevant = False
         for bot in self.bots:
             if not bot.is_relevant(market):
                 continue
+            any_bot_relevant = True
             try:
                 sig = bot.evaluate(market, news_signal=self.news)
                 if sig is not None:
@@ -1183,47 +1012,62 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.error("[%s] error on %s: %s", bot.sector_name, ticker, e)
 
-        if not signals:
+        if not any_bot_relevant:
+            self._gate_stats['rejected_no_relevant_bot'] += 1
             return
+        if not signals:
+            self._gate_stats['rejected_bots_returned_none'] += 1
+            return
+
+        self._gate_stats['reached_consensus'] += 1
 
         consensus = self.engine.evaluate(ticker, yes_price, signals)
 
         if not consensus.execute:
-            logger.debug("Consensus reject %s: %s", ticker, consensus.reject_reason)
+            reason = consensus.reject_reason or "unknown"
+            reason_lower = reason.lower()
+            if "edge" in reason_lower and "floor" in reason_lower:
+                self._gate_stats['rejected_consensus_edge_floor'] += 1
+            elif "edge" in reason_lower and "ceiling" in reason_lower:
+                self._gate_stats['rejected_consensus_edge_ceiling'] += 1
+            elif "confidence" in reason_lower:
+                self._gate_stats['rejected_consensus_confidence'] += 1
+            elif "direction" in reason_lower and "disagree" in reason_lower:
+                self._gate_stats['rejected_consensus_direction_disagree'] += 1
+            elif "direction" in reason_lower and "filter" in reason_lower:
+                self._gate_stats['rejected_consensus_direction_filter'] += 1
+            else:
+                self._gate_stats['rejected_consensus_other'] += 1
             return
 
+        self._gate_stats['passed_consensus'] += 1
+
+        # Sharp veto
         if sharp_signal.sharp_detected and not sharp_signal.aligned_with(consensus.direction):
-            logger.info(
-                "SHARP VETO %s | sharp_dir=%s our_dir=%s sharp_conf=%.2f",
-                ticker, sharp_signal.sharp_direction, consensus.direction,
-                sharp_signal.confidence,
-            )
+            self._gate_stats['rejected_sharp_veto'] += 1
             return
 
         lead_sector = signals[0].sector
 
-        _already_seen = ticker in self._last_bot_probs
-
+        # Record bot probability for fade/restime scanners
         self._last_bot_probs[ticker] = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
+        # Arb gate
         arb = self.arb.check_and_log(
             ticker=ticker,
             kalshi_cents=yes_price,
             our_direction=consensus.direction,
             market_title=title,
         )
-
         if not arb.passes:
-            logger.info(
-                "ARB GATE VETO %s | dir_aligned=%s spread=%.2f%% notes=%s",
-                ticker, arb.direction_aligned, arb.cross_spread * 100, arb.notes,
-            )
+            self._gate_stats['rejected_arb_gate'] += 1
             return
 
-        if not _already_seen and not _recent_signal_exists_in_db(ticker, within_minutes=180):
+        # Log the main signal (DB enforces correlation-artifact CHECK)
+        if not _recent_main_signal_exists(ticker, source="main", within_minutes=30):
             try:
-                log_signal(
+                log_main_signal(
                     ticker=ticker,
                     sector=lead_sector,
                     our_prob=consensus.avg_prob,
@@ -1231,9 +1075,15 @@ class FlywheelOrchestrator:
                     edge=consensus.avg_edge,
                     confidence=consensus.avg_confidence,
                     direction=consensus.direction,
+                    source="main",
                 )
+                self._gate_stats['main_signals_logged'] += 1
+            except ValueError as e:
+                logger.warning("log_main_signal refused %s: %s", ticker, e)
+                self._gate_stats['rejected_signal_shape'] += 1
+                return
             except Exception as e:
-                logger.error("log_signal failed for %s: %s", ticker, e)
+                logger.error("log_main_signal failed for %s: %s", ticker, e)
 
         self._execute_trade(
             ticker=ticker,
@@ -1242,6 +1092,7 @@ class FlywheelOrchestrator:
             consensus=consensus,
             lead_sector=lead_sector,
             arb=arb,
+            source="main",
             market=market,
         )
 
@@ -1253,45 +1104,45 @@ class FlywheelOrchestrator:
         consensus,
         lead_sector: str,
         arb,
+        source: str = "main",
         fade: bool = False,
         market: dict = None,
-    ) -> None:
-        now = time.monotonic()
-        last_ts = self._recently_traded.get(ticker, 0.0)
-        elapsed = now - last_ts
-        if elapsed < RECENT_TRADE_WINDOW_SEC:
-            logger.info(
-                "DUPLICATE GUARD skip %s — last trade %.0fs ago (cooldown=%ds)",
-                ticker, elapsed, RECENT_TRADE_WINDOW_SEC,
-            )
-            return
+    ):
+        """Execute a trade. v20: DB-backed cooldown at top of function.
+
+        Returns trade_id on success, None otherwise.
+        """
+
+        # v20: DB-backed cooldown first
+        if _recently_traded_in_db(ticker, within_sec=RECENT_TRADE_WINDOW_SEC):
+            self._gate_stats['rejected_cooldown'] += 1
+            return None
+
+        if FINANCIAL_MARKETS_DISABLED and lead_sector == "financial_markets":
+            self._gate_stats['rejected_fm_disabled'] += 1
+            return None
 
         if self.circuit_breaker.is_halted():
-            logger.warning("CIRCUIT BREAKER HALT — skipping trade for %s", ticker)
-            return
+            self._gate_stats['rejected_circuit_breaker'] += 1
+            return None
 
         if not self.risk_manager.can_trade():
-            logger.warning("RISK HALT: %s — skipping %s", self.risk_manager.halt_reason, ticker)
-            return
+            self._gate_stats['rejected_risk_halt'] += 1
+            return None
 
         cap = sector_loss_cap(lead_sector)
         if cap == 0.0:
-            logger.warning("SECTOR DISABLED: %s cap=0 — skipping %s", lead_sector, ticker)
-            return
+            self._gate_stats['rejected_sector_disabled'] += 1
+            return None
 
         with self._sector_pnl_lock:
             sector_loss_today = self._sector_daily_pnl.get(lead_sector, 0.0)
-
         if sector_loss_today <= -cap:
-            logger.warning(
-                "SECTOR LOSS CAP hit: %s daily_loss=$%.2f cap=$%.2f — skipping %s",
-                lead_sector, sector_loss_today, cap, ticker,
-            )
-            return
+            self._gate_stats['rejected_sector_loss_cap'] += 1
+            return None
 
         live_bankroll = self._scan_bankroll
-        summary = self._scan_summary
-        daily_pnl = float(summary.get("realized_pnl", 0.0))
+        daily_pnl = float(self._scan_summary.get("realized_pnl", 0.0))
         loss_limit = live_bankroll * CIRCUIT_BREAKER_PCT
         drawdown_factor = (
             max(0.5, 1.0 + (daily_pnl / loss_limit) * 0.5)
@@ -1302,12 +1153,6 @@ class FlywheelOrchestrator:
         kf = sector_kelly_fraction(lead_sector, resolved_count)
         in_exploration = resolved_count < SECTOR_MIN_RESOLVED.get(lead_sector, 30)
 
-        if in_exploration:
-            logger.info(
-                "[EXPLORATION] %s resolved=%d — will scale stake to %.0f%% of Kelly",
-                lead_sector, resolved_count, (kf / KELLY_FRACTION) * 100,
-            )
-
         pinnacle_adj = 1.0
         if lead_sector == "sports" and not fade:
             sharp_check = self.pinnacle.check_from_kalshi_ticker(
@@ -1315,47 +1160,20 @@ class FlywheelOrchestrator:
                 our_prob=consensus.avg_prob,
                 our_direction=consensus.direction,
             )
-
             if not sharp_check.passes:
-                logger.info(
-                    "PINNACLE VETO %s: %s (our=%.1f%% sharp=%.1f%% div=%+.1f%%)",
-                    ticker[:40], sharp_check.reason,
-                    consensus.avg_prob * 100,
-                    (sharp_check.sharp_prob or 0) * 100,
-                    (sharp_check.divergence or 0) * 100,
-                )
-                return
-
+                self._gate_stats['rejected_pinnacle'] += 1
+                return None
             pinnacle_adj = sharp_check.confidence_adjustment
-            if pinnacle_adj != 1.0:
-                logger.info(
-                    "[PINNACLE] %s: %s → conf adj %.2f",
-                    ticker[:35], sharp_check.reason, pinnacle_adj,
-                )
 
         if lead_sector == "sports" and not fade:
             lineup_check = self.lineup_checker.check_from_kalshi_ticker(ticker)
-
             if not lineup_check.is_active:
-                logger.info(
-                    "LINEUP VETO %s: %s (status=%s)",
-                    ticker[:40], lineup_check.reason, lineup_check.status,
-                )
-                return
-
+                self._gate_stats['rejected_lineup'] += 1
+                return None
             if lineup_check.status == "questionable":
                 pinnacle_adj *= 0.7
-                logger.info(
-                    "[LINEUP] %s: %s → additional conf penalty",
-                    ticker[:35], lineup_check.reason,
-                )
 
         sector_exp = self._exposure.get(lead_sector, 0.0)
-        logger.info(
-            "[EXPOSURE] %s sector_exp=$%.2f bankroll=$%.2f",
-            lead_sector, sector_exp, live_bankroll,
-        )
-
         effective_drawdown = drawdown_factor * pinnacle_adj
 
         if consensus.direction == "YES":
@@ -1383,57 +1201,34 @@ class FlywheelOrchestrator:
             )
             side = "no"
 
-        td_factor = sizing.get("time_decay", 1.0)
-        if td_factor < 1.0:
-            logger.info(
-                "[TIME DECAY] %s: %.0f%% Kelly (expiry approaching)",
-                ticker[:40], td_factor * 100,
-            )
-
         if in_exploration and sizing["contracts"] > 0:
             exploration_scale = kf / KELLY_FRACTION
             sizing["dollars"] = round(sizing["dollars"] * exploration_scale, 2)
             sizing["contracts"] = max(1, int(sizing["dollars"] / (yes_price / 100)))
-            logger.info(
-                "[EXPLORATION] %s scaled stake: $%.2f × %.2f → $%.2f (%d contracts)",
-                lead_sector, sizing["dollars"] / exploration_scale,
-                exploration_scale, sizing["dollars"], sizing["contracts"],
-            )
 
         if sizing["contracts"] <= 0:
-            logger.info("Sizing zero for %s — rationale: %s", ticker, sizing.get("rationale", "unknown"))
-            return
+            self._gate_stats['rejected_sizing_zero'] += 1
+            return None
 
         player_key = self._extract_risk_entity_key(ticker, lead_sector)
-        ok, reason = self.risk_manager.pre_trade_check(player_key, lead_sector, sizing["dollars"])
+        ok, reason = self.risk_manager.pre_trade_check(
+            player_key, lead_sector, sizing["dollars"],
+        )
         if not ok:
-            logger.info("RISK BLOCKED %s: %s", ticker, reason)
-            return
+            self._gate_stats['rejected_risk_pretrade'] += 1
+            return None
 
         corr_result = self.correlation_tracker.get_discount(ticker)
         if corr_result.discount < 1.0:
-            old_dollars = sizing["dollars"]
             sizing["dollars"] = round(sizing["dollars"] * corr_result.discount, 2)
             sizing["contracts"] = max(1, int(sizing["contracts"] * corr_result.discount))
-            logger.info(
-                "[CORRELATION] %s: %s → $%.2f × %.2f = $%.2f",
-                ticker[:35], corr_result.rationale,
-                old_dollars, corr_result.discount, sizing["dollars"],
-            )
             if sizing["contracts"] <= 0:
-                logger.info("CORRELATION SKIP %s: discount too steep", ticker[:40])
-                return
+                self._gate_stats['rejected_correlation_discount'] += 1
+                return None
 
         client_order_id = str(uuid.uuid4())
 
         if DEMO_MODE:
-            logger.info(
-                "DEMO TRADE %s | %s | %s %dx@%dc | $%.2f%s%s",
-                ticker, title[:40], consensus.direction.upper(),
-                sizing["contracts"], yes_price, sizing["dollars"],
-                " [FADE]" if fade else "",
-                " [EXPLORATION]" if in_exploration else "",
-            )
             order_id = f"demo-{client_order_id}"
         else:
             try:
@@ -1444,46 +1239,33 @@ class FlywheelOrchestrator:
                     max_price_cents=yes_price + 2,
                     urgency="normal",
                 )
-
                 if limit_result.contracts_filled == 0:
-                    logger.warning(
-                        "LIMIT ORDER FAILED %s: %s — falling back to market",
-                        ticker[:40], limit_result.reason,
-                    )
+                    logger.warning("LIMIT FAIL %s — falling back to market", ticker[:40])
                     order_resp = self.client.place_order(
-                        ticker=ticker,
-                        side=side,
+                        ticker=ticker, side=side,
                         count=sizing["contracts"],
                         yes_price=yes_price,
                         client_order_id=client_order_id,
                     )
                     order_id = order_resp.get("order", {}).get("order_id", client_order_id)
                 else:
-                    order_id = limit_result.order_ids[0] if limit_result.order_ids else client_order_id
-                    if limit_result.spread_saved > 0:
-                        logger.info(
-                            "[LIMIT] %s filled %d/%d @ %d¢ — saved %d¢",
-                            ticker[:30], limit_result.contracts_filled,
-                            sizing["contracts"], limit_result.fill_price,
-                            limit_result.spread_saved,
-                        )
+                    order_id = (limit_result.order_ids[0]
+                                if limit_result.order_ids else client_order_id)
             except Exception as e:
+                self._gate_stats['rejected_order_error'] += 1
                 logger.error("Order failed %s: %s", ticker, e)
-                return
+                return None
 
-        self._recently_traded[ticker] = now
         self._exposure[lead_sector] = sector_exp + sizing["dollars"]
         self.bankroll = live_bankroll
 
         self.risk_manager.record_trade(player_key, lead_sector, sizing["dollars"])
         self.correlation_tracker.record_trade(ticker, sizing["dollars"])
 
-        arb_note = f" arb_spread={arb.cross_spread:.2f}%" if arb and arb.arb_exists else ""
-        fade_note = " [FADE]" if fade else ""
-
         trade_id = log_trade(
             ticker=ticker,
             sector=lead_sector,
+            source=source,
             direction=consensus.direction,
             contracts=sizing["contracts"],
             yes_price_cents=yes_price,
@@ -1492,30 +1274,34 @@ class FlywheelOrchestrator:
             avg_edge=consensus.avg_edge,
             avg_confidence=consensus.avg_confidence,
             order_id=order_id,
+            client_order_id=client_order_id,
             demo_mode=DEMO_MODE,
         )
+
+        if trade_id is None:
+            self._gate_stats['rejected_trade_dedupe'] += 1
+            return None
+
+        self._gate_stats[f'trades_executed_{source}'] += 1
 
         provisional_loss = -sizing["dollars"]
         with self._sector_pnl_lock:
             self._sector_daily_pnl[lead_sector] = (
                 self._sector_daily_pnl.get(lead_sector, 0.0) + provisional_loss
             )
-            if trade_id is not None:
-                self._open_provisionals[int(trade_id)] = provisional_loss
-
-        logger.debug(
-            "[PROVISIONAL] trade_id=%s ticker=%s sector=%s provisional_loss=$%.2f new_sector_pnl=$%.2f",
-            trade_id, ticker, lead_sector, provisional_loss,
-            self._sector_daily_pnl[lead_sector],
-        )
+            self._open_provisionals[trade_id] = provisional_loss
 
         logger.info(
-            "TRADE #%d | %s | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%%s%s",
-            trade_id, ticker, lead_sector.upper(), consensus.direction.upper(),
+            "TRADE #%d | %s | %s | %s | %s %dx@%dc | $%.2f | edge=%+.2f%% conf=%.0f%%",
+            trade_id, ticker, lead_sector.upper(), source,
+            consensus.direction.upper(),
             sizing["contracts"], yes_price, sizing["dollars"],
             consensus.avg_edge * 100, consensus.avg_confidence * 100,
-            arb_note, fade_note,
         )
+
+        return trade_id
+
+    # ── Fade scanner ───────────────────────────────────────────────────────────
 
     def _execute_fades(self, open_markets: list[dict]) -> None:
         if not self._last_bot_probs:
@@ -1529,20 +1315,18 @@ class FlywheelOrchestrator:
         fades = self.fade_scanner.scan(open_markets, self._last_bot_probs)
 
         for fade in fades:
-            from shared.consensus_engine import ConsensusResult
-
             market = market_map.get(_normalize_ticker(fade.ticker))
             sector = self._last_bot_sectors.get(fade.ticker, "sports")
 
             ok, reason = self._passes_market_quality_gate(market, sector)
             if not ok:
-                logger.info("FADE SKIP %s: %s", fade.ticker, reason)
+                continue
+
+            if abs(fade.our_prob - fade.market_prob) < 0.001:
                 continue
 
             mock_consensus = ConsensusResult(
-                ticker=fade.ticker,
-                signals=[],
-                execute=True,
+                ticker=fade.ticker, signals=[], execute=True,
                 direction=fade.direction,
                 avg_prob=fade.our_prob,
                 avg_edge=abs(fade.our_prob - fade.market_prob),
@@ -1550,19 +1334,20 @@ class FlywheelOrchestrator:
                 reject_reason="",
             )
 
-            if not _recent_signal_exists_in_db(fade.ticker, within_minutes=180):
+            if not _recent_main_signal_exists(fade.ticker, source="fade", within_minutes=30):
                 try:
-                    log_signal(
+                    log_main_signal(
                         ticker=fade.ticker,
                         sector=sector,
-                        our_prob=mock_consensus.avg_prob,
+                        our_prob=fade.our_prob,
                         market_prob=fade.yes_price_cents / 100,
                         edge=mock_consensus.avg_edge,
                         confidence=mock_consensus.avg_confidence,
                         direction=mock_consensus.direction,
+                        source="fade",
                     )
                 except Exception as e:
-                    logger.warning("log_signal failed for fade trade %s: %s", fade.ticker, e)
+                    logger.warning("log_main_signal failed for fade %s: %s", fade.ticker, e)
 
             self._execute_trade(
                 ticker=fade.ticker,
@@ -1571,12 +1356,16 @@ class FlywheelOrchestrator:
                 consensus=mock_consensus,
                 lead_sector=sector,
                 arb=None,
+                source="fade",
                 fade=True,
                 market=market,
             )
             self.fade_scanner.mark_executed(fade.ticker)
 
+    # ── Correlation engine ─────────────────────────────────────────────────────
+
     def _execute_correlations(self, open_markets: list[dict]) -> None:
+        """Correlation engine writes to correlation_legs, not main_signals."""
         market_map = {
             _normalize_ticker(m.get("ticker", "")): m
             for m in open_markets
@@ -1589,55 +1378,50 @@ class FlywheelOrchestrator:
                 break
 
             inferred_sector = _infer_sector_from_ticker(sig.event_group)
-            if inferred_sector not in ("sports", "weather", "crypto"):
-                logger.debug(
-                    "CORR SKIP (sector=%s not in whitelist): %s",
-                    inferred_sector, sig.event_group,
-                )
+
+            allowed_sectors = ("sports", "weather", "crypto")
+            if not FINANCIAL_MARKETS_DISABLED:
+                allowed_sectors = allowed_sectors + ("financial_markets",)
+            if inferred_sector not in allowed_sectors:
                 continue
 
             if _is_blocked_structural_market(sig.event_group):
-                logger.info(
-                    "CORR BLOCKED (uncalibrated structural market): %s",
-                    sig.event_group,
-                )
                 continue
-
-            corr_key = f"__corr__{sig.event_group}"
-            now = time.monotonic()
-            last_corr = self._recently_traded.get(corr_key, 0.0)
-            if (now - last_corr) < RECENT_TRADE_WINDOW_SEC:
-                logger.debug(
-                    "CORR DUPLICATE GUARD skip %s — already traded this group",
-                    sig.event_group,
-                )
-                continue
-            self._recently_traded[corr_key] = now
 
             logger.info(
-                "[CORR TRADE] Legging into %s sector=%s (cheap=%s@%d¢, expensive=%s@%d¢) div=%.1f¢",
+                "[CORR] %s sector=%s cheap=%s@%d¢ expensive=%s@%d¢ div=%.1f¢",
                 sig.event_group, inferred_sector,
                 sig.cheap_ticker, sig.cheap_price_cents,
                 sig.expensive_ticker, sig.expensive_price_cents,
                 sig.divergence_cents,
             )
 
-            for ticker, direction, price in [
-                (sig.cheap_ticker, sig.cheap_direction, sig.cheap_price_cents),
-                (sig.expensive_ticker, sig.expensive_direction, sig.expensive_price_cents),
+            for leg_role, ticker, direction, price in [
+                ("cheap", sig.cheap_ticker, sig.cheap_direction, sig.cheap_price_cents),
+                ("expensive", sig.expensive_ticker, sig.expensive_direction, sig.expensive_price_cents),
             ]:
-                from shared.consensus_engine import ConsensusResult
-
                 market = market_map.get(_normalize_ticker(ticker))
                 ok, reason = self._passes_market_quality_gate(market, inferred_sector)
                 if not ok:
-                    logger.info("CORR SKIP %s: %s", ticker, reason)
+                    continue
+
+                try:
+                    leg_id = log_correlation_leg(
+                        event_group=sig.event_group,
+                        leg_role=leg_role,
+                        ticker=ticker,
+                        direction=direction,
+                        leg_price_cents=price,
+                        pair_divergence_cents=sig.divergence_cents,
+                        sector=inferred_sector,
+                        confidence=sig.confidence,
+                    )
+                except Exception as e:
+                    logger.warning("log_correlation_leg failed for %s: %s", ticker, e)
                     continue
 
                 mock_consensus = ConsensusResult(
-                    ticker=ticker,
-                    signals=[],
-                    execute=True,
+                    ticker=ticker, signals=[], execute=True,
                     direction=direction,
                     avg_prob=(
                         sig.cheap_price_cents / 100
@@ -1649,30 +1433,28 @@ class FlywheelOrchestrator:
                     reject_reason="",
                 )
 
-                if not _recent_signal_exists_in_db(ticker, within_minutes=180):
-                    try:
-                        log_signal(
-                            ticker=ticker,
-                            sector=inferred_sector,
-                            our_prob=mock_consensus.avg_prob,
-                            market_prob=price / 100,
-                            edge=mock_consensus.avg_edge,
-                            confidence=mock_consensus.avg_confidence,
-                            direction=mock_consensus.direction,
-                        )
-                    except Exception as e:
-                        logger.warning("log_signal failed for corr trade %s: %s", ticker, e)
-
-                self._execute_trade(
+                trade_id = self._execute_trade(
                     ticker=ticker,
                     title=f"[CORR] {sig.event_group}",
                     yes_price=price,
                     consensus=mock_consensus,
                     lead_sector=inferred_sector,
                     arb=None,
+                    source="correlation",
                     fade=False,
                     market=market,
                 )
+
+                if trade_id:
+                    try:
+                        link_correlation_leg_to_trade(leg_id, trade_id)
+                    except Exception as e:
+                        logger.warning(
+                            "link_correlation_leg_to_trade failed leg=%d trade=%d: %s",
+                            leg_id, trade_id, e,
+                        )
+
+    # ── Resolution timing ──────────────────────────────────────────────────────
 
     def _execute_resolution_timing(self, open_markets: list[dict]) -> None:
         market_map = {
@@ -1681,9 +1463,7 @@ class FlywheelOrchestrator:
         }
 
         signals = self.res_timer.scan(
-            open_markets,
-            self._last_bot_probs,
-            self._last_bot_sectors,
+            open_markets, self._last_bot_probs, self._last_bot_sectors,
         )
 
         for sig in signals:
@@ -1691,24 +1471,15 @@ class FlywheelOrchestrator:
                 break
 
             if _is_blocked_structural_market(sig.ticker):
-                logger.info(
-                    "RESTIME BLOCKED (uncalibrated structural market): %s",
-                    sig.ticker,
-                )
                 continue
 
             market = market_map.get(_normalize_ticker(sig.ticker))
             ok, reason = self._passes_market_quality_gate(market, sig.sector)
             if not ok:
-                logger.info("RESTIME SKIP %s: %s", sig.ticker, reason)
                 continue
 
-            from shared.consensus_engine import ConsensusResult
-
             mock_consensus = ConsensusResult(
-                ticker=sig.ticker,
-                signals=[],
-                execute=True,
+                ticker=sig.ticker, signals=[], execute=True,
                 direction=sig.direction,
                 avg_prob=sig.our_prob,
                 avg_edge=abs(sig.our_prob - sig.yes_price_cents / 100),
@@ -1716,19 +1487,25 @@ class FlywheelOrchestrator:
                 reject_reason="",
             )
 
-            if not _recent_signal_exists_in_db(sig.ticker, within_minutes=180):
+            if abs(sig.our_prob - sig.yes_price_cents / 100) < 0.001:
+                continue
+            if abs((sig.our_prob + sig.yes_price_cents / 100) - 1.0) < 0.001:
+                continue
+
+            if not _recent_main_signal_exists(sig.ticker, source="restime", within_minutes=30):
                 try:
-                    log_signal(
+                    log_main_signal(
                         ticker=sig.ticker,
                         sector=sig.sector,
-                        our_prob=mock_consensus.avg_prob,
+                        our_prob=sig.our_prob,
                         market_prob=sig.yes_price_cents / 100,
                         edge=mock_consensus.avg_edge,
                         confidence=mock_consensus.avg_confidence,
                         direction=mock_consensus.direction,
+                        source="restime",
                     )
                 except Exception as e:
-                    logger.warning("log_signal failed for restime trade %s: %s", sig.ticker, e)
+                    logger.warning("log_main_signal failed for restime %s: %s", sig.ticker, e)
 
             self._execute_trade(
                 ticker=sig.ticker,
@@ -1737,25 +1514,28 @@ class FlywheelOrchestrator:
                 consensus=mock_consensus,
                 lead_sector=sig.sector,
                 arb=None,
+                source="restime",
                 fade=False,
                 market=market,
             )
 
+    # ── Scan loop ──────────────────────────────────────────────────────────────
+
     def scan_markets(self) -> None:
-        logger.info("Scanning markets...")
+        logger.info("=== SCAN START ===")
+
+        self._gate_stats = defaultdict(int)
 
         _synced = self.circuit_breaker.sync_bankroll()
         self._scan_bankroll = _synced if _synced > 0 else BANKROLL
         self._scan_summary = self.circuit_breaker.daily_summary()
         self.bankroll = self._scan_bankroll
 
-        self._rebuild_demo_exposure()
-        logger.info("Rebuilt exposure for scan: %s", self._exposure)
+        self._rebuild_exposure()
 
         self.risk_manager.update_daily_pnl(
             self._scan_summary.get("realized_pnl", 0.0)
         )
-        self._scan_player_trades = {}
         self.correlation_tracker.reset()
 
         try:
@@ -1774,74 +1554,107 @@ class FlywheelOrchestrator:
 
         logger.info("Fetched %d open markets", len(markets))
 
-        nonzero = 0
-        for m in markets[:100]:
-            if _parse_yes_price_cents(m) > 0:
-                nonzero += 1
-        if markets:
-            sample = markets[0]
-            logger.info(
-                "PRICE DIAG: %d/100 markets have nonzero price | response_price_units=%s | tick_size=%s | sample yes_bid=%r yes_ask=%r last=%r",
-                nonzero,
-                sample.get("response_price_units"),
-                sample.get("tick_size"),
-                sample.get("yes_bid_dollars"),
-                sample.get("yes_ask_dollars"),
-                sample.get("last_price_dollars"),
-            )
-
-        _diag_priced = 0
-        _diag_relevant = 0
         for market in markets:
-            yp = _parse_yes_price_cents(market)
-            if yp > 2 and yp < 98:
-                _diag_priced += 1
-                for bot in self.bots:
-                    if bot.is_relevant(market):
-                        _diag_relevant += 1
-                        break
             self._evaluate_market(market)
-
-        logger.info(
-            "SIGNAL DIAG: total=%d priced=%d relevant=%d",
-            len(markets), _diag_priced, _diag_relevant,
-        )
 
         self._execute_fades(markets)
         self._execute_correlations(markets)
         self._execute_resolution_timing(markets)
 
+        self._log_gate_stats()
+
+        logger.info("=== SCAN END ===")
+
+    def _log_gate_stats(self) -> None:
+        """Summarize where markets died in the pipeline."""
+        stats = dict(self._gate_stats)
+        total = stats.get('markets_scanned', 0)
+
+        if total == 0:
+            logger.info("[GATE STATS] No markets scanned")
+            return
+
+        ordering = [
+            'markets_scanned',
+            'rejected_no_price',
+            'rejected_extreme_price',
+            'rejected_fm_disabled',
+            'rejected_liquidity',
+            'reached_bot_evaluation',
+            'rejected_no_relevant_bot',
+            'rejected_bots_returned_none',
+            'reached_consensus',
+            'rejected_consensus_edge_floor',
+            'rejected_consensus_edge_ceiling',
+            'rejected_consensus_confidence',
+            'rejected_consensus_direction_disagree',
+            'rejected_consensus_direction_filter',
+            'rejected_consensus_other',
+            'passed_consensus',
+            'rejected_sharp_veto',
+            'rejected_arb_gate',
+            'rejected_signal_shape',
+            'main_signals_logged',
+            'rejected_cooldown',
+            'rejected_circuit_breaker',
+            'rejected_risk_halt',
+            'rejected_sector_disabled',
+            'rejected_sector_loss_cap',
+            'rejected_pinnacle',
+            'rejected_lineup',
+            'rejected_sizing_zero',
+            'rejected_risk_pretrade',
+            'rejected_correlation_discount',
+            'rejected_order_error',
+            'rejected_trade_dedupe',
+            'trades_executed_main',
+            'trades_executed_fade',
+            'trades_executed_restime',
+            'trades_executed_correlation',
+        ]
+
+        logger.info("[GATE STATS] ===== main-path pipeline =====")
+        for key in ordering:
+            if key in stats and stats[key] > 0:
+                pct = 100.0 * stats[key] / total if total > 0 else 0
+                logger.info("[GATE STATS]   %-42s %6d  (%.1f%%)", key, stats[key], pct)
+
+        unexpected = set(stats.keys()) - set(ordering)
+        for key in sorted(unexpected):
+            logger.info("[GATE STATS]   %-42s %6d  (unexpected)", key, stats[key])
+
+    # ── Nightly retrain ────────────────────────────────────────────────────────
+
     def retrain_models(self) -> None:
         logger.info("=== Nightly retrain ===")
 
         n_resolved = self._ingest_resolved_markets()
-        logger.info("Ingested %d new resolved outcomes this cycle", n_resolved)
+        logger.info("Ingested %d new outcomes", n_resolved)
 
         n_patterns = self.res_timer.rebuild_patterns()
         logger.info("Rebuilt %d resolution timing patterns", n_patterns)
 
         for bot in self.bots:
-            stats = bot.refresh_calibration()
-            logger.info("[%s] calibration: %s", bot.sector_name, stats)
-            bot.save_model()
+            try:
+                stats = bot.refresh_calibration()
+                logger.info("[%s] calibration: %s", bot.sector_name, stats)
+                bot.save_model()
+            except Exception as e:
+                logger.warning("[%s] retrain failed: %s", bot.sector_name, e)
 
         _synced = self.circuit_breaker.sync_bankroll()
         live_bankroll = _synced if _synced > 0 else BANKROLL
         self.bankroll = live_bankroll
         self._scan_bankroll = live_bankroll
         self._scan_summary = {}
-        logger.info("Bankroll synced: $%.2f", live_bankroll)
 
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
-
         with self._sector_pnl_lock:
             self._sector_daily_pnl = {b.sector_name: 0.0 for b in self.bots}
             self._open_provisionals = {}
 
         self._last_bot_probs.clear()
         self._last_bot_sectors.clear()
-        self._recently_traded.clear()
-
         self._resolved_count_cache.clear()
         self._resolved_count_cache_ts = 0.0
 
@@ -1862,27 +1675,26 @@ class FlywheelOrchestrator:
         for stat in self.brier_tracker.all_stats():
             if stat:
                 logger.info(
-                    "[BRIER] %s: %.4f (%d samples, trend=%s, ×%.1f)",
+                    "[BRIER] %s: %.4f (n=%d trend=%s ×%.1f)",
                     stat["prop_code"], stat["brier"] or 0,
                     stat["count"], stat["trend"], stat["multiplier"],
                 )
 
         logger.info("=== Retrain complete ===")
 
+    # ── Main loop ──────────────────────────────────────────────────────────────
+
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v19.30 | DEMO=%s | $%.2f | arb_mode=%s",
-            DEMO_MODE, self.bankroll, self.arb._mode,
+            "Kalshi Flywheel v20.0 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
 
         try:
             self.news.start_background_poller()
         except Exception as e:
-            logger.warning(
-                "NewsSignal failed to start background poller: %s — continuing without news signal (trades will not be news-gated)",
-                e,
-            )
+            logger.warning("NewsSignal poller failed to start: %s", e)
 
         import random
         jitter = random.randint(-45, 45)
@@ -1892,7 +1704,7 @@ class FlywheelOrchestrator:
 
         self._run_ingestion_thread()
 
-        logger.info("Waiting 30s before first scan to stagger API calls...")
+        logger.info("Waiting 30s before first scan...")
         time.sleep(30)
 
         self.scan_markets()
