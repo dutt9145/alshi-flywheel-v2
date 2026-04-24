@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 SECTOR_CALIBRATION = {
     'sports':            0.00,   # v6: was +0.13, now zero — player-prop models are self-calibrating
     'crypto':            0.13,
-    'weather':          -0.15,
+    'weather':           0.00,
     'financial_markets': 0.00,
     'economics':         0.00,
     'politics':          0.00,
