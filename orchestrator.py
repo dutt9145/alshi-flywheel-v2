@@ -236,6 +236,7 @@ _STRUCTURAL_MARKET_BLOCKLIST = (
     "kxmvesportsmultigameextended",
     "kxmvesportsmultigame",
     "kxmvesportsmulti",
+    "kxcoinbase",
 )
 
 
