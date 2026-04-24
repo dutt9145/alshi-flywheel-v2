@@ -38,6 +38,15 @@ new calibration_logger (v11). Key changes from v19.31:
    Next ingestion cycle would re-book the same outcome. Now the side
    effects only fire after successful persistence.
 
+v20.1 (2026-04-24):
+  - Phase 3 expanded to cover ALL sports ticker families, not just
+    ATP/WTA/Tennis/ITF. Previous whitelist left MLB player props, La Liga
+    totals, LoL games, and niche esports stuck in the resolver. Added a
+    24-hour minimum age floor to avoid hammering Kalshi's per-ticker
+    endpoint for games still in progress.
+  - No schema changes. No new methods. Only a WHERE-clause edit in
+    _ingest_resolved_markets.
+
 Preserved from v19.x (all still working, no refactor):
    - RiskManager, BrierTracker
    - Pinnacle sharp-line check for sports
@@ -57,7 +66,7 @@ Deployment order:
    1. Run migrations/001_clean_slate_v3.sql
    2. Verify with integrity tests (all three must pass)
    3. Replace shared/calibration_logger.py (v11)
-   4. Replace orchestrator.py (v20.0)
+   4. Replace orchestrator.py (v20.1)
    5. Restart the Railway deployment
    6. Watch logs for "[GATE STATS]" summary at end of first scan
 """
@@ -884,7 +893,15 @@ class FlywheelOrchestrator:
 
         logger.info("Phase 1/2 complete — %d outcome rows written", recorded)
 
-        # Phase 3
+        # ── Phase 3: per-ticker fallback ─────────────────────────────────────
+        # v20.1: WHERE clause expanded to cover ALL sports ticker families,
+        # not just ATP/WTA/Tennis/ITF. The narrow whitelist was leaving MLB
+        # player props, La Liga totals, LoL games, and niche esports stuck
+        # (observed 2026-04-23/24: 9 MLB + La Liga trades required manual
+        # SQL resolution).
+        # Added 24h minimum age floor so we don't hammer Kalshi's per-ticker
+        # endpoint for games still in progress. Kalshi typically finalizes
+        # within 2-12h, so 24h is a safe lower bound.
         logger.info("=== Phase 3: checking unresolved tickers for finalized status ===")
 
         unresolved_rows = _query_db(
@@ -894,18 +911,8 @@ class FlywheelOrchestrator:
             LEFT JOIN outcomes o ON o.trade_id = t.id
             WHERE o.trade_id IS NULL
               AND t.created_at > NOW() - INTERVAL '7 days'
-              AND (
-                t.sector IN ('weather', 'crypto', 'financial_markets')
-                OR (
-                  t.sector = 'sports'
-                  AND (
-                    LOWER(t.ticker) LIKE 'kxatp%%'
-                    OR LOWER(t.ticker) LIKE 'kxwta%%'
-                    OR LOWER(t.ticker) LIKE 'kxtennis%%'
-                    OR LOWER(t.ticker) LIKE 'kxitf%%'
-                  )
-                )
-              )
+              AND t.created_at < NOW() - INTERVAL '24 hours'
+              AND t.sector IN ('sports', 'weather', 'crypto', 'financial_markets')
             LIMIT 1500
             """
         )
@@ -945,7 +952,7 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.warning("Brier tracker save failed: %s", e)
 
-        logger.info("=== Resolution ingestion complete — %d total outcomes ===", recorded)
+        logger.info("=== Resolution ingestion complete — %d new outcomes ===", recorded)
         return recorded
 
     def _run_ingestion_thread(self) -> None:
@@ -1686,7 +1693,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.0 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.1 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
