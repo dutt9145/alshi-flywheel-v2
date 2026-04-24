@@ -1,16 +1,38 @@
 """
-shared/consensus_engine.py  (v5 — sector calibration offsets)
+shared/consensus_engine.py  (v6 — sports calibration reset after v14 HRR fix)
 
-Changes vs v4:
-  1. Added SECTOR_CALIBRATION dict with probability offsets based on
-     historical prediction vs actual analysis (2026-04-19):
-       Sports: predicted 33% YES, actual 46% → +13% offset
-       Crypto: predicted 25% YES, actual 38% → +13% offset
-       Weather: predicted 34% YES, actual 25% → -9% offset
-  2. Gate 2 (direction agreement) now uses calibrated probabilities
-     to determine direction, fixing the all-NO-trades bug.
-  3. Weighted average probs are calibrated before direction/edge calc.
-  4. All other gates unchanged from v4.
+Changes vs v5:
+  1. SECTOR_CALIBRATION['sports'] changed from +0.13 → 0.00.
+
+     Context: The +0.13 sports offset was added in v5 to compensate for the
+     "971/971 trades were NO" bug, which was rooted in poisoned Bayesian
+     priors in the pre-v12.7 sports path. Since v12.7, sports routes
+     exclusively through the MLB/NBA player-prop models (bypassing
+     Bayesian), and since v14 of mlb_hit_model.py, HRR has a dedicated
+     predictor that outputs real threshold-sensitive probabilities.
+
+     With those fixes in place, the +0.13 offset is no longer correcting
+     a systematic under-prediction — it is introducing bias. Specifically:
+     it was pinning HRR raw probs (~0.001) to 0.13 regardless of threshold,
+     masking the underlying model and generating trades that looked like
+     fades but were ghost signals.
+
+  2. SECTOR_CALIBRATION['weather'] left at -0.15 — weather continues to
+     show predicted vs actual divergence per the 2026-04-20 audit.
+
+  3. NEW: Per-signal calibration logging. When calibration shifts a
+     probability, we log raw/calibrated/direction so future Brier-score
+     analysis can distinguish model error from calibration error.
+
+  All other gates unchanged from v5.
+
+  FOLLOW-UP (recommended):
+    - Add `raw_prob` and `calibrated_prob` columns to the `trades` and
+      `main_signals` tables. Without this, we cannot Brier-score the
+      underlying model independently of the calibration layer.
+    - Re-audit weather calibration after 30 days on the v14 HRR-aware
+      sports baseline, to confirm -0.15 is still the right weather offset
+      relative to a fairly-calibrated sports sector.
 """
 
 import logging
@@ -22,24 +44,27 @@ import numpy as np
 from config.settings import (
     CONSENSUS_EDGE_PCT, CONSENSUS_CONFIDENCE, SECTORS,
     MAX_EDGE_PCT, DIRECTION_FILTER,
-    sector_max_edge,   # v4: per-sector edge ceilings
+    sector_max_edge,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Sector calibration offsets (v5) ────────────────────────────────────────────
-# Based on historical prediction vs actual analysis (2026-04-19):
-#   Sector        | Predicted | Actual | Offset
-#   sports        | 33% YES   | 46%    | +0.13 (under-predicting)
-#   crypto        | 25% YES   | 38%    | +0.13 (under-predicting)
-#   weather       | 34% YES   | 25%    | -0.09 (over-predicting)
-#   financial_mkts| (tbd)     | (tbd)  | 0.00  (no data yet)
+# ── Sector calibration offsets (v6) ────────────────────────────────────────────
+# v6 (2026-04-23): Set sports to 0.00 after v14 HRR predictor fix.
 #
-# These offsets shift raw model probabilities before direction is determined.
-# This fixes the bug where 971/971 trades were NO because models consistently
-# predicted low YES probabilities.
+# The +0.13 sports offset was introduced in v5 when all sports markets ran
+# through a shared poisoned Bayesian model that systematically under-predicted
+# YES. That Bayesian path no longer exists — SportsBot v12.7 only routes
+# through player-prop models (MLB hit, MLB HR, MLB HRR via v14, MLB KS,
+# NBA props). These models produce per-game, threshold-sensitive probabilities
+# with their own calibration. Adding +0.13 on top of them pushes everything
+# uniformly toward YES, which floors near-zero probabilities into the 0.13
+# range and distorts edge calculations.
+#
+# Weather offset remains at -0.15 per 2026-04-20 audit (282 resolved signals,
+# predicted 35% YES, actual 20%). Revisit after 30 days.
 SECTOR_CALIBRATION = {
-    'sports':            0.13,
+    'sports':            0.00,   # v6: was +0.13, now zero — player-prop models are self-calibrating
     'crypto':            0.13,
     'weather':          -0.15,
     'financial_markets': 0.00,
@@ -57,36 +82,28 @@ def _calibrate_prob(prob: float, sector: str) -> float:
 
 @dataclass
 class BotSignal:
-    """
-    Output from a single sector bot for a given contract.
-    """
+    """Output from a single sector bot for a given contract."""
     sector:          str
     prob:            float          # our P(YES) — raw, before calibration
     confidence:      float          # model confidence 0–1
     market_prob:     float          # market's implied P(YES) from yes_price/100
-    brier_score:     Optional[float] = None   # rolling Brier — lower = better
+    brier_score:     Optional[float] = None
 
     @property
     def calibrated_prob(self) -> float:
-        """Probability after applying sector calibration offset."""
         return _calibrate_prob(self.prob, self.sector)
 
     @property
     def edge(self) -> float:
-        """Signed edge: positive = we think YES is underpriced (uses calibrated prob)."""
         return self.calibrated_prob - self.market_prob
 
     @property
     def direction(self) -> str:
-        """YES if we think it should resolve YES, NO otherwise (uses calibrated prob)."""
         return "YES" if self.calibrated_prob > self.market_prob else "NO"
 
 
 @dataclass
 class ConsensusResult:
-    """
-    Outcome of the consensus gate for a single contract.
-    """
     ticker:          str
     execute:         bool
     direction:       Optional[str]
@@ -106,27 +123,13 @@ class ConsensusResult:
 
 
 class ConsensusEngine:
-    """
-    Aggregates signals from all registered sector bots and decides
-    whether to execute a trade.
-
-    Six gates (all must pass):
-      1. At least one bot responded
-      2. All responding bots agree on direction
-      3. Weighted-average edge >= CONSENSUS_EDGE_PCT (floor)
-      4. Weighted-average confidence >= CONSENSUS_CONFIDENCE
-      5. Weighted-average edge <= sector edge ceiling (per-sector, v4)
-      6. Direction matches DIRECTION_FILTER (NO-only mode)
-    """
+    """Aggregates signals from all registered sector bots and decides
+    whether to execute a trade."""
 
     def __init__(self):
         self._brier_baseline = {s: None for s in SECTORS}
 
     def _bot_weight(self, signal: BotSignal) -> float:
-        """
-        Inverse-Brier weighting: better-calibrated bots get more say.
-        Falls back to equal weight if no Brier score is available.
-        """
         bs = signal.brier_score
         if bs is None or bs <= 0:
             return 1.0
@@ -138,15 +141,6 @@ class ConsensusEngine:
         yes_price_cents: int,
         signals:         list[BotSignal],
     ) -> ConsensusResult:
-        """
-        Run the six-gate consensus check.
-
-        Parameters
-        ----------
-        ticker          : Kalshi market ticker
-        yes_price_cents : current market YES price in cents
-        signals         : list of BotSignal — one per sector bot
-        """
         market_prob = yes_price_cents / 100.0
 
         # ── Gate 1: at least one bot must respond ──────────────────────────────
@@ -159,10 +153,8 @@ class ConsensusEngine:
                 reject_reason="No bots responded",
             )
 
-        # ── Gate 2: direction agreement (v5: uses calibrated probs) ────────────
-        # Direction is now determined from calibrated_prob, not raw prob.
-        # This fixes the all-NO-trades bug caused by systematic under-prediction.
-        directions = [s.direction for s in signals]  # Uses calibrated_prob via property
+        # ── Gate 2: direction agreement (uses calibrated probs) ───────────────
+        directions = [s.direction for s in signals]
         if len(set(directions)) > 1:
             disagreements = ", ".join(f"{s.sector}={s.direction}" for s in signals)
             return ConsensusResult(
@@ -175,11 +167,10 @@ class ConsensusEngine:
 
         direction = directions[0]
 
-        # ── Weighted averages (v5: uses calibrated probs) ──────────────────────
+        # ── Weighted averages (uses calibrated probs) ──────────────────────────
         weights    = np.array([self._bot_weight(s) for s in signals])
         weights   /= weights.sum()
 
-        # v5: Use calibrated probabilities for averaging
         probs      = np.array([s.calibrated_prob for s in signals])
         confs      = np.array([s.confidence for s in signals])
 
@@ -189,15 +180,19 @@ class ConsensusEngine:
         if direction == "NO":
             avg_edge = market_prob - avg_prob
 
-        # Log calibration effect for debugging
+        # v6: Log calibration effect when it shifted any signal's direction
+        # or materially moved a probability. Helps distinguish model error
+        # from calibration error in future Brier analysis.
         raw_probs = [s.prob for s in signals]
         cal_probs = [s.calibrated_prob for s in signals]
-        if raw_probs != cal_probs:
-            logger.debug(
-                "[Consensus] %s calibration: raw=%s cal=%s dir=%s",
-                ticker, 
-                [f"{p:.2f}" for p in raw_probs],
-                [f"{p:.2f}" for p in cal_probs],
+        any_shifted = any(abs(r - c) > 0.001 for r, c in zip(raw_probs, cal_probs))
+        if any_shifted:
+            logger.info(
+                "[Consensus-calib] %s raw=%s cal=%s sector=%s dir=%s",
+                ticker,
+                [f"{p:.3f}" for p in raw_probs],
+                [f"{p:.3f}" for p in cal_probs],
+                [s.sector for s in signals],
                 direction,
             )
 
@@ -225,11 +220,7 @@ class ConsensusEngine:
                 ),
             )
 
-        # ── Gate 5: edge ceiling (v4: per-sector) ─────────────────────────────
-        # v3 used global MAX_EDGE_PCT (25%) for all sectors. This rejected
-        # genuine weather signals (NOAA 96% conf, 58% edge on Houston temp)
-        # and extreme MLB player props (≥3 hits for a .200 hitter).
-        # v4 uses sector_max_edge() which gives weather 60%, sports 40%.
+        # ── Gate 5: edge ceiling (per-sector) ─────────────────────────────────
         lead_sector = signals[0].sector
         edge_ceiling = sector_max_edge(lead_sector)
 
@@ -248,7 +239,7 @@ class ConsensusEngine:
                 ),
             )
 
-        # ── Gate 6: direction filter (audit: YES 22% WR, NO 65% WR) ───────────
+        # ── Gate 6: direction filter ─────────────────────────────────────────
         if DIRECTION_FILTER != "BOTH" and direction != DIRECTION_FILTER:
             logger.info(
                 "[Consensus] %s REJECTED: direction %s blocked (%s only)",
