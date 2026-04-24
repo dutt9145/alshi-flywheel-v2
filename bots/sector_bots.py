@@ -764,6 +764,7 @@ class CryptoBot(BaseBot):
         "kxbtcd",      # BTC daily targets (not 15M, different dynamics)
         "kxethd",      # ETH daily targets
         "kxsold",      # SOL daily targets
+        "kxcoinbase",  # Coinbase exchange (too many non-price factors)
         "kxsol15m",    # 8 resolved, 0.2375 Brier
         "kxxrp15m",    # 5 resolved, 0.2688 Brier
         "kxtabletennis",  # Table tennis
@@ -1645,6 +1646,25 @@ class SportsBot(BaseBot):
         "PGA":      0.50,
     }
 
+    # v12.8: Per-prop MLB confidence scaling based on 2026-04-24 Brier audit.
+    # When an MLB ticker is encountered, these prop-specific scales OVERRIDE
+    # the generic MLB=0.75 scaling above. Falls through to MLB default for
+    # MLB tickers that don't match any prop code (e.g., KXMLBSPREAD).
+    #
+    # Audit data over 30 days:
+    #   HRR: 1,335 resolved, Brier 0.2523 — pre-v14 broken model (contamination)
+    #   TB:    374 resolved, Brier 0.0853 — best-calibrated family in system
+    #                                        (beats weather's 0.0976)
+    #   HIT:    48 resolved, Brier 0.1698
+    #   HR:     26 resolved, Brier 0.0193 — small sample, all resolved NO
+    MLB_PROP_CONFIDENCE_SCALE = {
+        "TB":  0.95,  # Brier 0.0853 — raise aggressively, this is the star
+        "HIT": 0.75,  # Brier 0.170  — hold at baseline
+        "HR":  0.75,  # n=26 — sample too thin to adjust
+        "HRR": 0.65,  # v14 predictor unproven, stay conservative until 50+ resolved
+        "KS":  0.75,  # No resolved data yet
+    }
+
     # ── v12.7: SPORT_BLOCKLIST — data-driven update 2026-04-20 ─────────────────
     # Key changes from v12.6:
     #   REMOVED: kxmlbspr (KXMLBSPREAD has 0.19 Brier — BEST MLB performer)
@@ -1903,9 +1923,27 @@ class SportsBot(BaseBot):
         return any(tk.startswith(prefix) for prefix in self.SPORT_BLOCKLIST)
 
     def _scale_confidence(self, ticker: str, raw_conf: float) -> float:
-        """Apply per-sport confidence scaling based on historical Brier."""
+        """Apply per-sport confidence scaling based on historical Brier.
+
+        v12.8: MLB prop code gets checked FIRST so TB (Brier 0.0853 —
+        best-calibrated family in the system) gets aggressive sizing,
+        while HRR (v14 predictor unproven) stays conservative. Non-MLB
+        tickers and MLB tickers without a matching prop code fall through
+        to the existing sport-wide scale.
+        """
         if self._is_blocklisted_sport(ticker):
             return 0.0
+
+        # v12.8: MLB per-prop scaling overrides generic MLB=0.75 scale.
+        # Order matters: HRR must be checked before HR because "KXMLBHRR"
+        # also starts with "KXMLBHR".
+        tk_upper = ticker.upper()
+        if tk_upper.startswith("KXMLB"):
+            for prop_code in ("HRR", "HIT", "TB", "HR", "KS"):
+                if tk_upper.startswith(f"KXMLB{prop_code}"):
+                    return raw_conf * self.MLB_PROP_CONFIDENCE_SCALE[prop_code]
+            # MLB ticker but no matching prop code (e.g., KXMLBSPREAD)
+            # falls through to sport-wide MLB scale below.
 
         sport_code = self._detect_sport_code(ticker)
         scale = self.SPORT_CONFIDENCE_SCALE.get(sport_code, 0.50)
