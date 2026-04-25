@@ -280,30 +280,36 @@ def log_correlation_leg(
     pair_divergence_cents:  float,
     sector:                 str,
     confidence:             Optional[float] = None,
+    pair_uuid:              Optional[str] = None,    # v11.1: atomic pair tracking
 ) -> int:
     """Log one leg of a correlation-engine pair. Returns row id.
-
+ 
     The returned id lets the caller link this leg to the resulting trade
-    (via trades.id → correlation_legs.trade_id) once the order is placed.
+    (via trades.id -> correlation_legs.trade_id) once the order is placed.
+ 
+    v11.1: pair_uuid lets us group both legs of an atomically-placed pair
+    for joint tracking. Both legs of the same pair should share the same
+    pair_uuid. Passing None is allowed for backward compatibility with any
+    remaining non-atomic callers (legacy data).
     """
     if leg_role not in ("cheap", "expensive"):
         raise ValueError(f"leg_role must be cheap or expensive, got {leg_role!r}")
     if direction not in ("YES", "NO"):
         raise ValueError(f"direction must be YES or NO, got {direction!r}")
-
+ 
     sql = f"""
         INSERT INTO correlation_legs
             (created_at, event_group, leg_role, ticker, direction,
-             leg_price_cents, pair_divergence_cents, sector, confidence)
-        VALUES ({_ph(9)})
+             leg_price_cents, pair_divergence_cents, sector, confidence, pair_uuid)
+        VALUES ({_ph(10)})
         RETURNING id
     """ if USE_POSTGRES else f"""
         INSERT INTO correlation_legs
             (created_at, event_group, leg_role, ticker, direction,
-             leg_price_cents, pair_divergence_cents, sector, confidence)
-        VALUES ({_ph(9)})
+             leg_price_cents, pair_divergence_cents, sector, confidence, pair_uuid)
+        VALUES ({_ph(10)})
     """
-
+ 
     vals = (
         datetime.now(timezone.utc).isoformat(),
         str(event_group),
@@ -314,8 +320,9 @@ def log_correlation_leg(
         float(pair_divergence_cents),
         str(sector),
         float(confidence) if confidence is not None else None,
+        str(pair_uuid) if pair_uuid is not None else None,
     )
-
+ 
     with _db() as conn:
         if USE_POSTGRES:
             cur = conn.cursor()
@@ -324,14 +331,14 @@ def log_correlation_leg(
         else:
             cur = conn.execute(sql, vals)
             row_id = int(cur.lastrowid)
-
+ 
     logger.info(
-        "CORR LEG #%d | group=%s | %s | %s %s @ %d¢ | div=%.1f¢",
-        row_id, event_group[:30], leg_role.upper(), direction,
+        "CORR LEG #%d | pair=%s | group=%s | %s | %s %s @ %d¢ | div=%.1f¢",
+        row_id, (pair_uuid or "none")[:8], event_group[:30],
+        leg_role.upper(), direction,
         ticker[:30], leg_price_cents, pair_divergence_cents,
     )
     return row_id
-
 
 def link_correlation_leg_to_trade(leg_id: int, trade_id: int) -> None:
     """Mark a correlation leg as executed by linking it to the trades row."""

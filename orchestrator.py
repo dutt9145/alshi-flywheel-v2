@@ -1,74 +1,40 @@
 """
-orchestrator.py  (v20.0 — clean slate rewrite)
+orchestrator.py  (v20.3 — atomic correlation pair execution)
 
-Rewritten against the new schema (migrations/001_clean_slate_v3.sql) and the
-new calibration_logger (v11). Key changes from v19.31:
+Changes vs v20.1:
+  ATOMIC CORRELATION PAIRS
+  Previous versions placed each correlation leg independently via
+  _execute_correlations. If the second leg failed any gate (liquidity,
+  cooldown, sizing, blocklist, or API rejection), the first leg was left
+  as a naked directional bet — no hedge. Audit on 2026-04-24 confirmed
+  this was happening 100% of the time: 40 correlation trades in history,
+  0 paired, every single one a single naked leg.
 
-1. SIGNAL STREAM SEPARATION
-   - main_signals: consensus/fade/restime decisions (real model views)
-   - correlation_legs: correlation engine pair arbitrage legs
-   DB CHECK constraint on main_signals prevents correlation artifacts from
-   leaking into the main stream. The two streams are structurally separate
-   and calibration analyses run only against main_signals.
+  v20.3 enforces atomic placement:
+    Phase 1: Pre-flight BOTH legs through every gate. If either fails,
+             skip the pair entirely.
+    Phase 2: Place cheap leg first. If it fails, abort cleanly.
+    Phase 3: Place expensive leg. If it fails, IMMEDIATELY close the
+             cheap leg at market to prevent a naked bet.
+    Phase 4: Log both legs with a shared pair_uuid for joint tracking.
+    Phase 5: Dedupe within a scan — one pair per event_group per scan.
 
-2. DB-BACKED COOLDOWN (30-MINUTE)
-   Replaces the in-memory _recently_traded dict that got wiped on every
-   Railway restart. Now checks the trades table directly for recent trades
-   on the same ticker. Survives restarts and works across parallel instances.
-   Cooldown is checked at the TOP of _execute_trade before any early returns.
+  Schema change: correlation_legs.pair_uuid (TEXT, nullable) added via
+  migration. Historical rows have NULL. Requires updated
+  shared/calibration_logger.py v11.1 (log_correlation_leg accepts pair_uuid).
 
-3. ONE OUTCOME ROW PER TRADE (via trade_id)
-   Previously _calculate_pnl summed across all trade rows for a ticker,
-   which multiplied P&L by N whenever the same ticker had N phantom
-   duplicates. Now each trade gets its own outcome row keyed on trade_id.
-   Eliminates the phantom-multiplier bug structurally.
-
-4. SOURCE TAGGING
-   Every trade row now has a `source` column ('main', 'fade', 'restime',
-   'correlation'). Lets us cleanly separate performance analysis per path.
-
-5. GATE-FAILURE INSTRUMENTATION
-   _evaluate_market increments per-stage counters. At end of scan, log a
-   summary showing exactly where main-path signals die. Tells us in
-   production whether the consensus path actually fires.
-
-6. LOG_OUTCOME COMMITS BEFORE P&L SIDE EFFECTS
-   Fixes a subtle double-booking risk: if log_outcome raised, v19.x had
-   already called circuit_breaker.record_pnl() and mutated sector P&L.
-   Next ingestion cycle would re-book the same outcome. Now the side
-   effects only fire after successful persistence.
-
-v20.1 (2026-04-24):
-  - Phase 3 expanded to cover ALL sports ticker families, not just
-    ATP/WTA/Tennis/ITF. Previous whitelist left MLB player props, La Liga
-    totals, LoL games, and niche esports stuck in the resolver. Added a
-    24-hour minimum age floor to avoid hammering Kalshi's per-ticker
-    endpoint for games still in progress.
-  - No schema changes. No new methods. Only a WHERE-clause edit in
-    _ingest_resolved_markets.
-
-Preserved from v19.x (all still working, no refactor):
-   - RiskManager, BrierTracker
-   - Pinnacle sharp-line check for sports
-   - LineupChecker for MLB/NBA
-   - WeatherEnsemble (NOAA + Open-Meteo)
-   - LimitOrderManager (smart limit orders)
-   - EarlyExitManager
-   - LiquidityFilter
-   - CorrelationTracker (same-game prop discount)
-   - CircuitBreaker (daily P&L halt)
-   - Resolution ingestion Phase 1/2/3
-   - Sector exposure tracking and caps
-   - Exploration mode Kelly scaling
-   - NBA/MLB feature logging for logreg training
+Changes vs v20 (carried forward):
+  v20.1: Phase 3 expanded to cover all sports families with 24h age floor.
+  v20:   Signal stream separation, DB-backed cooldown, one-outcome-per-trade,
+         source tagging, gate-failure instrumentation, outcome-before-side-
+         effects ordering.
 
 Deployment order:
-   1. Run migrations/001_clean_slate_v3.sql
-   2. Verify with integrity tests (all three must pass)
-   3. Replace shared/calibration_logger.py (v11)
-   4. Replace orchestrator.py (v20.1)
-   5. Restart the Railway deployment
-   6. Watch logs for "[GATE STATS]" summary at end of first scan
+   1. Run migration_correlation_pairs.sql in Supabase
+   2. Replace shared/calibration_logger.py (v11.1)
+   3. Replace orchestrator.py (v20.3)
+   4. git commit + push
+   5. Railway redeploys; watch logs for [CORR-PAIR] messages
 """
 
 import logging
@@ -133,7 +99,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
-# Quiet the high-volume internal modules
 logging.getLogger("shared.sharp_detector").setLevel(logging.WARNING)
 logging.getLogger("shared.mlb_stats_fetcher").setLevel(logging.WARNING)
 logging.getLogger("shared.nba_stats_fetcher").setLevel(logging.WARNING)
@@ -142,23 +107,18 @@ logging.getLogger("shared.nba_stats_fetcher").setLevel(logging.WARNING)
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# v20: Cooldown extended from 5 min (in-memory) to 30 min (DB-backed).
 RECENT_TRADE_WINDOW_SEC = 1800
-
 FINANCIAL_MARKETS_DISABLED = True
-
 SCAN_PAGE_SLEEP_SEC = 0.25
-
 _UUID_SUFFIX_RE = re.compile(r'-S[0-9A-Fa-f]{4,}-[0-9A-Fa-f]+$')
 
 
 def _normalize_ticker(ticker: str) -> str:
-    """Strip Kalshi UUID suffix from multivariate market tickers."""
     return _UUID_SUFFIX_RE.sub('', ticker)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sector inference from ticker
+# Sector inference
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TICKER_SECTOR_MAP: list[tuple[tuple[str, ...], str]] = [
@@ -245,10 +205,6 @@ def _is_blocked_structural_market(ticker: str) -> bool:
     return any(tk.startswith(p) for p in _STRUCTURAL_MARKET_BLOCKLIST)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# NBA player prop detection (for outcome recording)
-# ─────────────────────────────────────────────────────────────────────────────
-
 _NBA_PROP_CODES = ("PTS", "REB", "AST", "3PT", "STL", "BLK")
 
 
@@ -288,7 +244,6 @@ def _ph() -> str:
 
 
 def _query_db(sql: str, params: tuple = (), _retries: int = 2) -> list:
-    """Generic DB query helper. Returns list of dicts."""
     pool = _get_pool()
     try:
         if pool:
@@ -337,11 +292,10 @@ def _query_db(sql: str, params: tuple = (), _retries: int = 2) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DB-backed cooldown (v20 — replaces in-memory _recently_traded dict)
+# DB-backed cooldown + signal existence helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _recently_traded_in_db(ticker: str, within_sec: int = RECENT_TRADE_WINDOW_SEC) -> bool:
-    """True if a trade exists for this ticker within the last `within_sec` seconds."""
     p = _ph()
     if os.getenv("DATABASE_URL"):
         sql = (
@@ -363,7 +317,6 @@ def _recently_traded_in_db(ticker: str, within_sec: int = RECENT_TRADE_WINDOW_SE
 
 
 def _recent_main_signal_exists(ticker: str, source: str, within_minutes: int = 30) -> bool:
-    """True if a main_signals row exists for (ticker, source) recently."""
     p = _ph()
     if os.getenv("DATABASE_URL"):
         sql = (
@@ -415,7 +368,6 @@ def _calculate_trade_pnl(
     yes_price_cents: int,
     resolved_yes: bool,
 ) -> float:
-    """P&L for a single trade given its direction, size, entry price, and outcome."""
     yes_price_frac = yes_price_cents / 100.0
     no_price_frac = 1.0 - yes_price_frac
     direction_upper = direction.upper()
@@ -431,7 +383,6 @@ def _calculate_trade_pnl(
 
 
 def _update_main_signal_brier(ticker: str, resolved_yes: bool) -> None:
-    """Update Brier score on unresolved main_signals rows for this ticker."""
     outcome = 1 if resolved_yes else 0
     now = datetime.now(timezone.utc)
     p = _ph()
@@ -477,7 +428,6 @@ def _update_main_signal_brier(ticker: str, resolved_yes: bool) -> None:
 
 
 def _update_correlation_leg_outcome(ticker: str, resolved_yes: bool) -> None:
-    """Mark unresolved correlation_legs rows for this ticker with their outcome."""
     outcome = 1 if resolved_yes else 0
     now = datetime.now(timezone.utc)
     p = _ph()
@@ -671,7 +621,6 @@ class FlywheelOrchestrator:
         return True, ""
 
     def _rebuild_exposure(self) -> None:
-        """Rebuild per-sector exposure from unresolved trades in the last 3 days."""
         self._exposure = {b.sector_name: 0.0 for b in self.bots}
         rows = _query_db(
             """
@@ -697,7 +646,6 @@ class FlywheelOrchestrator:
         processed_this_run: set[str],
         bayesian_updated_events: set[str],
     ) -> int:
-        """Process one resolved market. Returns number of outcomes written."""
         p = _ph()
 
         ticker = _normalize_ticker(market.get("ticker", ""))
@@ -764,7 +712,6 @@ class FlywheelOrchestrator:
             except Exception as e:
                 logger.warning("[NBA LOGREG] record_outcome failed for %s: %s", ticker, e)
 
-        # One outcome row per trade
         trade_rows = _query_db(
             f"""
             SELECT t.id, t.direction, t.contracts, t.yes_price_cents,
@@ -812,7 +759,6 @@ class FlywheelOrchestrator:
                 or (direction == "NO" and not resolved_yes)
             )
 
-            # Commit outcome FIRST, then apply side effects
             try:
                 log_outcome(
                     ticker=ticker,
@@ -894,15 +840,6 @@ class FlywheelOrchestrator:
 
         logger.info("Phase 1/2 complete — %d outcome rows written", recorded)
 
-        # ── Phase 3: per-ticker fallback ─────────────────────────────────────
-        # v20.1: WHERE clause expanded to cover ALL sports ticker families,
-        # not just ATP/WTA/Tennis/ITF. The narrow whitelist was leaving MLB
-        # player props, La Liga totals, LoL games, and niche esports stuck
-        # (observed 2026-04-23/24: 9 MLB + La Liga trades required manual
-        # SQL resolution).
-        # Added 24h minimum age floor so we don't hammer Kalshi's per-ticker
-        # endpoint for games still in progress. Kalshi typically finalizes
-        # within 2-12h, so 24h is a safe lower bound.
         logger.info("=== Phase 3: checking unresolved tickers for finalized status ===")
 
         unresolved_rows = _query_db(
@@ -973,11 +910,6 @@ class FlywheelOrchestrator:
     # ── Main path ──────────────────────────────────────────────────────────────
 
     def _evaluate_market(self, market: dict) -> None:
-        """Evaluate a single market through the main consensus path.
-
-        v20: Extensive gate-failure instrumentation. Every rejection increments
-        a counter so we can see at end of scan where markets die.
-        """
         self._gate_stats['markets_scanned'] += 1
 
         ticker = _normalize_ticker(
@@ -1050,18 +982,15 @@ class FlywheelOrchestrator:
 
         self._gate_stats['passed_consensus'] += 1
 
-        # Sharp veto
         if sharp_signal.sharp_detected and not sharp_signal.aligned_with(consensus.direction):
             self._gate_stats['rejected_sharp_veto'] += 1
             return
 
         lead_sector = signals[0].sector
 
-        # Record bot probability for fade/restime scanners
         self._last_bot_probs[ticker] = consensus.avg_prob
         self._last_bot_sectors[ticker] = lead_sector
 
-        # Arb gate
         arb = self.arb.check_and_log(
             ticker=ticker,
             kalshi_cents=yes_price,
@@ -1072,7 +1001,6 @@ class FlywheelOrchestrator:
             self._gate_stats['rejected_arb_gate'] += 1
             return
 
-        # Log the main signal (DB enforces correlation-artifact CHECK)
         if not _recent_main_signal_exists(ticker, source="main", within_minutes=30):
             try:
                 log_main_signal(
@@ -1116,12 +1044,6 @@ class FlywheelOrchestrator:
         fade: bool = False,
         market: dict = None,
     ):
-        """Execute a trade. v20: DB-backed cooldown at top of function.
-
-        Returns trade_id on success, None otherwise.
-        """
-
-        # v20: DB-backed cooldown first
         if _recently_traded_in_db(ticker, within_sec=RECENT_TRADE_WINDOW_SEC):
             self._gate_stats['rejected_cooldown'] += 1
             return None
@@ -1370,10 +1292,22 @@ class FlywheelOrchestrator:
             )
             self.fade_scanner.mark_executed(fade.ticker)
 
-    # ── Correlation engine ─────────────────────────────────────────────────────
+    # ── Correlation engine (v20.3 atomic pair execution) ───────────────────────
 
     def _execute_correlations(self, open_markets: list[dict]) -> None:
-        """Correlation engine writes to correlation_legs, not main_signals."""
+        """Correlation engine — ATOMIC PAIR EXECUTION (v20.3).
+
+        Previous versions placed each leg independently, which created naked
+        directional bets whenever the second leg failed any gate. Audit on
+        2026-04-24 showed 40/40 correlation trades in history had been single
+        naked legs, not arbitrage pairs.
+
+        This version enforces atomic placement:
+          Phase 1: gate both legs; skip pair if EITHER fails
+          Phase 2: place cheap leg; abort cleanly if it fails
+          Phase 3: place expensive leg; close cheap at market if it fails
+          Phase 4: link both trades to correlation_legs with shared pair_uuid
+        """
         market_map = {
             _normalize_ticker(m.get("ticker", "")): m
             for m in open_markets
@@ -1381,86 +1315,347 @@ class FlywheelOrchestrator:
 
         corr_signals = self.corr_engine.scan(open_markets)
 
+        # Dedupe within scan: only fire one pair per event_group per scan.
+        seen_groups: set[str] = set()
+
         for sig in corr_signals:
             if self.circuit_breaker.is_halted():
+                logger.warning("[CORR] circuit breaker halted — stopping")
                 break
 
-            inferred_sector = _infer_sector_from_ticker(sig.event_group)
-
-            allowed_sectors = ("sports", "weather", "crypto")
-            if not FINANCIAL_MARKETS_DISABLED:
-                allowed_sectors = allowed_sectors + ("financial_markets",)
-            if inferred_sector not in allowed_sectors:
+            if sig.event_group in seen_groups:
+                logger.debug(
+                    "[CORR] %s — skipping, already fired pair this scan",
+                    sig.event_group,
+                )
                 continue
 
-            if _is_blocked_structural_market(sig.event_group):
+            pair_ok, reject_reason = self._preflight_correlation_pair(sig, market_map)
+            if not pair_ok:
+                logger.debug(
+                    "[CORR] %s pair REJECTED (%s): cheap=%s expensive=%s",
+                    sig.event_group, reject_reason,
+                    sig.cheap_ticker, sig.expensive_ticker,
+                )
                 continue
 
+            try:
+                self._execute_correlation_pair(sig, market_map)
+                seen_groups.add(sig.event_group)
+            except Exception as e:
+                logger.error(
+                    "[CORR] unexpected error executing pair %s: %s",
+                    sig.event_group, e,
+                )
+
+    def _preflight_correlation_pair(self, sig, market_map: dict) -> tuple[bool, str]:
+        """Check that BOTH legs pass every gate before placing either."""
+        inferred_sector = _infer_sector_from_ticker(sig.event_group)
+
+        allowed_sectors = ("sports", "weather", "crypto")
+        if not FINANCIAL_MARKETS_DISABLED:
+            allowed_sectors = allowed_sectors + ("financial_markets",)
+        if inferred_sector not in allowed_sectors:
+            return False, f"sector {inferred_sector} not allowed"
+
+        if _is_blocked_structural_market(sig.event_group):
+            return False, "event_group in structural blocklist"
+
+        cheap_market = market_map.get(_normalize_ticker(sig.cheap_ticker))
+        expensive_market = market_map.get(_normalize_ticker(sig.expensive_ticker))
+
+        if cheap_market is None:
+            return False, "cheap leg market not in open_markets"
+        if expensive_market is None:
+            return False, "expensive leg market not in open_markets"
+
+        if _is_blocked_structural_market(sig.cheap_ticker):
+            return False, "cheap ticker in structural blocklist"
+        if _is_blocked_structural_market(sig.expensive_ticker):
+            return False, "expensive ticker in structural blocklist"
+
+        cheap_ok, cheap_reason = self._passes_market_quality_gate(
+            cheap_market, inferred_sector,
+        )
+        if not cheap_ok:
+            return False, f"cheap leg quality gate: {cheap_reason}"
+
+        expensive_ok, expensive_reason = self._passes_market_quality_gate(
+            expensive_market, inferred_sector,
+        )
+        if not expensive_ok:
+            return False, f"expensive leg quality gate: {expensive_reason}"
+
+        if _recently_traded_in_db(sig.cheap_ticker, within_sec=RECENT_TRADE_WINDOW_SEC):
+            return False, "cheap ticker in cooldown"
+        if _recently_traded_in_db(sig.expensive_ticker, within_sec=RECENT_TRADE_WINDOW_SEC):
+            return False, "expensive ticker in cooldown"
+
+        if self.circuit_breaker.is_halted():
+            return False, "circuit breaker halted"
+        if not self.risk_manager.can_trade():
+            return False, "risk manager halted"
+
+        cap = sector_loss_cap(inferred_sector)
+        if cap == 0.0:
+            return False, "sector disabled (zero loss cap)"
+
+        with self._sector_pnl_lock:
+            sector_loss_today = self._sector_daily_pnl.get(inferred_sector, 0.0)
+        if sector_loss_today <= -cap:
+            return False, f"sector at daily loss cap ({sector_loss_today:.2f})"
+
+        return True, ""
+
+    def _execute_correlation_pair(self, sig, market_map: dict) -> None:
+        """Execute a correlation pair atomically.
+
+        If cheap leg fills but expensive leg fails, IMMEDIATELY close the
+        cheap leg at market to avoid holding a naked directional bet.
+        """
+        pair_uuid = str(uuid.uuid4())
+
+        inferred_sector = _infer_sector_from_ticker(sig.event_group)
+        cheap_market = market_map.get(_normalize_ticker(sig.cheap_ticker))
+        expensive_market = market_map.get(_normalize_ticker(sig.expensive_ticker))
+
+        cheap_consensus = ConsensusResult(
+            ticker=sig.cheap_ticker, signals=[], execute=True,
+            direction=sig.cheap_direction,
+            avg_prob=sig.cheap_price_cents / 100.0,
+            avg_edge=sig.divergence_cents / 100.0 / 2.0,
+            avg_confidence=sig.confidence,
+            reject_reason="",
+        )
+
+        expensive_consensus = ConsensusResult(
+            ticker=sig.expensive_ticker, signals=[], execute=True,
+            direction=sig.expensive_direction,
+            avg_prob=1.0 - (sig.expensive_price_cents / 100.0),
+            avg_edge=sig.divergence_cents / 100.0 / 2.0,
+            avg_confidence=sig.confidence,
+            reject_reason="",
+        )
+
+        logger.info(
+            "[CORR-PAIR] %s START | sector=%s | pair_uuid=%s",
+            sig.event_group, inferred_sector, pair_uuid,
+        )
+        logger.info(
+            "[CORR-PAIR]   cheap:     %s YES @%d cents",
+            sig.cheap_ticker, sig.cheap_price_cents,
+        )
+        logger.info(
+            "[CORR-PAIR]   expensive: %s NO  @%d cents (buy-NO price=%d cents)",
+            sig.expensive_ticker, sig.expensive_price_cents,
+            100 - sig.expensive_price_cents,
+        )
+
+        cheap_leg_id = None
+        expensive_leg_id = None
+        try:
+            cheap_leg_id = log_correlation_leg(
+                event_group=sig.event_group,
+                leg_role="cheap",
+                ticker=sig.cheap_ticker,
+                direction=sig.cheap_direction,
+                leg_price_cents=sig.cheap_price_cents,
+                pair_divergence_cents=sig.divergence_cents,
+                sector=inferred_sector,
+                confidence=sig.confidence,
+                pair_uuid=pair_uuid,
+            )
+            expensive_leg_id = log_correlation_leg(
+                event_group=sig.event_group,
+                leg_role="expensive",
+                ticker=sig.expensive_ticker,
+                direction=sig.expensive_direction,
+                leg_price_cents=sig.expensive_price_cents,
+                pair_divergence_cents=sig.divergence_cents,
+                sector=inferred_sector,
+                confidence=sig.confidence,
+                pair_uuid=pair_uuid,
+            )
+        except Exception as e:
+            logger.error("[CORR-PAIR] %s leg logging failed: %s", sig.event_group, e)
+            return
+
+        cheap_trade_id = self._execute_trade(
+            ticker=sig.cheap_ticker,
+            title=f"[CORR] {sig.event_group} cheap",
+            yes_price=sig.cheap_price_cents,
+            consensus=cheap_consensus,
+            lead_sector=inferred_sector,
+            arb=None,
+            source="correlation",
+            fade=False,
+            market=cheap_market,
+        )
+
+        if cheap_trade_id is None:
             logger.info(
-                "[CORR] %s sector=%s cheap=%s@%d¢ expensive=%s@%d¢ div=%.1f¢",
-                sig.event_group, inferred_sector,
-                sig.cheap_ticker, sig.cheap_price_cents,
-                sig.expensive_ticker, sig.expensive_price_cents,
-                sig.divergence_cents,
+                "[CORR-PAIR] %s ABORTED at cheap leg — no trades placed (clean)",
+                sig.event_group,
+            )
+            self._gate_stats['correlation_pair_aborted_cheap'] += 1
+            return
+
+        try:
+            if cheap_leg_id is not None:
+                link_correlation_leg_to_trade(cheap_leg_id, cheap_trade_id)
+        except Exception as e:
+            logger.warning(
+                "[CORR-PAIR] cheap leg link failed leg=%s trade=%d: %s",
+                cheap_leg_id, cheap_trade_id, e,
             )
 
-            for leg_role, ticker, direction, price in [
-                ("cheap", sig.cheap_ticker, sig.cheap_direction, sig.cheap_price_cents),
-                ("expensive", sig.expensive_ticker, sig.expensive_direction, sig.expensive_price_cents),
-            ]:
-                market = market_map.get(_normalize_ticker(ticker))
-                ok, reason = self._passes_market_quality_gate(market, inferred_sector)
-                if not ok:
-                    continue
+        expensive_trade_id = self._execute_trade(
+            ticker=sig.expensive_ticker,
+            title=f"[CORR] {sig.event_group} expensive",
+            yes_price=sig.expensive_price_cents,
+            consensus=expensive_consensus,
+            lead_sector=inferred_sector,
+            arb=None,
+            source="correlation",
+            fade=False,
+            market=expensive_market,
+        )
 
+        if expensive_trade_id is None:
+            logger.error(
+                "[CORR-PAIR] %s BROKEN — expensive leg rejected. Rolling back cheap leg.",
+                sig.event_group,
+            )
+            self._rollback_cheap_leg(
+                pair_uuid=pair_uuid,
+                cheap_trade_id=cheap_trade_id,
+                cheap_ticker=sig.cheap_ticker,
+                cheap_market=cheap_market,
+                event_group=sig.event_group,
+            )
+            self._gate_stats['correlation_pair_rollback_expensive'] += 1
+            return
+
+        try:
+            if expensive_leg_id is not None:
+                link_correlation_leg_to_trade(expensive_leg_id, expensive_trade_id)
+        except Exception as e:
+            logger.warning(
+                "[CORR-PAIR] expensive leg link failed leg=%s trade=%d: %s",
+                expensive_leg_id, expensive_trade_id, e,
+            )
+
+        logger.info(
+            "[CORR-PAIR] %s SUCCESS | cheap_trade=%d expensive_trade=%d | pair_uuid=%s",
+            sig.event_group, cheap_trade_id, expensive_trade_id, pair_uuid,
+        )
+        self._gate_stats['correlation_pairs_placed'] += 1
+
+    def _rollback_cheap_leg(
+        self,
+        pair_uuid: str,
+        cheap_trade_id: int,
+        cheap_ticker: str,
+        cheap_market: dict,
+        event_group: str,
+    ) -> None:
+        """Close a cheap leg at market when the expensive leg rejected.
+
+        In DEMO_MODE, logs only (no real API call). In live mode, sells
+        the contracts back at the current best bid, eating up to ~5 cents of
+        spread to ensure the position doesn't stay naked.
+        """
+        logger.warning(
+            "[CORR-ROLLBACK] pair=%s | closing cheap leg trade_id=%d ticker=%s",
+            pair_uuid, cheap_trade_id, cheap_ticker,
+        )
+
+        try:
+            p = _ph()
+            pool = _get_pool()
+            if pool:
+                conn = pool.getconn()
                 try:
-                    leg_id = log_correlation_leg(
-                        event_group=sig.event_group,
-                        leg_role=leg_role,
-                        ticker=ticker,
-                        direction=direction,
-                        leg_price_cents=price,
-                        pair_divergence_cents=sig.divergence_cents,
-                        sector=inferred_sector,
-                        confidence=sig.confidence,
+                    cur = conn.cursor()
+                    cur.execute(
+                        f"""
+                        UPDATE correlation_legs
+                        SET notes = COALESCE(notes, '') || ' ROLLED_BACK_AT ' || {p}
+                        WHERE pair_uuid = {p}
+                        """,
+                        (datetime.now(timezone.utc).isoformat(), pair_uuid),
                     )
-                except Exception as e:
-                    logger.warning("log_correlation_leg failed for %s: %s", ticker, e)
-                    continue
+                    conn.commit()
+                finally:
+                    pool.putconn(conn)
+        except Exception as e:
+            logger.debug("[CORR-ROLLBACK] could not update notes: %s", e)
 
-                mock_consensus = ConsensusResult(
-                    ticker=ticker, signals=[], execute=True,
-                    direction=direction,
-                    avg_prob=(
-                        sig.cheap_price_cents / 100
-                        if direction == "YES"
-                        else 1 - sig.expensive_price_cents / 100
-                    ),
-                    avg_edge=sig.divergence_cents / 100 / 2,
-                    avg_confidence=sig.confidence,
-                    reject_reason="",
+        if DEMO_MODE:
+            logger.info(
+                "[CORR-ROLLBACK] DEMO mode — no real close needed for trade_id=%d",
+                cheap_trade_id,
+            )
+            return
+
+        p = _ph()
+        try:
+            trade_rows = _query_db(
+                f"SELECT direction, contracts, yes_price_cents FROM trades WHERE id = {p}",
+                (cheap_trade_id,),
+            )
+            if not trade_rows:
+                logger.error(
+                    "[CORR-ROLLBACK] cannot find trade_id=%d!", cheap_trade_id,
                 )
+                return
+            trade = trade_rows[0]
+            direction = str(trade["direction"]).upper()
+            contracts = int(trade["contracts"])
+        except Exception as e:
+            logger.error(
+                "[CORR-ROLLBACK] failed to look up trade %d: %s",
+                cheap_trade_id, e,
+            )
+            return
 
-                trade_id = self._execute_trade(
-                    ticker=ticker,
-                    title=f"[CORR] {sig.event_group}",
-                    yes_price=price,
-                    consensus=mock_consensus,
-                    lead_sector=inferred_sector,
-                    arb=None,
-                    source="correlation",
-                    fade=False,
-                    market=market,
-                )
+        close_side = direction.lower()
 
-                if trade_id:
-                    try:
-                        link_correlation_leg_to_trade(leg_id, trade_id)
-                    except Exception as e:
-                        logger.warning(
-                            "link_correlation_leg_to_trade failed leg=%d trade=%d: %s",
-                            leg_id, trade_id, e,
-                        )
+        try:
+            bid = float(cheap_market.get("yes_bid_dollars") or 0) * 100
+            ask = float(cheap_market.get("yes_ask_dollars") or 0) * 100
+            if direction == "YES":
+                close_price = max(1, int(round(bid - 5))) if bid > 0 else 1
+            else:
+                no_bid = 100 - ask
+                close_price = max(1, int(round(no_bid - 5))) if ask > 0 else 1
+        except (TypeError, ValueError):
+            close_price = 1
+
+        try:
+            close_client_order_id = f"rollback-{uuid.uuid4()}"
+            order_resp = self.client.place_order(
+                ticker=cheap_ticker,
+                side=close_side,
+                count=contracts,
+                yes_price=close_price,
+                action="sell",
+                client_order_id=close_client_order_id,
+            )
+            close_order_id = order_resp.get("order", {}).get("order_id", close_client_order_id)
+            logger.warning(
+                "[CORR-ROLLBACK] CLOSED cheap leg trade_id=%d | ticker=%s | close_order=%s | price=%d cents",
+                cheap_trade_id, cheap_ticker, close_order_id, close_price,
+            )
+        except Exception as e:
+            logger.error(
+                "[CORR-ROLLBACK] FAILED to close cheap leg trade_id=%d ticker=%s: %s",
+                cheap_trade_id, cheap_ticker, e,
+            )
+            logger.error(
+                "[CORR-ROLLBACK] MANUAL INTERVENTION REQUIRED: close %s manually on Kalshi",
+                cheap_ticker,
+            )
 
     # ── Resolution timing ──────────────────────────────────────────────────────
 
@@ -1574,7 +1769,6 @@ class FlywheelOrchestrator:
         logger.info("=== SCAN END ===")
 
     def _log_gate_stats(self) -> None:
-        """Summarize where markets died in the pipeline."""
         stats = dict(self._gate_stats)
         total = stats.get('markets_scanned', 0)
 
@@ -1619,6 +1813,9 @@ class FlywheelOrchestrator:
             'trades_executed_fade',
             'trades_executed_restime',
             'trades_executed_correlation',
+            'correlation_pair_aborted_cheap',
+            'correlation_pair_rollback_expensive',
+            'correlation_pairs_placed',
         ]
 
         logger.info("[GATE STATS] ===== main-path pipeline =====")
@@ -1683,7 +1880,7 @@ class FlywheelOrchestrator:
         for stat in self.brier_tracker.all_stats():
             if stat:
                 logger.info(
-                    "[BRIER] %s: %.4f (n=%d trend=%s ×%.1f)",
+                    "[BRIER] %s: %.4f (n=%d trend=%s x%.1f)",
                     stat["prop_code"], stat["brier"] or 0,
                     stat["count"], stat["trend"], stat["multiplier"],
                 )
@@ -1694,7 +1891,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.1 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.3 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
