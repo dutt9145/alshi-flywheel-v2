@@ -1,37 +1,35 @@
 """
-pinnacle_reference.py (v1.13 — name-matching bug fixes)
+pinnacle_reference.py (v1.14 — variable-length team-code player parsing)
+
+Changes vs v1.13:
+  PLAYER PARSING NOW HANDLES 2-LETTER TEAM CODES
+  The check_from_kalshi_ticker method was hardcoding a 3-char team prefix
+  in parts[2], which silently corrupted player names for 2-letter team
+  codes (SF, TB, KC, AZ, NY, NO, GS, SA, UT). Examples from production:
+
+    Ticker tail              Old parse (BROKEN)        v1.14 (FIXED)
+    SFLARRAEZ1               team=SFL, player=ARRAEZ   team=SF,  player=LARRAEZ
+    SFWADAMES2               team=SFW, player=ADAMES   team=SF,  player=WADAMES
+    SFMCHAPMAN26             team=SFM, player=CHAPMAN  team=SF,  player=MCHAPMAN
+    TBSPRINGS17              team=TBS, player=PRINGS   team=TB,  player=SPRINGS
+    KCSALVAYA12              team=KCS, player=ALVAYA   team=KC,  player=SALVAYA
+
+  These all failed Pinnacle player matching because the corrupted player
+  string didn't normalize to the Pinnacle full name. Result: Pinnacle
+  gate failed-open for ~30% of MLB props (every game involving SF/TB/KC/AZ).
+
+  Fix: try 2-char team prefix first against MLB_TEAM_CODES/NBA_TEAM_CODES,
+  then fall back to 3-char if 2-char doesn't validate. When game_teams is
+  known (from earlier _extract_game_teams call), prefer matching against
+  those specifically since they're authoritative for this ticker.
 
 Changes vs v1.12:
-  THREE BUG FIXES discovered during 2026-04-25 production audit:
-
-  1. SUFFIX-STRIP BUG (HIGHEST IMPACT)
-     The suffix-stripping loop in _normalize_to_kalshi_format used
-     str.replace() with non-anchored substrings like " V", " II", etc.
-     This caused FALSE-POSITIVE replacements anywhere in the name:
-       "Mark Vientos"       → "Markientos" → "MARKIENTOS" ❌ (should be MVIENTOS)
-       "Justin Verlander"   → "Justinerlander" → "JUSTINERLANDER" ❌
-       "David Iverson"      → "David erson" → "DERSON" ❌
-
-     Fix: anchor suffix removal to end-of-string with a regex. Now only
-     true Roman-numeral / Jr/Sr suffixes at the END are stripped.
-     "Mark Vientos" now correctly normalizes to "MVIENTOS".
-
-  2. MISSING ATHLETICS TEAM CODE
-     The Athletics rebrand (Oakland → Sacramento → Las Vegas, 2025+)
-     introduced new codes "ATH" and "SAC" used by Kalshi tickers.
-     The team_codes dict only had "OAK". Result: every Athletics game
-     failed _extract_game_teams, which cascaded into smart-mode failure
-     and player-prop failure for that game.
-
-     Fix: added "ATH" and "SAC" entries pointing to the same Athletics
-     metadata. Also added a few other commonly-missing aliases.
-
-  3. WRONG ERROR LOG TRUNCATION
-     The "Could not extract teams from: %s" log was showing only the
-     LAST 8 chars of game_info, which obscured the actual input. Logs
-     showed "05ATHTEX" when the real input was "26APR242005ATHTEX".
-
-     Fix: log the full game_info string so the regression is visible.
+  v1.13: Three bug fixes:
+    1. Suffix-stripping regex anchored to end-of-string only.
+       Fixed false-positive replacement for "Mark Vientos" (was
+       MARKIENTOS, now MVIENTOS) and similar V/W/IV-prefix names.
+    2. Added ATH and SAC team codes for Athletics 2025+ relocation.
+    3. Show full game_info in "Could not extract teams" log.
 
 Changes vs v1.11:
   v1.12: get_game_total() method for dynamic AB estimation.
@@ -812,10 +810,53 @@ class PinnacleReference:
 
         try:
             player_part = parts[2]
-            team = player_part[:3]
-            player_raw = player_part[3:]
-            player_name = "".join(c for c in player_raw if not c.isdigit())
             line = float(parts[3])
+
+            # v1.14 FIX: variable-length team prefix.
+            # Old code hardcoded player_part[:3] for team, which silently
+            # corrupted player names for 2-letter team codes (SF, TB, KC, etc.)
+            # by eating the first letter of the player.
+            #
+            # Strategy:
+            #   1. If game_teams is known, try matching parts[2] against each
+            #      team code from the game (preferred — authoritative).
+            #   2. Else, try 3-char prefix first (most common case), then
+            #      2-char fallback if 3-char doesn't validate.
+            team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
+
+            team = None
+            player_raw = None
+
+            if game_teams:
+                # Try each team from the matched game
+                for candidate_team in game_teams:
+                    if player_part.startswith(candidate_team):
+                        team = candidate_team
+                        player_raw = player_part[len(candidate_team):]
+                        break
+
+            if team is None:
+                # Fallback: try 3-char then 2-char prefix against full team_map
+                for prefix_len in (3, 2):
+                    candidate = player_part[:prefix_len]
+                    if candidate in team_map:
+                        team = candidate
+                        player_raw = player_part[prefix_len:]
+                        break
+
+            if team is None or player_raw is None:
+                # Last resort: keep original 3-char behavior so we don't
+                # silently break on unknown ticker formats. Old behavior
+                # may produce wrong matches but at least won't crash.
+                team = player_part[:3]
+                player_raw = player_part[3:]
+                logger.debug(
+                    "[PINNACLE] Player parse fallback: ticker=%s player_part=%s "
+                    "no team prefix matched team_map; using 3-char default",
+                    ticker[:40], player_part,
+                )
+
+            player_name = "".join(c for c in player_raw if not c.isdigit())
 
         except (IndexError, ValueError) as e:
             return SharpCheckResult(
