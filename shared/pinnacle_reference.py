@@ -1,21 +1,46 @@
 """
-pinnacle_reference.py (v1.12 — Game Total Fetching for Dynamic AB)
+pinnacle_reference.py (v1.13 — name-matching bug fixes)
+
+Changes vs v1.12:
+  THREE BUG FIXES discovered during 2026-04-25 production audit:
+
+  1. SUFFIX-STRIP BUG (HIGHEST IMPACT)
+     The suffix-stripping loop in _normalize_to_kalshi_format used
+     str.replace() with non-anchored substrings like " V", " II", etc.
+     This caused FALSE-POSITIVE replacements anywhere in the name:
+       "Mark Vientos"       → "Markientos" → "MARKIENTOS" ❌ (should be MVIENTOS)
+       "Justin Verlander"   → "Justinerlander" → "JUSTINERLANDER" ❌
+       "David Iverson"      → "David erson" → "DERSON" ❌
+
+     Fix: anchor suffix removal to end-of-string with a regex. Now only
+     true Roman-numeral / Jr/Sr suffixes at the END are stripped.
+     "Mark Vientos" now correctly normalizes to "MVIENTOS".
+
+  2. MISSING ATHLETICS TEAM CODE
+     The Athletics rebrand (Oakland → Sacramento → Las Vegas, 2025+)
+     introduced new codes "ATH" and "SAC" used by Kalshi tickers.
+     The team_codes dict only had "OAK". Result: every Athletics game
+     failed _extract_game_teams, which cascaded into smart-mode failure
+     and player-prop failure for that game.
+
+     Fix: added "ATH" and "SAC" entries pointing to the same Athletics
+     metadata. Also added a few other commonly-missing aliases.
+
+  3. WRONG ERROR LOG TRUNCATION
+     The "Could not extract teams from: %s" log was showing only the
+     LAST 8 chars of game_info, which obscured the actual input. Logs
+     showed "05ATHTEX" when the real input was "26APR242005ATHTEX".
+
+     Fix: log the full game_info string so the regression is visible.
 
 Changes vs v1.11:
-  1. Added get_game_total() method — fetches Vegas O/U (game total) from
-     Pinnacle via Odds API for a given Kalshi ticker. Used by mlb_hit_model
-     v13 to dynamically estimate expected at-bats per game instead of
-     hardcoding 4 AB.
-     
-     Cost: Usually 0 extra API calls because the events list is already
-     cached from the player prop check. Only 1 additional call for the
-     totals odds endpoint if the event is found.
+  v1.12: get_game_total() method for dynamic AB estimation.
 
 Changes vs v1.10:
-  1. FIXED: Team extraction now handles 2-letter codes (TB, SF, KC, AZ, etc.)
+  v1.11: Team extraction handles 2-letter codes (TB, SF, KC, AZ, etc.)
 
 Changes vs v1.9:
-  1. MLB/NBA ONLY: Explicitly skips all other sports to save API calls.
+  v1.10: MLB/NBA only — explicitly skips other sports.
 
 Sharp line comparison using Pinnacle odds via The Odds API.
 """
@@ -43,15 +68,35 @@ class SharpCheckResult:
     divergence: Optional[float]
     confidence_adjustment: float
     sharp_direction: Optional[str]
-    
+
+
+# v1.13 BUGFIX: anchor suffix-stripping to end-of-string only.
+# The old approach used str.replace() which matched anywhere in the name,
+# breaking players like "Mark Vientos" (' V' substring stripped → "Markientos").
+# Order matters: longer suffixes first, so " Jr." is tried before " Jr".
+_SUFFIX_PATTERN = re.compile(
+    r"\s+(?:Jr\.?|Sr\.?|III|II|IV|V)\s*$",
+    flags=re.IGNORECASE,
+)
+
 
 def _normalize_to_kalshi_format(full_name: str) -> str:
+    """Convert a Pinnacle-style full name to Kalshi's compact format.
+
+    Examples:
+      "Zach Gelof"    → "ZGELOF"
+      "Mark Vientos"  → "MVIENTOS"  (FIXED in v1.13; was "MARKIENTOS")
+      "J.P. Crawford" → "JCRAWFORD"
+      "Bobby Witt Jr."→ "BWITT"
+    """
     if not full_name:
         return ""
+    # Strip diacritics (José → Jose)
     name = unicodedata.normalize('NFD', full_name)
     name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
-    for suffix in [' Jr.', ' Jr', ' Sr.', ' Sr', ' III', ' II', ' IV', ' V', '.']:
-        name = name.replace(suffix, '')
+    # v1.13 FIX: strip Jr/Sr/Roman-numeral suffixes ONLY at end of string.
+    name = _SUFFIX_PATTERN.sub('', name)
+    # Strip remaining punctuation (e.g., periods in "J.P.")
     name = re.sub(r"[^a-zA-Z\s]", "", name)
     parts = [p.strip() for p in name.split() if p.strip()]
     if not parts:
@@ -69,8 +114,13 @@ def _normalize_kalshi_player(kalshi_name: str) -> str:
 
 # ── Team Code Mappings ────────────────────────────────────────────────────────
 
+# v1.13 FIX: Added ATH and SAC for Athletics relocation (2025+ era).
+# The Athletics moved from Oakland to Sacramento for 2025-2026 (transitioning
+# to Las Vegas), and Kalshi now uses ATH (and sometimes SAC) instead of OAK.
+# Added other common alias variants for robustness.
 MLB_TEAM_CODES = {
-    "AZ": ["Arizona Diamondbacks", "Diamondbacks"],
+    "AZ":  ["Arizona Diamondbacks", "Diamondbacks"],
+    "ARI": ["Arizona Diamondbacks", "Diamondbacks"],   # alt code
     "ATL": ["Atlanta Braves", "Braves"],
     "BAL": ["Baltimore Orioles", "Orioles"],
     "BOS": ["Boston Red Sox", "Red Sox"],
@@ -82,7 +132,7 @@ MLB_TEAM_CODES = {
     "COL": ["Colorado Rockies", "Rockies"],
     "DET": ["Detroit Tigers", "Tigers"],
     "HOU": ["Houston Astros", "Astros"],
-    "KC": ["Kansas City Royals", "Royals"],
+    "KC":  ["Kansas City Royals", "Royals"],
     "KCR": ["Kansas City Royals", "Royals"],
     "LAA": ["Los Angeles Angels", "LA Angels", "Angels"],
     "LAD": ["Los Angeles Dodgers", "LA Dodgers", "Dodgers"],
@@ -92,15 +142,17 @@ MLB_TEAM_CODES = {
     "NYM": ["New York Mets", "NY Mets", "Mets"],
     "NYY": ["New York Yankees", "NY Yankees", "Yankees"],
     "OAK": ["Oakland Athletics", "Athletics", "A's"],
+    "ATH": ["Athletics", "Sacramento Athletics", "Oakland Athletics", "A's"],  # v1.13
+    "SAC": ["Sacramento Athletics", "Athletics", "A's"],                       # v1.13
     "PHI": ["Philadelphia Phillies", "Phillies"],
     "PIT": ["Pittsburgh Pirates", "Pirates"],
-    "SD": ["San Diego Padres", "Padres"],
+    "SD":  ["San Diego Padres", "Padres"],
     "SDP": ["San Diego Padres", "Padres"],
-    "SF": ["San Francisco Giants", "Giants"],
+    "SF":  ["San Francisco Giants", "Giants"],
     "SFG": ["San Francisco Giants", "Giants"],
     "SEA": ["Seattle Mariners", "Mariners"],
     "STL": ["St. Louis Cardinals", "Cardinals"],
-    "TB": ["Tampa Bay Rays", "Rays"],
+    "TB":  ["Tampa Bay Rays", "Rays"],
     "TBR": ["Tampa Bay Rays", "Rays"],
     "TEX": ["Texas Rangers", "Rangers"],
     "TOR": ["Toronto Blue Jays", "Blue Jays"],
@@ -114,13 +166,14 @@ NBA_TEAM_CODES = {
     "BKN": ["Brooklyn Nets", "Nets"],
     "BRK": ["Brooklyn Nets", "Nets"],
     "CHA": ["Charlotte Hornets", "Hornets"],
+    "CHO": ["Charlotte Hornets", "Hornets"],   # alt code
     "CHI": ["Chicago Bulls", "Bulls"],
     "CLE": ["Cleveland Cavaliers", "Cavaliers", "Cavs"],
     "DAL": ["Dallas Mavericks", "Mavericks", "Mavs"],
     "DEN": ["Denver Nuggets", "Nuggets"],
     "DET": ["Detroit Pistons", "Pistons"],
     "GSW": ["Golden State Warriors", "Warriors"],
-    "GS": ["Golden State Warriors", "Warriors"],
+    "GS":  ["Golden State Warriors", "Warriors"],
     "HOU": ["Houston Rockets", "Rockets"],
     "IND": ["Indiana Pacers", "Pacers"],
     "LAC": ["Los Angeles Clippers", "LA Clippers", "Clippers"],
@@ -130,39 +183,43 @@ NBA_TEAM_CODES = {
     "MIL": ["Milwaukee Bucks", "Bucks"],
     "MIN": ["Minnesota Timberwolves", "Timberwolves", "Wolves"],
     "NOP": ["New Orleans Pelicans", "Pelicans"],
-    "NO": ["New Orleans Pelicans", "Pelicans"],
+    "NO":  ["New Orleans Pelicans", "Pelicans"],
     "NYK": ["New York Knicks", "NY Knicks", "Knicks"],
+    "NY":  ["New York Knicks", "NY Knicks", "Knicks"],   # alt code
     "OKC": ["Oklahoma City Thunder", "Thunder"],
     "ORL": ["Orlando Magic", "Magic"],
     "PHI": ["Philadelphia 76ers", "76ers", "Sixers"],
     "PHX": ["Phoenix Suns", "Suns"],
+    "PHO": ["Phoenix Suns", "Suns"],   # alt code
     "POR": ["Portland Trail Blazers", "Trail Blazers", "Blazers"],
     "SAC": ["Sacramento Kings", "Kings"],
     "SAS": ["San Antonio Spurs", "Spurs"],
-    "SA": ["San Antonio Spurs", "Spurs"],
+    "SA":  ["San Antonio Spurs", "Spurs"],
     "TOR": ["Toronto Raptors", "Raptors"],
     "UTA": ["Utah Jazz", "Jazz"],
+    "UTAH": ["Utah Jazz", "Jazz"],   # alt code
     "WAS": ["Washington Wizards", "Wizards"],
+    "WSH": ["Washington Wizards", "Wizards"],
 }
 
 
 class PinnacleReference:
     """
     Compare our probabilities to Pinnacle sharp lines.
-    
+
     Uses The Odds API to fetch Pinnacle odds for MLB/NBA player props
     and game lines.
     """
-    
+
     BASE_URL = "https://api.the-odds-api.com/v4"
-    
+
     SPORT_KEYS = {
         "mlb": "baseball_mlb",
         "nba": "basketball_nba",
         "nfl": "americanfootball_nfl",
         "nhl": "icehockey_nhl",
     }
-    
+
     PROP_MARKETS = {
         "batter_hits": "batter_hits",
         "batter_home_runs": "batter_home_runs",
@@ -181,7 +238,7 @@ class PinnacleReference:
         "player_blocks": "player_blocks",
         "player_pra": "player_points_rebounds_assists",
     }
-    
+
     KALSHI_TO_ODDS_API = {
         "PTS": "player_points",
         "REB": "player_rebounds",
@@ -197,11 +254,11 @@ class PinnacleReference:
         "K": "pitcher_strikeouts",
         "SO": "batter_strikeouts",
     }
-    
+
     SOFT_DIVERGENCE_THRESHOLD = 0.05
     HARD_DIVERGENCE_THRESHOLD = 0.10
     ALIGNMENT_BOOST_THRESHOLD = 0.03
-    
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -215,33 +272,33 @@ class PinnacleReference:
         self._player_name_cache: Dict[str, str] = {}
         self._last_request_time = 0.0
         self._min_request_interval = 1.0
-        
+
         if not self.api_key:
             logger.warning("ODDS_API_KEY not set — Pinnacle reference disabled")
             self.enabled = False
-    
+
     def _rate_limit(self) -> None:
         elapsed = time.time() - self._last_request_time
         if elapsed < self._min_request_interval:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
-    
+
     def _american_to_prob(self, american_odds: int) -> float:
         if american_odds < 0:
             return abs(american_odds) / (abs(american_odds) + 100)
         else:
             return 100 / (american_odds + 100)
-    
+
     def _get_cached(self, cache_key: str) -> Optional[dict]:
         if cache_key in self._cache:
             ts, data = self._cache[cache_key]
             if time.time() - ts < self.cache_ttl_sec:
                 return data
         return None
-    
+
     def _set_cache(self, cache_key: str, data: dict) -> None:
         self._cache[cache_key] = (time.time(), data)
-    
+
     def _extract_game_teams(
         self,
         ticker: str,
@@ -250,33 +307,35 @@ class PinnacleReference:
         parts = ticker.upper().split("-")
         if len(parts) < 2:
             return None
-        
+
         game_info = parts[1]
         team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
-        
+
         for teams_len in [6, 5, 4]:
             if len(game_info) < teams_len:
                 continue
-            
+
             teams_str = game_info[-teams_len:]
-            
+
             for split_pos in range(2, min(4, teams_len - 1)):
                 away_code = teams_str[:split_pos]
                 home_code = teams_str[split_pos:]
-                
+
                 if away_code in team_map and home_code in team_map:
                     logger.info(
                         "[PINNACLE] Extracted teams: %s @ %s from ticker",
                         away_code, home_code,
                     )
                     return (away_code, home_code)
-        
+
+        # v1.13 FIX: Log the FULL game_info string, not the trimmed last 8 chars.
+        # Old log showed "05ATHTEX" obscuring the real input "26APR242005ATHTEX".
         logger.info(
-            "[PINNACLE] Could not extract teams from: %s",
-            game_info[-8:] if len(game_info) >= 8 else game_info,
+            "[PINNACLE] Could not extract teams from game_info=%r (ticker=%s)",
+            game_info, ticker[:50],
         )
         return None
-    
+
     def _find_event_id(
         self,
         events: List[dict],
@@ -285,14 +344,14 @@ class PinnacleReference:
     ) -> Optional[str]:
         away_code, home_code = game_teams
         team_map = MLB_TEAM_CODES if sport.lower() == "mlb" else NBA_TEAM_CODES
-        
+
         away_names = team_map.get(away_code, [away_code])
         home_names = team_map.get(home_code, [home_code])
-        
+
         for event in events:
             event_home = event.get("home_team", "")
             event_away = event.get("away_team", "")
-            
+
             away_match = any(
                 name.lower() in event_away.lower() or event_away.lower() in name.lower()
                 for name in away_names
@@ -301,7 +360,7 @@ class PinnacleReference:
                 name.lower() in event_home.lower() or event_home.lower() in name.lower()
                 for name in home_names
             )
-            
+
             if away_match and home_match:
                 event_id = event.get("id")
                 logger.info(
@@ -310,13 +369,13 @@ class PinnacleReference:
                     event_away, event_home,
                 )
                 return event_id
-        
+
         logger.info(
             "[PINNACLE] No event match for %s @ %s in %d events",
             away_code, home_code, len(events),
         )
         return None
-    
+
     def _fetch_player_props(
         self,
         sport: str,
@@ -327,22 +386,22 @@ class PinnacleReference:
         if not sport_key:
             logger.warning("Unknown sport: %s", sport)
             return []
-        
+
         if game_teams:
             cache_key = f"{sport_key}:{market}:{game_teams[0]}@{game_teams[1]}"
         else:
             cache_key = f"{sport_key}:{market}"
-        
+
         cached = self._get_cached(cache_key)
         if cached:
             return cached
-        
+
         self._rate_limit()
-        
+
         try:
             events_cache_key = f"{sport_key}:events"
             events_list = self._get_cached(events_cache_key)
-            
+
             if not events_list:
                 events_url = f"{self.BASE_URL}/sports/{sport_key}/events"
                 events_resp = requests.get(
@@ -354,12 +413,12 @@ class PinnacleReference:
                 events_list = events_resp.json()
                 self._set_cache(events_cache_key, events_list)
                 logger.info("[PINNACLE] Fetched %d events for %s", len(events_list), sport_key)
-            
+
             if not events_list:
                 return []
-            
+
             events_to_query = []
-            
+
             if game_teams:
                 target_event_id = self._find_event_id(events_list, game_teams, sport)
                 if target_event_id:
@@ -370,18 +429,18 @@ class PinnacleReference:
                     logger.info("[PINNACLE] FALLBACK: no team match, querying %d events", len(events_to_query))
             else:
                 events_to_query = events_list[:30]
-            
+
             all_odds = []
             events_queried = 0
-            
+
             for event in events_to_query:
                 event_id = event.get("id")
                 if not event_id:
                     continue
-                
+
                 self._rate_limit()
                 events_queried += 1
-                
+
                 odds_url = f"{self.BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
                 params = {
                     "apiKey": self.api_key,
@@ -390,7 +449,7 @@ class PinnacleReference:
                     "bookmakers": "pinnacle",
                     "oddsFormat": "american",
                 }
-                
+
                 try:
                     odds_resp = requests.get(odds_url, params=params, timeout=10)
                     if odds_resp.status_code == 200:
@@ -399,7 +458,7 @@ class PinnacleReference:
                             all_odds.append(odds_data)
                 except requests.RequestException:
                     continue
-            
+
             if all_odds:
                 logger.info(
                     "[PINNACLE] Fetched odds from %d/%d events for %s/%s",
@@ -410,17 +469,17 @@ class PinnacleReference:
                     "[PINNACLE] No odds found in %d events for %s/%s",
                     events_queried, sport_key, market,
                 )
-            
+
             self._set_cache(cache_key, all_odds)
             return all_odds
-            
+
         except requests.RequestException as e:
             logger.warning("[PINNACLE] API error: %s", e)
             return []
         except Exception as e:
             logger.error("[PINNACLE] Unexpected error: %s", e)
             return []
-    
+
     def _find_player_line(
         self,
         events: List[dict],
@@ -429,26 +488,26 @@ class PinnacleReference:
     ) -> Optional[Tuple[float, float]]:
         kalshi_normalized = _normalize_kalshi_player(player_name)
         pinnacle_names_seen = []
-        
+
         for event in events:
             bookmakers = event.get("bookmakers", [])
-            
+
             for book in bookmakers:
                 if book.get("key") != "pinnacle":
                     continue
-                
+
                 for market in book.get("markets", []):
                     for outcome in market.get("outcomes", []):
                         outcome_player = outcome.get("description", "").strip()
-                        
+
                         if not outcome_player:
                             continue
-                        
+
                         if len(pinnacle_names_seen) < 10 and outcome_player not in pinnacle_names_seen:
                             pinnacle_names_seen.append(outcome_player)
-                        
+
                         odds_api_normalized = _normalize_to_kalshi_format(outcome_player)
-                        
+
                         if kalshi_normalized != odds_api_normalized:
                             if len(kalshi_normalized) > 3:
                                 kalshi_lastname = kalshi_normalized[1:]
@@ -457,34 +516,34 @@ class PinnacleReference:
                                     continue
                             else:
                                 continue
-                        
+
                         outcome_line = outcome.get("point")
                         if outcome_line is None:
                             continue
-                        
+
                         if abs(float(outcome_line) - line) > 0.5:
                             continue
-                        
+
                         outcome_name = outcome.get("name", "").upper()
                         price = outcome.get("price", 0)
-                        
+
                         if not price:
                             continue
-                        
+
                         prob = self._american_to_prob(price)
-                        
+
                         if kalshi_normalized not in self._player_name_cache:
                             self._player_name_cache[kalshi_normalized] = outcome_player
                             logger.info(
                                 "[PINNACLE] MATCH: %s → '%s' (normalized: %s)",
                                 kalshi_normalized, outcome_player, odds_api_normalized,
                             )
-                        
+
                         if outcome_name == "OVER":
                             return (prob, 1.0 - prob)
                         elif outcome_name == "UNDER":
                             return (1.0 - prob, prob)
-        
+
         if pinnacle_names_seen:
             logger.info(
                 "[PINNACLE] DEBUG %s: Not found. Sample Pinnacle names: %s",
@@ -495,11 +554,11 @@ class PinnacleReference:
                 "[PINNACLE] DEBUG %s: No player outcomes found in %d events",
                 kalshi_normalized, len(events),
             )
-        
+
         return None
-    
+
     SUPPORTED_SPORTS = {"mlb", "nba"}
-    
+
     def check_player_prop(
         self,
         sport: str,
@@ -520,7 +579,7 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         if not self.enabled:
             return SharpCheckResult(
                 passes=True,
@@ -531,7 +590,7 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         market = self.PROP_MARKETS.get(prop_type)
         if not market:
             return SharpCheckResult(
@@ -543,9 +602,9 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         events = self._fetch_player_props(sport, market, game_teams=game_teams)
-        
+
         if not events:
             return SharpCheckResult(
                 passes=True,
@@ -556,9 +615,9 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         odds = self._find_player_line(events, player_name, line)
-        
+
         if not odds:
             return SharpCheckResult(
                 passes=True,
@@ -569,24 +628,24 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         over_prob, under_prob = odds
-        
+
         if our_direction == "OVER":
             sharp_prob = over_prob
         else:
             sharp_prob = under_prob
-        
+
         divergence = our_prob - sharp_prob
         abs_div = abs(divergence)
-        
+
         sharp_direction = "OVER" if over_prob > 0.5 else "UNDER"
-        
+
         logger.info(
             "[PINNACLE] %s @ %.1f: sharp=%.1f%% ours=%.1f%% div=%+.1f%%",
             player_name, line, sharp_prob * 100, our_prob * 100, divergence * 100,
         )
-        
+
         if abs_div > self.HARD_DIVERGENCE_THRESHOLD:
             return SharpCheckResult(
                 passes=False,
@@ -597,7 +656,7 @@ class PinnacleReference:
                 confidence_adjustment=0.0,
                 sharp_direction=sharp_direction,
             )
-        
+
         if abs_div > self.SOFT_DIVERGENCE_THRESHOLD:
             adj = 0.7
             return SharpCheckResult(
@@ -609,7 +668,7 @@ class PinnacleReference:
                 confidence_adjustment=adj,
                 sharp_direction=sharp_direction,
             )
-        
+
         if abs_div < self.ALIGNMENT_BOOST_THRESHOLD:
             adj = 1.1
             return SharpCheckResult(
@@ -621,7 +680,7 @@ class PinnacleReference:
                 confidence_adjustment=adj,
                 sharp_direction=sharp_direction,
             )
-        
+
         return SharpCheckResult(
             passes=True,
             reason=f"Sharp check OK: {divergence:+.1%}",
@@ -631,7 +690,7 @@ class PinnacleReference:
             confidence_adjustment=1.0,
             sharp_direction=sharp_direction,
         )
-    
+
     def check_mlb_player_prop(
         self,
         player_name: str,
@@ -650,7 +709,7 @@ class PinnacleReference:
             our_direction=our_direction,
             game_teams=game_teams,
         )
-    
+
     def check_nba_player_prop(
         self,
         player_name: str,
@@ -669,7 +728,7 @@ class PinnacleReference:
             our_direction=our_direction,
             game_teams=game_teams,
         )
-    
+
     def check_from_kalshi_ticker(
         self,
         ticker: str,
@@ -686,12 +745,12 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         ticker_upper = ticker.upper()
-        
+
         sport = None
         prop_code = None
-        
+
         if ticker_upper.startswith("KXMLB"):
             sport = "mlb"
             if "TOTAL" in ticker_upper or "F5" in ticker_upper:
@@ -721,7 +780,7 @@ class PinnacleReference:
                 if f"KXNBA{code}" in ticker_upper:
                     prop_code = code
                     break
-        
+
         if not sport or not prop_code:
             logger.info(
                 "[PINNACLE] Can't parse ticker: %s (sport=%s, prop_code=%s)",
@@ -736,9 +795,9 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         game_teams = self._extract_game_teams(ticker, sport)
-        
+
         parts = ticker.split("-")
         if len(parts) < 4:
             return SharpCheckResult(
@@ -750,14 +809,14 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         try:
             player_part = parts[2]
             team = player_part[:3]
             player_raw = player_part[3:]
             player_name = "".join(c for c in player_raw if not c.isdigit())
             line = float(parts[3])
-            
+
         except (IndexError, ValueError) as e:
             return SharpCheckResult(
                 passes=True,
@@ -768,7 +827,7 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         prop_type = self.KALSHI_TO_ODDS_API.get(prop_code)
         if not prop_type:
             return SharpCheckResult(
@@ -780,13 +839,13 @@ class PinnacleReference:
                 confidence_adjustment=1.0,
                 sharp_direction=None,
             )
-        
+
         logger.info(
             "[PINNACLE] Checking %s: sport=%s player=%s prop=%s line=%.1f teams=%s",
             ticker[:30], sport, player_name, prop_type, line,
             f"{game_teams[0]}@{game_teams[1]}" if game_teams else "unknown",
         )
-        
+
         return self.check_player_prop(
             sport=sport,
             player_name=player_name,
@@ -806,35 +865,34 @@ class PinnacleReference:
     ) -> Optional[float]:
         """
         v1.12: Fetch Vegas O/U (game total) for the game in a Kalshi ticker.
-        
+
         Uses the same smart event matching as player prop checks.
         Returns the total line (e.g., 8.5) or None if unavailable.
-        
+
         Cost: Usually 0 extra API calls because the events list is already
         cached from the player prop Pinnacle check that runs in _execute_trade.
         Only costs 1 call for the totals odds if event is found.
         """
         if not self.enabled:
             return None
-        
+
         game_teams = self._extract_game_teams(ticker, sport)
         if not game_teams:
             return None
-        
+
         cache_key = f"game_total:{sport}:{game_teams[0]}@{game_teams[1]}"
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached.get("total")
-        
+
         sport_key = self.SPORT_KEYS.get(sport.lower())
         if not sport_key:
             return None
-        
+
         try:
-            # Get events list (likely already cached from player prop check)
             events_cache_key = f"{sport_key}:events"
             events_list = self._get_cached(events_cache_key)
-            
+
             if not events_list:
                 self._rate_limit()
                 events_url = f"{self.BASE_URL}/sports/{sport_key}/events"
@@ -846,15 +904,14 @@ class PinnacleReference:
                 resp.raise_for_status()
                 events_list = resp.json()
                 self._set_cache(events_cache_key, events_list)
-            
+
             if not events_list:
                 return None
-            
+
             event_id = self._find_event_id(events_list, game_teams, sport)
             if not event_id:
                 return None
-            
-            # Fetch totals odds for this event
+
             self._rate_limit()
             odds_url = f"{self.BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
             params = {
@@ -864,13 +921,13 @@ class PinnacleReference:
                 "bookmakers": "pinnacle",
                 "oddsFormat": "american",
             }
-            
+
             resp = requests.get(odds_url, params=params, timeout=10)
             if resp.status_code != 200:
                 return None
-            
+
             data = resp.json()
-            
+
             for book in data.get("bookmakers", []):
                 if book.get("key") != "pinnacle":
                     continue
@@ -887,9 +944,9 @@ class PinnacleReference:
                                 game_teams[0], game_teams[1], total,
                             )
                             return total
-            
+
             return None
-            
+
         except Exception as e:
             logger.debug("[PINNACLE] Game total fetch failed: %s", e)
             return None

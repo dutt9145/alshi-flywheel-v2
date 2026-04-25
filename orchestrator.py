@@ -1,5 +1,25 @@
 """
-orchestrator.py  (v20.3 — atomic correlation pair execution)
+orchestrator.py  (v20.4 — structural blocklist expansion)
+
+Changes vs v20.3:
+  STRUCTURAL BLOCKLIST EXPANSION
+  Promotes 7 ticker families from SportsBot.SPORT_BLOCKLIST (main-path
+  only) into _STRUCTURAL_MARKET_BLOCKLIST (every path). After this
+  change, correlation engine, fade scanner, and resolution timer all
+  respect the same blocks.
+
+  Catastrophic-Brier families newly blocked at structural level:
+    - kxmlbf5         (149 resolved, 0.30 Brier)
+    - kxncaamlax      (18 resolved, 0.77 Brier)
+    - kxowgame        (4 resolved, 0.58 Brier)
+    - kxlolgame       (8 resolved, 0.43 Brier)
+    - kxwtachall      (6 resolved, 0.44 Brier)
+    - kxwtamatch      (21 resolved, 0.39 Brier)
+
+  Long-duration futures newly blocked at structural level:
+    - kxnfldraftcat (NFL draft category, unhedgeable arb)
+
+  These remain in SportsBot.SPORT_BLOCKLIST as well — defense in depth.
 
 Changes vs v20.1:
   ATOMIC CORRELATION PAIRS
@@ -190,13 +210,26 @@ def _is_financial_markets_ticker(ticker: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STRUCTURAL_MARKET_BLOCKLIST = (
+    # Multi-game crossover markets — all paths
     "kxmvecrosscategory",
     "kxmvecrosscat",
     "kxmvecross",
     "kxmvesportsmultigameextended",
     "kxmvesportsmultigame",
     "kxmvesportsmulti",
+    # Long-duration futures — correlation engine can't hedge effectively
     "kxcoinbase",
+    "kxnfldraftcat",
+    # v20.4: catastrophic-Brier sport families promoted from
+    # SportsBot.SPORT_BLOCKLIST to enforce blocking on all paths
+    # (correlation engine, fade scanner, resolution timer) — not just
+    # the main path through the sport bot.
+    "kxmlbf5",        # MLB first-5-innings — 149 resolved, 0.30 Brier
+    "kxncaamlax",     # NCAA men's lacrosse — 18 resolved, 0.77 Brier
+    "kxowgame",       # Overwatch League — 4 resolved, 0.58 Brier
+    "kxlolgame",      # League of Legends — 8 resolved, 0.43 Brier
+    "kxwtachall",     # WTA challenger — 6 resolved, 0.44 Brier
+    "kxwtamatch",     # WTA tour matches — 21 resolved, 0.39 Brier
 )
 
 
@@ -1891,7 +1924,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.3 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.4 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
