@@ -1,12 +1,30 @@
 """
-orchestrator.py  (v20.4 — structural blocklist expansion)
+orchestrator.py  (v20.5 — NYC hourly temp blocklist)
+
+Changes vs v20.4:
+  TEMPORARY BLOCK ON KXTEMPNYCH (NYC HOURLY TEMP)
+  Calibration audit on 2026-04-25 morning revealed that NYC hourly
+  temperature markets are dragging weather sector calibration severely:
+
+    Predicted bucket  n   actual_yes_rate   miss
+    00-10%            15  40.0%             +34 pp
+    40-60%             4  100.0%            +57 pp
+
+  The weather bot converts NOAA hourly forecast point estimates to
+  threshold probabilities with too-narrow uncertainty bands, producing
+  extreme-confidence predictions (5-10% or 80-90%) that resolve the
+  opposite way far too often. The proper fix is to widen the sigma in
+  the probability conversion based on hours-ahead, but that requires
+  surgery on bots/sector_bots.py WeatherBot.
+
+  Until that fix lands, blocklist KXTEMPNYCH at the structural level
+  to stop the bleeding. Other weather families (KXHIGHCHI, KXLOWTDEN,
+  KXLOWTPHX, KXHIGHTPHX) remain active because their volumes are lower
+  and their misses are not as dominant.
 
 Changes vs v20.3:
-  STRUCTURAL BLOCKLIST EXPANSION
-  Promotes 7 ticker families from SportsBot.SPORT_BLOCKLIST (main-path
-  only) into _STRUCTURAL_MARKET_BLOCKLIST (every path). After this
-  change, correlation engine, fade scanner, and resolution timer all
-  respect the same blocks.
+  STRUCTURAL BLOCKLIST EXPANSION (carried forward from v20.4)
+  7 ticker families promoted from SportsBot.SPORT_BLOCKLIST.
 
   Catastrophic-Brier families newly blocked at structural level:
     - kxmlbf5         (149 resolved, 0.30 Brier)
@@ -230,6 +248,12 @@ _STRUCTURAL_MARKET_BLOCKLIST = (
     "kxlolgame",      # League of Legends — 8 resolved, 0.43 Brier
     "kxwtachall",     # WTA challenger — 6 resolved, 0.44 Brier
     "kxwtamatch",     # WTA tour matches — 21 resolved, 0.39 Brier
+    # v20.5: NYC hourly temp markets — temporary block while we fix
+    # the probability-conversion uncertainty bands in WeatherBot.
+    # Calibration audit 2026-04-25: extreme-confidence predictions
+    # (5-10% or 80-90%) miss frequently because point forecasts are
+    # treated as deterministic. Re-enable after sigma widening lands.
+    "kxtempnych",     # NYC hourly temp (bucket 00-10% resolves YES 40%)
 )
 
 
@@ -1924,7 +1948,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.4 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.5 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()

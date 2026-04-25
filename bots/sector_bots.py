@@ -1289,9 +1289,137 @@ class WeatherBot(BaseBot):
                 return coords[0], coords[1], city
         return 40.71, -74.01, "New York"
 
+    # ── v12.8: Helper methods for hourly-aware NOAA prior ─────────────────
+
+    def _parse_temp_ticker(self, ticker: str) -> Optional[dict]:
+        """v12.8: Parse temperature ticker to extract date, hour, threshold.
+
+        Examples:
+          KXTEMPNYCH-26APR2403-T57.99 → hourly, Apr 24 2026 hour=3, 57.99F
+          KXLOWTPHX-26APR23-T62       → daily_low, Apr 23 2026, 62F
+          KXHIGHCHI-26APR23-B82.5     → daily_high, Apr 23 2026, 82.5F
+        """
+        tk_upper = ticker.upper()
+
+        hourly_match = re.match(
+            r'^KXTEMP\w*?-(\d{2})([A-Z]{3})(\d{2})(\d{2})-([BT])(\d+\.?\d*)$',
+            tk_upper,
+        )
+        if hourly_match:
+            return {
+                "market_kind": "hourly",
+                "target_year": 2000 + int(hourly_match.group(1)),
+                "target_month": _MONTH_MAP.get(hourly_match.group(2), 1),
+                "target_day": int(hourly_match.group(3)),
+                "target_hour": int(hourly_match.group(4)),
+                "threshold_kind": hourly_match.group(5),
+                "threshold": float(hourly_match.group(6)),
+            }
+
+        daily_match = re.match(
+            r'^KX(HIGH|LOW)T?\w*?-(\d{2})([A-Z]{3})(\d{2})-([BT])(\d+\.?\d*)$',
+            tk_upper,
+        )
+        if daily_match:
+            kind_word = daily_match.group(1)
+            return {
+                "market_kind": "daily_high" if kind_word == "HIGH" else "daily_low",
+                "target_year": 2000 + int(daily_match.group(2)),
+                "target_month": _MONTH_MAP.get(daily_match.group(3), 1),
+                "target_day": int(daily_match.group(4)),
+                "target_hour": None,
+                "threshold_kind": daily_match.group(5),
+                "threshold": float(daily_match.group(6)),
+            }
+
+        return None
+
+    def _hours_ahead(self, target_year: int, target_month: int,
+                     target_day: int, target_hour: Optional[int]) -> float:
+        """v12.8: Compute hours from now until target. Returns float >= 0."""
+        from datetime import datetime, timezone
+        target_h = target_hour if target_hour is not None else 12
+        try:
+            target = datetime(target_year, target_month, target_day,
+                              target_h, 0, tzinfo=timezone.utc)
+        except ValueError:
+            return 24.0
+        now = datetime.now(timezone.utc)
+        diff_hours = (target - now).total_seconds() / 3600
+        return max(0.0, diff_hours)
+
+    def _sigma_for_hours_ahead(self, hours: float) -> float:
+        """v12.8: NOAA hourly forecast error scales with horizon.
+
+        Empirical NOAA NWS error envelope:
+          0-3 hr: σ=2.0°F | 3-12 hr: σ=2.0→4.5°F
+          12-24 hr: σ=4.5→6.0°F | 24+ hr: σ=6.0→7.5°F (capped)
+        """
+        if hours <= 3.0:
+            return 2.0
+        elif hours <= 12.0:
+            return 2.0 + (hours - 3.0) * (4.5 - 2.0) / 9.0
+        elif hours <= 24.0:
+            return 4.5 + (hours - 12.0) * (6.0 - 4.5) / 12.0
+        else:
+            return min(7.5, 6.0 + (hours - 24.0) * (7.5 - 6.0) / 24.0)
+
+    @staticmethod
+    def _normal_cdf(x: float) -> float:
+        """Standard normal CDF via Abramowitz & Stegun approximation."""
+        if x > 6:
+            return 1.0
+        if x < -6:
+            return 0.0
+        t = 1.0 / (1.0 + 0.2316419 * abs(x))
+        d = 0.3989422804 * math.exp(-x * x / 2)
+        p = 1.0 - d * t * (
+            0.319381530 + t * (
+                -0.356563782 + t * (
+                    1.781477937 + t * (
+                        -1.821255978 + t * 1.330274429
+                    )
+                )
+            )
+        )
+        return p if x >= 0 else 1.0 - p
+
+    def _extract_hour_temp(self, hourly: list[dict],
+                            target_year: int, target_month: int,
+                            target_day: int, target_hour: int) -> Optional[float]:
+        """v12.8: Find NOAA hourly forecast temp for a specific hour."""
+        target_prefix = (
+            f"{target_year:04d}-{target_month:02d}-"
+            f"{target_day:02d}T{target_hour:02d}"
+        )
+        for period in hourly:
+            start = period.get("startTime", "")
+            if start.startswith(target_prefix):
+                t = period.get("temperature")
+                unit = period.get("temperatureUnit", "F")
+                if t is not None:
+                    if unit == "C":
+                        t = t * 9 / 5 + 32
+                    return float(t)
+        return None
+    
     def _get_noaa_prior(self, market: dict) -> Optional[dict]:
-        title      = market.get("title", "")
+        """v12.8: Hourly-aware NOAA prior with proper uncertainty scaling.
+
+        Three bug fixes vs v12.7:
+        1. Hourly markets now use the specific hour from NOAA hourly forecast
+           instead of the daily high/low extremes.
+        2. Sigma scales with hours-ahead (2°F to 7.5°F) instead of using
+           daily range as a uncertainty proxy.
+        3. Gaussian CDF replaces the too-steep custom sigmoid.
+
+        Calibration audit 2026-04-25: predicted 5-10% bucket was resolving
+        YES 40% of the time, predicted 80-90% bucket was missing frequently.
+        Pattern was hourly markets being answered with daily extremes.
+        """
+        title = market.get("title", "")
         close_time = market.get("close_time")
+        ticker = market.get("ticker", "")
 
         city_str = self._parse_city_from_title(title)
         if not city_str:
@@ -1300,54 +1428,134 @@ class WeatherBot(BaseBot):
         if not coords:
             return None
 
-        lat, lon    = coords
-        target_date = parse_market_date(title, close_time)
-        market_type = classify_weather_market(title)
+        lat, lon = coords
 
         try:
             pkg = asyncio.run(fetch_weather_package(lat, lon))
         except RuntimeError:
             loop = asyncio.get_event_loop()
-            pkg  = loop.run_until_complete(fetch_weather_package(lat, lon))
+            pkg = loop.run_until_complete(fetch_weather_package(lat, lon))
 
         if not pkg:
             return None
 
-        prior_yes  = 0.5
+        # v12.8: Try ticker-based parsing first
+        parsed = self._parse_temp_ticker(ticker)
+
+        target_date = parse_market_date(title, close_time)
+        market_type = classify_weather_market(title)
+
+        prior_yes = 0.5
         confidence = 0.30
-        summary    = "NOAA: no signal matched"
+        summary = "NOAA: no signal matched"
 
-        if market_type in ("temp_high", "temp_low"):
-            temps     = extract_temp_signals(pkg["hourly"], target_date)
-            threshold = parse_temp_threshold(title)
-            if temps and threshold is not None:
-                observed = temps["high_f"] if market_type == "temp_high" else temps["low_f"]
-                spread   = max((temps["high_f"] - temps["low_f"]) / 2, 1.0)
-                z        = (observed - threshold) / spread
-                prior_yes  = round(1 / (1 + pow(2.718, -1.7 * z)), 4)
-                confidence = min(0.85, 0.4 + 0.05 * temps["sample_count"])
-                summary    = (
-                    f"NOAA temp: observed={observed:.1f}°F "
-                    f"threshold={threshold:.1f}°F P(YES)={prior_yes:.2f}"
+        # ── v12.8: HOURLY temperature markets ────────────────────────────
+        if parsed and parsed["market_kind"] == "hourly":
+            observed = self._extract_hour_temp(
+                pkg["hourly"],
+                parsed["target_year"], parsed["target_month"],
+                parsed["target_day"], parsed["target_hour"],
+            )
+
+            if observed is not None:
+                threshold = parsed["threshold"]
+                hours = self._hours_ahead(
+                    parsed["target_year"], parsed["target_month"],
+                    parsed["target_day"], parsed["target_hour"],
                 )
+                sigma = self._sigma_for_hours_ahead(hours)
 
-        elif market_type == "precipitation":
+                z = (observed - threshold) / sigma
+                prior_yes = round(self._normal_cdf(z), 4)
+
+                distance_sigmas = abs(z)
+                confidence = min(0.85, 0.40 + 0.15 * min(distance_sigmas, 3.0))
+
+                summary = (
+                    f"NOAA hourly: forecast={observed:.1f}F threshold={threshold:.1f}F "
+                    f"sigma={sigma:.1f}F (h={hours:.1f}) z={z:+.2f} P(YES)={prior_yes:.3f}"
+                )
+                logger.info(f"[NOAA] {city_str} | hour={parsed['target_hour']:02d} | {summary}")
+
+                return {
+                    "prior_yes":    prior_yes,
+                    "confidence":   confidence,
+                    "market_type":  "temp_hourly",
+                    "noaa_summary": summary,
+                    "city":         city_str,
+                    "target_date":  target_date,
+                }
+            else:
+                logger.info(
+                    f"[NOAA] {city_str} | hour={parsed['target_hour']:02d} | "
+                    f"no hourly forecast for target hour"
+                )
+                return None
+
+        # ── v12.8: DAILY HIGH/LOW temperature markets ────────────────────
+        if parsed and parsed["market_kind"] in ("daily_high", "daily_low"):
+            date_str = (
+                f"{parsed['target_year']:04d}-{parsed['target_month']:02d}-"
+                f"{parsed['target_day']:02d}"
+            )
+            temps = extract_temp_signals(pkg["hourly"], date_str)
+
+            if temps and temps.get("sample_count", 0) > 0:
+                threshold = parsed["threshold"]
+
+                if parsed["market_kind"] == "daily_high":
+                    observed = temps["high_f"]
+                else:
+                    observed = temps["low_f"]
+
+                # Daily extremes are noisier — add 1.5F over hourly sigma
+                hours = self._hours_ahead(
+                    parsed["target_year"], parsed["target_month"],
+                    parsed["target_day"], None,
+                )
+                sigma = self._sigma_for_hours_ahead(hours) + 1.5
+
+                z = (observed - threshold) / sigma
+                prior_yes = round(self._normal_cdf(z), 4)
+
+                distance_sigmas = abs(z)
+                confidence = min(0.85, 0.45 + 0.13 * min(distance_sigmas, 3.0))
+
+                kind_label = "high" if parsed["market_kind"] == "daily_high" else "low"
+                summary = (
+                    f"NOAA daily {kind_label}: forecast={observed:.1f}F "
+                    f"threshold={threshold:.1f}F sigma={sigma:.1f}F z={z:+.2f} "
+                    f"P(YES)={prior_yes:.3f}"
+                )
+                logger.info(f"[NOAA] {city_str} | daily_{kind_label} | {summary}")
+
+                return {
+                    "prior_yes":    prior_yes,
+                    "confidence":   confidence,
+                    "market_type":  parsed["market_kind"],
+                    "noaa_summary": summary,
+                    "city":         city_str,
+                    "target_date":  date_str,
+                }
+
+        # ── Fallback to original behavior for non-temp weather markets ───
+        if market_type == "precipitation":
             precip = extract_precip_signals(pkg["forecast"], target_date)
             if precip:
-                prior_yes  = round(precip["precip_pct"] / 100.0, 4)
+                prior_yes = round(precip["precip_pct"] / 100.0, 4)
                 confidence = 0.70
-                summary    = f"NOAA precip: PoP={precip['precip_pct']:.0f}%"
+                summary = f"NOAA precip: PoP={precip['precip_pct']:.0f}%"
 
         elif market_type == "snow":
-            precip     = extract_precip_signals(pkg["forecast"], target_date)
-            alerts     = extract_alert_signals(pkg["alerts"])
+            precip = extract_precip_signals(pkg["forecast"], target_date)
+            alerts = extract_alert_signals(pkg["alerts"])
             snow_alert = any("snow" in (a or "").lower() for a in alerts["alert_types"])
-            base       = precip["precip_pct"] / 100.0 * 0.6
+            base = precip["precip_pct"] / 100.0 * 0.6
             if snow_alert:
                 base = min(1.0, base + 0.25)
-            prior_yes  = round(base, 4)
+            prior_yes = round(base, 4)
             confidence = 0.65
-            summary    = f"NOAA snow: precip={precip['precip_pct']:.0f}% snow_alert={snow_alert}"
+            summary = f"NOAA snow: precip={precip['precip_pct']:.0f}% snow_alert={snow_alert}"
 
         elif market_type == "severe_weather":
             alerts = extract_alert_signals(pkg["alerts"])
