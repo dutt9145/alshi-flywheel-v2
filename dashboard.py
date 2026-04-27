@@ -1,5 +1,13 @@
 """
-dashboard.py  (v5 — Fab 7 sectors: Financial Markets + Global Events)
+dashboard.py  (v6 — schema migration: signals → main_signals)
+
+Changes vs v5:
+  1. get_overview() and get_sector_stats() now query main_signals
+     instead of the deprecated signals table.
+  2. P&L join in get_sector_stats() uses outcomes.trade_id = trades.id
+     instead of joining on ticker. The old ticker-based join multiplied
+     P&L whenever a ticker had multiple trades.
+  3. No UI changes. Same dashboard, correct numbers.
 
 Changes vs v4:
   1. Replaced "tech" sector with "financial_markets"
@@ -59,7 +67,8 @@ def db_ready():
 
 def get_overview():
     t = query("SELECT COUNT(*) as n, SUM(dollars_risked) as total FROM trades")
-    s = query("SELECT COUNT(*) as n FROM signals")
+    # v6: query main_signals (deprecated 'signals' table no longer exists)
+    s = query("SELECT COUNT(*) as n FROM main_signals")
     o = query("SELECT COUNT(*) as n, SUM(pnl_usd) as pnl FROM outcomes")
     a = []
     try:
@@ -76,13 +85,14 @@ def get_overview():
     }
 
 def get_sector_stats():
+    # v6: query main_signals instead of deprecated signals table.
     sigs = query("""
         SELECT sector, COUNT(*) AS signals, AVG(edge) AS avg_edge,
                AVG(confidence) AS avg_conf,
                SUM(CASE WHEN direction='YES' THEN 1 ELSE 0 END) AS yes_count,
                SUM(CASE WHEN direction='NO'  THEN 1 ELSE 0 END) AS no_count,
                AVG(brier_score) AS brier
-        FROM signals GROUP BY sector
+        FROM main_signals GROUP BY sector
     """)
     sig_map = {r["sector"]: r for r in sigs}
 
@@ -93,10 +103,13 @@ def get_sector_stats():
     """)
     trd_map = {r["sector"]: r for r in trd}
 
+    # v6: join on trade_id, not ticker. Old ticker-based join multiplied
+    # P&L whenever a ticker had multiple trades (pre-v20 schema bug).
+    # The new outcomes table has trade_id as the authoritative foreign key.
     pnl = query("""
         SELECT t.sector, SUM(o.pnl_usd) AS pnl, COUNT(*) AS resolved
         FROM outcomes o
-        JOIN trades t ON o.ticker = t.ticker
+        JOIN trades t ON o.trade_id = t.id
         GROUP BY t.sector
     """)
     pnl_map = {r["sector"]: r for r in pnl}
