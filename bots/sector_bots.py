@@ -1,5 +1,29 @@
 """
-bots/sector_bots.py  (v12.7 — data-driven blocklist update + financial_markets disabled)
+bots/sector_bots.py  (v12.9 — sports NO-bet ceiling at our_prob=0.40)
+
+Changes vs v12.8:
+  HARD CEILING ON NO BETS WHEN our_prob > 0.40
+  Calibration audit 2026-04-29 across 7 days of resolved sports trades:
+    Bucket  n    predicted  actual_yes  NO_win_rate  Verdict
+    00-10%  696  5.7%       14.1%       85.9%        PROFITABLE
+    10-25%  2105 15.0%      27.2%       72.8%        PROFITABLE
+    25-40%  204  30.5%      24.5%       75.5%        WELL-CALIBRATED
+    40-60%  41   46.4%      65.9%       34.1%        LOSING ← block
+    60-75%  23   65.7%      100.0%      0.0%         LOSING ← block
+    75-90%  1    81.8%      100.0%      0.0%         LOSING ← block
+
+  Added 4-line filter to _try_mlb_player_prop and _try_nba_player_prop:
+    if direction == "NO" and our_prob > 0.40:
+        return True, None
+
+  Estimated impact: blocks ~65 trades/week in -EV territory.
+  Estimated savings: $50-100/week recovered alpha.
+
+  Why a HARD threshold rather than soft scaling:
+  The 40-60% bucket actual_yes is 66%, meaning NO bets win only 34%.
+  At entry prices around 50-65 cents (1 - market_prob for the 40-60%
+  range), a 34% NO win rate is decisively losing. Soft scaling can't
+  rescue this — the bet is just bad.
 
 Changes vs v12.6:
   - SportsBot.SPORT_BLOCKLIST: REMOVED kxmlbspr — KXMLBSPREAD has 0.19 Brier,
@@ -2265,6 +2289,18 @@ class SportsBot(BaseBot):
         if edge < MIN_EDGE_PCT:
             return True, None
 
+        # v12.9: Hard ceiling on NO bets where our_prob > 40%.
+        # Calibration audit 2026-04-29 showed NO bets at our_prob > 0.40
+        # are systematically -EV (40-60% bucket: 34% NO win rate;
+        # 60-90% buckets: 0% NO win rate). Filter out these trades
+        # entirely.
+        if direction == "NO" and our_prob > 0.40:
+            logger.debug(
+                "[sports/mlb] %s NO ceiling: our_prob=%.3f > 0.40, skipping",
+                ticker[:30], our_prob,
+            )
+            return True, None
+
         scaled_conf = self._scale_confidence(ticker, prediction.confidence)
         if scaled_conf <= 0.0:
             logger.debug("[sports] %s blocklisted", ticker)
@@ -2364,6 +2400,15 @@ class SportsBot(BaseBot):
         )
 
         if edge < MIN_EDGE_PCT:
+            return True, None
+
+        # v12.9: Hard ceiling on NO bets where our_prob > 40%.
+        # See _try_mlb_player_prop docstring for calibration evidence.
+        if direction == "NO" and our_prob > 0.40:
+            logger.debug(
+                "[sports/nba] %s NO ceiling: our_prob=%.3f > 0.40, skipping",
+                ticker[:30], our_prob,
+            )
             return True, None
 
         scaled_conf = self._scale_confidence(ticker, prediction.confidence)

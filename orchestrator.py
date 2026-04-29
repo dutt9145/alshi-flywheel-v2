@@ -1,5 +1,22 @@
 """
-orchestrator.py  (v20.5 — NYC hourly temp blocklist)
+orchestrator.py  (v20.6 — re-enable KXTEMPNYCH after v12.8 verification)
+
+Changes vs v20.5:
+  KXTEMPNYCH RE-ENABLED FOR TRADING
+  WeatherBot v12.8 fix verified working in production. Calibration
+  audit 2026-04-29 across 54 resolved KXTEMPNYCH samples:
+    00-10% bucket: predicted 5.1%, actual 0.0% (was 40% pre-v12.8)
+    10-25% bucket: predicted 16.0%, actual 0.0%
+    75-90% bucket: predicted 84.4%, actual 100.0%
+  Atomic correlation pair execution also verified — 39,132 pairs
+  attempted in last week, 0 orphans.
+
+  Removed kxtempnych from _STRUCTURAL_MARKET_BLOCKLIST. NYC hourly
+  temp trading resumes through main path, fade scanner, correlation
+  engine, and resolution timer.
+
+Changes vs v20.4:
+  TEMPORARY BLOCK ON KXTEMPNYCH (carried forward from v20.5 — now removed)
 
 Changes vs v20.4:
   TEMPORARY BLOCK ON KXTEMPNYCH (NYC HOURLY TEMP)
@@ -248,12 +265,10 @@ _STRUCTURAL_MARKET_BLOCKLIST = (
     "kxlolgame",      # League of Legends — 8 resolved, 0.43 Brier
     "kxwtachall",     # WTA challenger — 6 resolved, 0.44 Brier
     "kxwtamatch",     # WTA tour matches — 21 resolved, 0.39 Brier
-    # v20.5: NYC hourly temp markets — temporary block while we fix
-    # the probability-conversion uncertainty bands in WeatherBot.
-    # Calibration audit 2026-04-25: extreme-confidence predictions
-    # (5-10% or 80-90%) miss frequently because point forecasts are
-    # treated as deterministic. Re-enable after sigma widening lands.
-    "kxtempnych",     # NYC hourly temp (bucket 00-10% resolves YES 40%)
+    # v20.5/v20.6: KXTEMPNYCH was structurally blocked while WeatherBot
+    # v12.8 sigma-widening fix proved out. Verified working 2026-04-29
+    # (n=54 resolved, 00-10% bucket actual=0%, 75-90% bucket actual=100%).
+    # Now removed from blocklist; resumed normal trading.
 )
 
 
@@ -1948,7 +1963,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.5 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.6 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
