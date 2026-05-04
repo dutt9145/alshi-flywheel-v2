@@ -1,8 +1,40 @@
 """
-orchestrator.py  (v20.6 — re-enable KXTEMPNYCH after v12.8 verification)
+orchestrator.py  (v20.7 — KXHIGHCHI daily highs blocklist)
+
+Changes vs v20.6:
+  KXHIGHCHI BLOCKED — DAILY CHICAGO HIGHS UNDER-PREDICT YES
+  Calibration audit 2026-05-03 found systematic ~17pp under-prediction
+  on Chicago daily-high markets:
+
+    Bucket    n   predicted  actual   bias
+    00-10%    70  7.0%       12.9%    +5.9pp
+    10-25%    73  19.3%      35.6%    +16.3pp
+    25-40%    26  27.1%      69.2%    +42.1pp
+
+  T-prefix (n=29) calibrated worse than B-prefix (n=140):
+    T-prefix:  predicted 21.2%, actual 62.1%, Brier 0.38
+    B-prefix:  predicted 13.2%, actual 25.0%, Brier 0.18
+
+  Day-by-day shows pattern emerged 2026-04-26 (post-v12.8 deploy).
+  Multiple days (4/26, 4/27, 4/28, 4/30) showed predicted ~25% vs
+  actual 100% YES.
+
+  Trade-level P&L: -$14.96 across 9 resolved trades (66.7% hit rate
+  but losing money — small bets winning offset by larger bets losing).
+
+  Other weather markets remain healthy:
+    KXTEMPNYCH (NYC hourly): Brier 0.07, n=322 — well-calibrated
+  Issue appears specific to v12.8's daily-extreme extraction for
+  Chicago. Likely: NOAA hourly→daily high computation underestimates
+  Chicago's actual peak temps, OR Kalshi resolves on different station
+  than NOAA forecasts.
+
+  Blocking via _STRUCTURAL_MARKET_BLOCKLIST (affects all paths:
+  main, fade, restime, correlation). Easy revert when root cause is
+  fixed — just remove the kxhighchi entry.
 
 Changes vs v20.5:
-  KXTEMPNYCH RE-ENABLED FOR TRADING
+  KXTEMPNYCH RE-ENABLED FOR TRADING (carried forward from v20.6)
   WeatherBot v12.8 fix verified working in production. Calibration
   audit 2026-04-29 across 54 resolved KXTEMPNYCH samples:
     00-10% bucket: predicted 5.1%, actual 0.0% (was 40% pre-v12.8)
@@ -14,9 +46,6 @@ Changes vs v20.5:
   Removed kxtempnych from _STRUCTURAL_MARKET_BLOCKLIST. NYC hourly
   temp trading resumes through main path, fade scanner, correlation
   engine, and resolution timer.
-
-Changes vs v20.4:
-  TEMPORARY BLOCK ON KXTEMPNYCH (carried forward from v20.5 — now removed)
 
 Changes vs v20.4:
   TEMPORARY BLOCK ON KXTEMPNYCH (NYC HOURLY TEMP)
@@ -269,6 +298,15 @@ _STRUCTURAL_MARKET_BLOCKLIST = (
     # v12.8 sigma-widening fix proved out. Verified working 2026-04-29
     # (n=54 resolved, 00-10% bucket actual=0%, 75-90% bucket actual=100%).
     # Now removed from blocklist; resumed normal trading.
+    # v20.7: KXHIGHCHI daily Chicago highs systematically under-predict YES.
+    # Calibration audit 2026-05-03 (n=169 resolved):
+    #   Predicted 14.2% YES, actual 31.4% — bias +17pp
+    #   T-prefix worse than B-prefix (Brier 0.38 vs 0.18)
+    #   Pattern emerged 2026-04-26 post-v12.8 daily-mode deploy
+    #   Trade-level P&L: -$14.96 on n=9 resolved (net-negative)
+    # Likely v12.8 daily-extreme extraction issue specific to Chicago.
+    # Block while root cause investigated. Other weather markets fine.
+    "kxhighchi",
 )
 
 
@@ -1963,7 +2001,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.6 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.7 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
