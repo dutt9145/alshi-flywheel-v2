@@ -1,5 +1,31 @@
 """
-orchestrator.py  (v20.7 — KXHIGHCHI daily highs blocklist)
+orchestrator.py  (v20.8 — apply structural blocklist to main path)
+
+Changes vs v20.7:
+  STRUCTURAL BLOCKLIST CHECK ADDED TO MAIN PATH
+  Bug discovered 2026-05-05: v20.7 added kxhighchi to
+  _STRUCTURAL_MARKET_BLOCKLIST but KXHIGHCHI trades continued firing
+  through the main path (3 trades placed May 4 with source='main'
+  immediately after v20.7 deploy).
+
+  Root cause: _is_blocked_structural_market() was only called from:
+    1. _passes_market_quality_gate (used by fade scanner only)
+    2. _preflight_correlation_pair (correlation engine)
+    3. _execute_resolution_timing (restime)
+
+  The main path through _evaluate_market never checked the structural
+  blocklist. Other blocked entries (kxmlbf5, kxcoinbase, etc.) appeared
+  to work because they ALSO had secondary defenses in SportsBot or
+  CryptoBot's per-bot blocklists. KXHIGHCHI had no secondary defense
+  in WeatherBot, so the bug was exposed.
+
+  Fix: 4-line check at top of _evaluate_market() that rejects any
+  ticker matching _STRUCTURAL_MARKET_BLOCKLIST before bot evaluation
+  begins. New gate stat: 'rejected_structural_blocklist'.
+
+  This makes the structural blocklist authoritative across all paths
+  (main, fade, correlation, restime). Future blocklist entries will
+  work consistently without needing per-bot duplicates.
 
 Changes vs v20.6:
   KXHIGHCHI BLOCKED — DAILY CHICAGO HIGHS UNDER-PREDICT YES
@@ -1025,6 +1051,19 @@ class FlywheelOrchestrator:
         ticker = _normalize_ticker(
             market.get("ticker") or market.get("event_ticker") or "UNKNOWN"
         )
+
+        # v20.8: Apply structural blocklist to main path. v20.7 and earlier
+        # only checked _is_blocked_structural_market() in the fade scanner,
+        # correlation engine, and resolution timer paths via
+        # _passes_market_quality_gate(). The main path bypassed it entirely.
+        # This silently let blocked tickers (e.g. KXHIGHCHI under v20.7)
+        # continue trading via the main path. Other blocklist entries
+        # happened to be blocked anyway by secondary defenses (sport bot
+        # blocklists, crypto blocklists), masking the bug. Now centralized.
+        if _is_blocked_structural_market(ticker):
+            self._gate_stats['rejected_structural_blocklist'] += 1
+            return
+
         title = market.get("title", "")
         yes_price = _parse_yes_price_cents(market)
 
@@ -1888,6 +1927,7 @@ class FlywheelOrchestrator:
 
         ordering = [
             'markets_scanned',
+            'rejected_structural_blocklist',
             'rejected_no_price',
             'rejected_extreme_price',
             'rejected_fm_disabled',
@@ -2001,7 +2041,7 @@ class FlywheelOrchestrator:
 
     def run(self) -> None:
         logger.info(
-            "Kalshi Flywheel v20.7 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
+            "Kalshi Flywheel v20.8 | DEMO=%s | bankroll=$%.2f | arb_mode=%s | FM_DISABLED=%s",
             DEMO_MODE, self.bankroll, self.arb._mode, FINANCIAL_MARKETS_DISABLED,
         )
         init_db()
